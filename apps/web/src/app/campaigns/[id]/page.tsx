@@ -112,7 +112,7 @@ export default function CampaignDetailPage({ params }: { params: { id: string } 
   async function handleStartCampaign() {
     setValidationErrors([]);
     setValidationWarnings([]);
-    setSystemMessage('Validating campaign...');
+    setSystemMessage('⏳ Validating campaign...');
     setIsStarting(true);
 
     try {
@@ -155,7 +155,7 @@ export default function CampaignDetailPage({ params }: { params: { id: string } 
     }
 
     setIsStopping(true);
-    setSystemMessage('Stopping campaign...');
+    setSystemMessage('⏳ Stopping campaign...');
 
     try {
       const res = await fetch(`/api/campaigns/${params.id}/stop`, {
@@ -262,7 +262,9 @@ export default function CampaignDetailPage({ params }: { params: { id: string } 
                 ? 'bg-red-50 border-red-200'
                 : systemMessage.includes('✅')
                 ? 'bg-green-50 border-green-200'
-                : 'bg-blue-50 border-blue-200'
+                : systemMessage.includes('🚀')
+                ? 'bg-blue-50 border-blue-200'
+                : 'bg-yellow-50 border-yellow-200'
             }
           >
             <Info className="w-4 h-4" />
@@ -275,7 +277,7 @@ export default function CampaignDetailPage({ params }: { params: { id: string } 
           <Alert className="bg-red-50 border-red-200">
             <AlertCircle className="w-4 h-4 text-red-600" />
             <AlertDescription className="ml-2">
-              <p className="font-semibold text-red-800 mb-2">Validation Errors:</p>
+              <p className="font-semibold text-red-800 mb-2">❌ Validation Errors:</p>
               <ul className="list-disc list-inside space-y-1 text-red-700">
                 {validationErrors.map((error, idx) => (
                   <li key={idx}>{error}</li>
@@ -290,7 +292,7 @@ export default function CampaignDetailPage({ params }: { params: { id: string } 
           <Alert className="bg-yellow-50 border-yellow-200">
             <AlertCircle className="w-4 h-4 text-yellow-600" />
             <AlertDescription className="ml-2">
-              <p className="font-semibold text-yellow-800 mb-2">Warnings:</p>
+              <p className="font-semibold text-yellow-800 mb-2">⚠️ Warnings:</p>
               <ul className="list-disc list-inside space-y-1 text-yellow-700">
                 {validationWarnings.map((warning, idx) => (
                   <li key={idx}>{warning}</li>
