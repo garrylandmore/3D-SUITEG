@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev -p 3001",
+    "dev": "next dev -p 7201",
     "build": "next build",
-    "start": "next start -p 3001",
+    "start": "next start -p 7201",
     "lint": "next lint",
     "type-check": "tsc --noEmit",
     "queue:process": "node dist/queue/processor.js"
