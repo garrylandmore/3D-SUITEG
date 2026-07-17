@@ -1,5 +1,5 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { NextResponse } from 'next/server';
+import { getHealthSummary } from '@/lib/campaign-service';
 
 export interface SystemConfig {
   database: boolean;
@@ -7,6 +7,7 @@ export interface SystemConfig {
   wetransfer: boolean;
   email: boolean;
   tempEmail: boolean;
+  localMode: boolean;
 }
 
 export interface HealthCheckResponse {
@@ -20,21 +21,16 @@ export interface HealthCheckResponse {
  * GET /api/health-check - Comprehensive system health check
  */
 export async function GET(): Promise<NextResponse<HealthCheckResponse>> {
+  const health = await getHealthSummary();
+
   const checks: SystemConfig = {
-    database: false,
+    database: health.database.reachable,
     redis: false,
     wetransfer: false,
     email: false,
     tempEmail: false,
+    localMode: health.mode === 'local-memory',
   };
-
-  // Check Database
-  try {
-    await prisma.user.findFirst();
-    checks.database = true;
-  } catch (error) {
-    console.error('Database check failed:', error);
-  }
 
   // Check Redis
   try {
@@ -58,13 +54,26 @@ export async function GET(): Promise<NextResponse<HealthCheckResponse>> {
   checks.tempEmail = !!process.env.TEMP_EMAIL_PROVIDER;
 
   // Determine overall status
-  const allHealthy = Object.values(checks).every((v) => v);
-  const someHealthy = Object.values(checks).some((v) => v);
+  const allHealthy =
+    checks.database &&
+    checks.redis &&
+    checks.wetransfer &&
+    checks.email &&
+    checks.tempEmail;
+  const someHealthy =
+    checks.database ||
+    checks.redis ||
+    checks.wetransfer ||
+    checks.email ||
+    checks.tempEmail;
 
   let status: HealthCheckResponse['status'] = 'unhealthy';
   let message = 'System is not properly configured';
 
-  if (allHealthy) {
+  if (checks.localMode) {
+    status = 'degraded';
+    message = 'Running in local in-memory mode; database persistence is disabled';
+  } else if (allHealthy) {
     status = 'healthy';
     message = 'All systems operational';
   } else if (someHealthy) {

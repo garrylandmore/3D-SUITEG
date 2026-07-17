@@ -1,17 +1,20 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { NextResponse } from 'next/server';
+import { getHealthSummary } from '@/lib/campaign-service';
 
 /**
  * GET /api/health - Health check
  */
 export async function GET() {
-  try {
-    await prisma.user.findFirst();
-    return NextResponse.json({ status: 'ok', timestamp: new Date() });
-  } catch (error) {
-    return NextResponse.json(
-      { status: 'error', error: 'Database connection failed' },
-      { status: 503 }
-    );
-  }
+  const health = await getHealthSummary();
+  const httpStatus = health.status === 'ok' ? 200 : 200;
+  return NextResponse.json(
+    {
+      status: health.status,
+      mode: health.mode,
+      timestamp: new Date().toISOString(),
+      database: health.database,
+      message: health.message,
+    },
+    { status: httpStatus }
+  );
 }

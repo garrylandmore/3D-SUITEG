@@ -1,21 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { createCampaign, listCampaigns } from '@/lib/campaign-service';
 
 /**
  * GET /api/campaigns - List all campaigns for a user
  */
 export async function GET() {
   try {
-    const campaigns = await prisma.campaign.findMany({
-      orderBy: { createdAt: 'desc' },
-      include: {
-        _count: {
-          select: { leads: true },
-        },
-      },
+    const result = await listCampaigns();
+    return NextResponse.json(result.data, {
+      headers: { 'x-3d-suite-mode': result.mode },
     });
-
-    return NextResponse.json(campaigns);
   } catch (error: any) {
     return NextResponse.json(
       { error: error.message },
@@ -39,29 +33,18 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Verify user exists or create default user
-    let user = await prisma.user.findFirst();
-    if (!user) {
-      user = await prisma.user.create({
-        data: {
-          email: userId || 'default@3dsuite.com',
-          name: 'Default User',
-        },
-      });
-    }
-
-    const campaign = await prisma.campaign.create({
-      data: {
-        userId: user.id,
-        name,
-        description,
-        templatePdfUrl,
-        placeholders: Array.isArray(placeholders) ? placeholders : [placeholders],
-        status: 'draft',
-      },
+    const result = await createCampaign({
+      name,
+      description,
+      templatePdfUrl,
+      placeholders: Array.isArray(placeholders) ? placeholders : [placeholders],
+      userId,
     });
 
-    return NextResponse.json(campaign, { status: 201 });
+    return NextResponse.json(result.data, {
+      status: 201,
+      headers: { 'x-3d-suite-mode': result.mode },
+    });
   } catch (error: any) {
     return NextResponse.json(
       { error: error.message },

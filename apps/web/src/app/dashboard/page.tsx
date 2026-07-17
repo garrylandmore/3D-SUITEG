@@ -130,6 +130,7 @@ export default function DashboardPage() {
   const [validationErrors, setValidationErrors] = React.useState<string[]>([]);
   const [systemMessage, setSystemMessage] = React.useState('Ready');
   const [apiConnected, setApiConnected] = React.useState(false);
+  const [apiMode, setApiMode] = React.useState<'unknown' | 'database' | 'local-memory'>('unknown');
   const [apiError, setApiError] = React.useState<string | null>(null);
   const [queuedCount, setQueuedCount] = React.useState(0);
   const [isProcessingCsv, setIsProcessingCsv] = React.useState(false);
@@ -166,11 +167,41 @@ export default function DashboardPage() {
       if (!res.ok) {
         throw new Error(`Health check failed (${res.status})`);
       }
+      const health = await res.json();
+      const mode = health?.mode === 'local-memory' ? 'local-memory' : 'database';
 
       setApiConnected(true);
+      setApiMode(mode);
       setApiError(null);
-      setSystemMessage('API connected');
-      appendLog('ok', 'API health check passed');
+      if (mode === 'local-memory') {
+        setSystemMessage('API connected in local in-memory mode (no database persistence).');
+        appendLog('warn', 'API health check passed in local in-memory mode');
+      } else {
+        setSystemMessage('API connected');
+        appendLog('ok', 'API health check passed');
+      }
+
+      try {
+        const hasLocalDraft = Boolean(localStorage.getItem('dashboard-draft'));
+        if (!hasLocalDraft) {
+          const sessionRes = await fetch('/api/dashboard/session');
+          if (sessionRes.ok) {
+            const sessionPayload = await sessionRes.json();
+            const saved = sessionPayload?.data;
+            if (saved) {
+              setProvider(saved.provider || 'wetransfer');
+              setBatchSize(saved.batchSize || '10');
+              setDelay(saved.delay || '3');
+              setRotateIds(Boolean(saved.rotateIds));
+              setSubject(saved.subject || '');
+              setMessage(saved.message || '');
+              appendLog('warn', 'Restored dashboard session from runtime memory');
+            }
+          }
+        }
+      } catch {
+        // Ignore optional session restore failures.
+      }
 
       try {
         const campaignsRes = await fetch('/api/campaigns');
@@ -187,9 +218,42 @@ export default function DashboardPage() {
     } catch (error: any) {
       const details = error?.message || 'Unknown connection error';
       setApiConnected(false);
+      setApiMode('unknown');
       setApiError(details);
       setSystemMessage('Backend API unavailable. Local simulation mode is enabled.');
       appendLog('warn', `API unavailable (${details})`);
+    }
+  }
+
+  async function syncDashboardSession(overrides?: Partial<{
+    provider: ProviderKey;
+    batchSize: string;
+    delay: string;
+    rotateIds: boolean;
+    subject: string;
+    message: string;
+    recipients: string;
+    files: File[];
+  }>) {
+    if (!apiConnected) return;
+
+    try {
+      await fetch('/api/dashboard/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: overrides?.provider ?? provider,
+          batchSize: overrides?.batchSize ?? batchSize,
+          delay: overrides?.delay ?? delay,
+          rotateIds: overrides?.rotateIds ?? rotateIds,
+          subject: overrides?.subject ?? subject,
+          message: overrides?.message ?? message,
+          recipientsCount: parseRecipients(overrides?.recipients ?? recipients).unique.length,
+          files: (overrides?.files ?? files).map((file) => ({ name: file.name, size: file.size })),
+        }),
+      });
+    } catch {
+      // Keep dashboard responsive if session sync fails.
     }
   }
 
@@ -443,6 +507,7 @@ export default function DashboardPage() {
     setDraftSavedAt(time);
     appendLog('ok', 'Draft saved locally');
     setSystemMessage(`Draft saved at ${time}`);
+    void syncDashboardSession();
   }
 
   React.useEffect(() => {
@@ -550,14 +615,21 @@ export default function DashboardPage() {
             <span className="text-xs px-2 py-0.5 rounded-full border" style={{ borderColor: '#3b1111', color: '#f87171', background: '#1f0a0a' }}>
               {runMode === 'simulated' ? 'SIMULATED' : 'BETA'}
             </span>
+            {apiMode === 'local-memory' && (
+              <span className="text-xs px-2 py-0.5 rounded-full border" style={{ borderColor: '#7f1d1d', color: '#fca5a5', background: '#2a0b0b' }}>
+                LOCAL MODE (NO DB)
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-3">
             <select
               value={provider}
               onChange={(e) => {
-                setProvider(e.target.value as ProviderKey);
-                appendLog('ok', `Provider changed to ${e.target.value}`);
+                const nextProvider = e.target.value as ProviderKey;
+                setProvider(nextProvider);
+                appendLog('ok', `Provider changed to ${nextProvider}`);
+                void syncDashboardSession({ provider: nextProvider });
               }}
               className="text-xs px-2 py-1 rounded border outline-none"
               style={{ background: '#1c0a0a', borderColor: '#3b1111', color: '#d4a0a0' }}

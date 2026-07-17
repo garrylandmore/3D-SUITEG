@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
-import { campaignQueue } from '@/lib/queue';
+import {
+  deleteCampaign,
+  getCampaignById,
+  updateCampaign,
+} from '@/lib/campaign-service';
 
 /**
  * GET /api/campaigns/[id] - Get campaign details
@@ -10,18 +13,8 @@ export async function GET(
   { params }: { params: { id: string } }
 ) {
   try {
-    const campaign = await prisma.campaign.findUnique({
-      where: { id: params.id },
-      include: {
-        leads: {
-          orderBy: { createdAt: 'desc' },
-        },
-        logs: {
-          orderBy: { createdAt: 'desc' },
-          take: 100,
-        },
-      },
-    });
+    const result = await getCampaignById(params.id);
+    const campaign = result.data;
 
     if (!campaign) {
       return NextResponse.json(
@@ -30,7 +23,9 @@ export async function GET(
       );
     }
 
-    return NextResponse.json(campaign);
+    return NextResponse.json(campaign, {
+      headers: { 'x-3d-suite-mode': result.mode },
+    });
   } catch (error: any) {
     return NextResponse.json(
       { error: error.message },
@@ -50,16 +45,19 @@ export async function PATCH(
     const body = await request.json();
     const { name, description, status } = body;
 
-    const campaign = await prisma.campaign.update({
-      where: { id: params.id },
-      data: {
-        ...(name && { name }),
-        ...(description && { description }),
-        ...(status && { status }),
-      },
-    });
+    const result = await updateCampaign(params.id, { name, description, status });
+    const campaign = result.data;
 
-    return NextResponse.json(campaign);
+    if (!campaign) {
+      return NextResponse.json(
+        { error: 'Campaign not found' },
+        { status: 404 }
+      );
+    }
+
+    return NextResponse.json(campaign, {
+      headers: { 'x-3d-suite-mode': result.mode },
+    });
   } catch (error: any) {
     return NextResponse.json(
       { error: error.message },
@@ -76,11 +74,18 @@ export async function DELETE(
   { params }: { params: { id: string } }
 ) {
   try {
-    await prisma.campaign.delete({
-      where: { id: params.id },
-    });
+    const result = await deleteCampaign(params.id);
+    if (!result.data) {
+      return NextResponse.json(
+        { error: 'Campaign not found' },
+        { status: 404 }
+      );
+    }
 
-    return NextResponse.json({ success: true });
+    return NextResponse.json(
+      { success: true },
+      { headers: { 'x-3d-suite-mode': result.mode } }
+    );
   } catch (error: any) {
     return NextResponse.json(
       { error: error.message },

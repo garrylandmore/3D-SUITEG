@@ -153,6 +153,14 @@ PROXY_LIST="proxy1.com:8080,proxy2.com:8080"
 ### Health
 - `GET /api/health` - Health check
 
+## Local no-database mode
+
+If `DATABASE_URL` is not configured (or DB connectivity fails), the API automatically runs in `local-memory` mode:
+- `GET /api/health` returns `status: "degraded"` with `mode: "local-memory"` instead of hard-failing.
+- Campaign create/update/import/start/stop flows remain usable with runtime in-memory state.
+- Dashboard draft/provider session metadata and CSV import events are kept in memory for the current API process.
+- In-memory data is reset when the API server restarts.
+
 ## Campaign Workflow
 
 1. **Create Campaign**
