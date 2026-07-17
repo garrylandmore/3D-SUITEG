@@ -1,0 +1,24 @@
+{
+  "name": "3d-suite",
+  "version": "1.0.0",
+  "description": "Professional WeTransfer Campaign Manager",
+  "private": true,
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "start": "turbo run start",
+    "lint": "turbo run lint",
+    "type-check": "turbo run type-check",
+    "db:push": "cd packages/db && prisma db push",
+    "db:generate": "cd packages/db && prisma generate",
+    "db:studio": "cd packages/db && prisma studio"
+  },
+  "devDependencies": {
+    "turbo": "^1.10.0",
+    "typescript": "^5.0.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}
