@@ -122,7 +122,8 @@ export async function getMailboxMessage(
   messageId: string,
   apiKey: string
 ): Promise<{ message: TempMailIOMessage; rateLimit: TempMailIORateLimitInfo }> {
-  const response = await fetch(`${TEMP_MAIL_IO_BASE}/v1/messages/${messageId}`, {
+  const encoded = encodeURIComponent(messageId);
+  const response = await fetch(`${TEMP_MAIL_IO_BASE}/v1/messages/${encoded}`, {
     headers: { 'X-API-Key': apiKey },
   });
 

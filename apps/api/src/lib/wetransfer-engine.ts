@@ -107,7 +107,7 @@ function nowIso(): string {
 }
 
 function makeId(prefix: string): string {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  return `${prefix}_${crypto.randomUUID()}`;
 }
 
 async function pause(ms: number): Promise<void> {
