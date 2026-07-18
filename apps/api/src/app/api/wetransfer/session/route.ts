@@ -25,8 +25,8 @@ type WeTransferSessionResponse = {
  *
  * Initialise a WeTransfer engine session for a campaign.
  *
- * REAL: Creates a temp-mail.io mailbox, validates WeTransfer API readiness,
- * and polls inbox for verification mail diagnostics.
+ * REAL: Creates a temp-mail.io mailbox and verifies WeTransfer browser automation
+ * can open the live website.
  *
  * Body: { campaignId: string; tempMailApiKey: string; filename?: string }
  */

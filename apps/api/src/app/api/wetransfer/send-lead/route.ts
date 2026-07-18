@@ -1,4 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import {
   sendLeadViaWeTransfer,
   WeTransferExecutionStep,
@@ -40,9 +43,14 @@ type WeTransferSendLeadResponse = {
  *
  * Send a file to a single lead using an existing WeTransfer session.
  *
- * REAL: Uploads and sends using the WeTransfer API with confirmation-based status.
+ * REAL: Uploads and sends using live WeTransfer browser automation with confirmation-based status.
  *
- * Body: { campaignId: string; leadEmail: string; filename?: string }
+ * Body: {
+ *   campaignId: string;
+ *   leadEmail: string;
+ *   fileSource: 'upload' | 'generated';
+ *   tempMailApiKey?: string;
+ * }
  */
 export async function POST(request: NextRequest) {
   const contentType = request.headers.get('content-type') ?? '';
@@ -69,6 +77,7 @@ export async function POST(request: NextRequest) {
   const leadName = body.leadName ? String(body.leadName).trim() : '';
   const fileSource = body.fileSource === 'upload' ? 'upload' : 'generated';
   const ctaLink = body.ctaLink ? String(body.ctaLink).trim() : '';
+  const tempMailApiKey = body.tempMailApiKey ? String(body.tempMailApiKey).trim() : '';
 
   if (!campaignId || !leadEmail) {
     return NextResponse.json(
@@ -100,6 +109,8 @@ export async function POST(request: NextRequest) {
   const stepSnapshots: WeTransferExecutionStep[] = [];
   let attachmentBuffer: Buffer;
   let filename = 'generated-proposal.pdf';
+  let attachmentPath: string | null = null;
+  let attachmentDir: string | null = null;
   let attachmentDebug: AttachmentDebugPayload | null = null;
 
   try {
@@ -192,6 +203,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const safeFilename = filename.replace(/[^a-z0-9._-]/gi, '_') || 'attachment.pdf';
+    attachmentDir = await fs.mkdtemp(path.join(os.tmpdir(), '3d-suite-wetransfer-'));
+    attachmentPath = path.join(attachmentDir, safeFilename);
+    await fs.writeFile(attachmentPath, attachmentBuffer);
+    logs.push(`[Attachment] ON_DISK: ${attachmentPath} | bytes=${attachmentBuffer.length}`);
+
     const result = await sendLeadViaWeTransfer(
       session,
       leadEmail,
@@ -202,6 +219,8 @@ export async function POST(request: NextRequest) {
         leadName: leadName || undefined,
         ctaLink: ctaLink || undefined,
         fileBuffer: attachmentBuffer,
+        attachmentPath,
+        tempMailApiKey: tempMailApiKey || undefined,
       },
       (step, logLine) => {
         stepSnapshots.push({ ...step });
@@ -245,5 +264,9 @@ export async function POST(request: NextRequest) {
         status: 500,
       }
     );
+  } finally {
+    if (attachmentDir) {
+      await fs.rm(attachmentDir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }
