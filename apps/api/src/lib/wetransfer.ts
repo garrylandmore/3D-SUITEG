@@ -2,8 +2,9 @@ import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, Page } from 'playwright';
 
-const WETRANSFER_URL = (process.env.WETRANSFER_WEB_URL || 'https://wetransfer.com').trim();
-const WETRANSFER_LOGIN_URL = `${WETRANSFER_URL.replace(/\/$/, '')}/log-in`;
+const WETRANSFER_AUTH_SIGNUP_URL = (
+  process.env.WETRANSFER_AUTH_SIGNUP_URL || 'https://auth.wetransfer.com/signup'
+).trim();
 
 type VerificationResolution = {
   verificationLink?: string;
@@ -327,17 +328,26 @@ function getAntiBotHint(html: string): string | null {
   return null;
 }
 
+function getUrlPathname(value: string): string {
+  try {
+    return new URL(value).pathname;
+  } catch {
+    return value;
+  }
+}
+
 /**
  * Perform the explicit WeTransfer signup/login flow observed in live Playwright inspection:
- *   1. Navigate to /log-in
- *   2. Click "Sign up"
- *   3. Fill input#email with senderEmail
- *   4. Click "Continue"
- *   5. Poll temp mailbox for verification code (via onVerificationRequired)
- *   6. Fill input#verificationCode
- *   7. Click "Verify"
- *   8. If [data-testid="accept-terms"] appears, click "I agree"
- *   9. Wait for the uploader UI to become visible
+ *   1. Navigate to https://auth.wetransfer.com/signup
+ *   2. Allow redirect to the auth login page if WeTransfer performs it
+ *   3. Click "Sign up" on the redirected login page
+ *   4. Fill input#email with senderEmail on the actual signup surface
+ *   5. Click "Continue"
+ *   6. Poll temp mailbox for verification code (via onVerificationRequired)
+ *   7. Fill input#verificationCode
+ *   8. Click "Verify"
+ *   9. If [data-testid="accept-terms"] appears, click "I agree"
+ *   10. Wait for the uploader UI to become visible
  */
 async function performSignupAndVerification(
   page: Page,
@@ -345,41 +355,90 @@ async function performSignupAndVerification(
   options: WeTransferSendOptions,
   onPhase?: (update: WeTransferSendPhaseUpdate) => void
 ): Promise<void> {
-  // Step 1: Navigate to the login page
-  onPhase?.({ phase: 'navigating_to_login', detail: `Navigating to ${WETRANSFER_LOGIN_URL}` });
-  await page.goto(WETRANSFER_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  const initialAuthUrl = WETRANSFER_AUTH_SIGNUP_URL;
+  let redirectedUrl: string | null = null;
+  let lastCompletedAuthStage = 'opening_auth_entrypoint';
+  let skippedEmailPendingSignupClick = true;
+
+  // Step 1: Navigate to the auth signup entrypoint
+  onPhase?.({
+    phase: 'navigating_to_login',
+    detail: `Navigating to initial auth URL: ${initialAuthUrl}`,
+  });
+  await page.goto(initialAuthUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await waitForStableDom(page);
   await dismissConsentAndPopups(page);
-  const loginUrl = page.url();
-  onPhase?.({ phase: 'navigating_to_login', detail: `Login page loaded (final URL: ${loginUrl})` });
+  redirectedUrl = page.url();
+  lastCompletedAuthStage = 'auth_redirect_resolved';
+  onPhase?.({
+    phase: 'navigating_to_login',
+    detail: `Initial auth URL: ${initialAuthUrl} | redirected URL: ${redirectedUrl}`,
+  });
 
-  // Step 2: Click "Sign up"
+  // Step 2: Click "Sign up" if WeTransfer lands on the auth login gate first
+  const redirectedPath = getUrlPathname(redirectedUrl);
+  const requiresSignupClick = /\/login\b/i.test(redirectedPath);
   const signUpCandidates = [
     page.getByRole('link', { name: /sign up/i }).first(),
     page.getByRole('button', { name: /sign up/i }).first(),
     page.getByText('Sign up', { exact: true }).first(),
   ];
+  let signupCtaFound = false;
   let signUpClicked = false;
   for (const candidate of signUpCandidates) {
     if (await candidate.isVisible().catch(() => false)) {
+      signupCtaFound = true;
+      if (!requiresSignupClick) {
+        break;
+      }
       await candidate.click({ timeout: 5000 });
       signUpClicked = true;
       break;
     }
   }
-  if (signUpClicked) {
-    onPhase?.({ phase: 'signup_clicked', detail: 'Clicked Sign up on WeTransfer login page' });
+  onPhase?.({
+    phase: 'signup_clicked',
+    detail: `Redirected URL: ${redirectedUrl} | signup CTA found on redirected page: ${signupCtaFound ? 'yes' : 'no'}`,
+  });
+  if (requiresSignupClick && signUpClicked) {
+    onPhase?.({
+      phase: 'signup_clicked',
+      detail: `Clicked Sign up on redirected auth login page (redirected URL: ${redirectedUrl})`,
+    });
     await page.waitForTimeout(1500);
     await waitForStableDom(page);
-  } else {
-    onPhase?.({ phase: 'signup_clicked', detail: 'Sign up link not found; proceeding with email entry directly' });
+    await dismissConsentAndPopups(page);
+    lastCompletedAuthStage = 'signup_clicked';
+  } else if (requiresSignupClick) {
+    const currentUrl = page.url();
+    throw new Error(
+      `Sign up CTA was not found on redirected WeTransfer auth login page ` +
+        `(current URL: ${currentUrl}, redirected URL: ${redirectedUrl}, ` +
+        `email field intentionally skipped pending signup click: ${skippedEmailPendingSignupClick ? 'yes' : 'no'}, ` +
+        `last completed auth stage: ${lastCompletedAuthStage})`
+    );
   }
 
-  // Step 3: Fill input#email with senderEmail
+  // Step 3: Fill input#email with senderEmail after the real signup surface appears
   const emailInput = page.locator('input#email').first();
-  await emailInput.waitFor({ state: 'visible', timeout: 20000 });
+  try {
+    await emailInput.waitFor({ state: 'visible', timeout: 20000 });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Signup email field did not appear after auth redirect/sign-up transition ` +
+        `(current URL: ${page.url()}, redirected URL: ${redirectedUrl ?? 'n/a'}, ` +
+        `email field intentionally skipped pending signup click: ${skippedEmailPendingSignupClick ? 'yes' : 'no'}, ` +
+        `last completed auth stage: ${lastCompletedAuthStage}, cause: ${message})`
+    );
+  }
   await emailInput.fill(senderEmail);
-  onPhase?.({ phase: 'sender_email_entered', detail: `Sender email entered: ${senderEmail}` });
+  skippedEmailPendingSignupClick = false;
+  lastCompletedAuthStage = 'sender_email_entered';
+  onPhase?.({
+    phase: 'sender_email_entered',
+    detail: `Sender email entered on signup surface: ${senderEmail} (current URL: ${page.url()})`,
+  });
 
   // Step 4: Click "Continue"
   const continueBtn = page.getByRole('button', { name: /continue/i }).first();
@@ -389,7 +448,11 @@ async function performSignupAndVerification(
     // Fallback: press Enter on the email input
     await emailInput.press('Enter');
   }
-  onPhase?.({ phase: 'verification_code_requested', detail: 'Submitted email, polling temp mailbox for verification code' });
+  lastCompletedAuthStage = 'verification_code_requested';
+  onPhase?.({
+    phase: 'verification_code_requested',
+    detail: 'Submitted signup email, polling temp mailbox for verification code',
+  });
   await page.waitForTimeout(2000);
 
   // Step 5: Poll temp mailbox for verification code
@@ -405,10 +468,11 @@ async function performSignupAndVerification(
     const currentUrl = page.url();
     throw new Error(
       `${resolution?.detail || 'No verification code received in temp mailbox after signup'} ` +
-        `(last successful stage: verification_code_requested, current URL: ${currentUrl})`
+        `(last completed auth stage: ${lastCompletedAuthStage}, current URL: ${currentUrl})`
     );
   }
 
+  lastCompletedAuthStage = 'verification_received';
   onPhase?.({
     phase: 'verification_received',
     detail:
@@ -435,6 +499,7 @@ async function performSignupAndVerification(
     } else {
       await clickFirstVisibleByText(page, ['Verify', 'Confirm', 'Continue']);
     }
+    lastCompletedAuthStage = 'verification_submitted';
     onPhase?.({ phase: 'verification_submitted', detail: 'Verification code submitted, waiting for session' });
     await page.waitForTimeout(3000);
     await waitForStableDom(page);
@@ -442,6 +507,7 @@ async function performSignupAndVerification(
     // If a magic link was provided instead of a code, navigate directly
     await page.goto(resolution.verificationLink, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await waitForStableDom(page);
+    lastCompletedAuthStage = 'verification_submitted';
     onPhase?.({ phase: 'verification_submitted', detail: 'Followed verification link' });
   }
 
@@ -449,6 +515,7 @@ async function performSignupAndVerification(
   const termsBtn = page.locator('[data-testid="accept-terms"]').first();
   if (await termsBtn.isVisible().catch(() => false)) {
     await termsBtn.click({ timeout: 5000 }).catch(() => undefined);
+    lastCompletedAuthStage = 'terms_accepted';
     onPhase?.({ phase: 'terms_accepted', detail: 'Accepted WeTransfer terms and conditions' });
     await page.waitForTimeout(1500);
     await waitForStableDom(page);
@@ -468,7 +535,7 @@ async function performSignupAndVerification(
   if (!uploaderVisible) {
     throw new Error(
       `Uploader UI did not appear after signup/verification ` +
-        `(last successful stage: verification_submitted, current URL: ${postSignupUrl})`
+        `(last completed auth stage: ${lastCompletedAuthStage}, current URL: ${postSignupUrl})`
     );
   }
 
@@ -524,12 +591,15 @@ export async function probeWeTransferWebsite(
     });
 
     const page = await browser.newPage();
-    onPhase?.({ phase: 'loading_wetransfer', detail: `Loading ${WETRANSFER_LOGIN_URL}` });
-    await page.goto(WETRANSFER_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    onPhase?.({ phase: 'loading_wetransfer', detail: `Loading ${WETRANSFER_AUTH_SIGNUP_URL}` });
+    await page.goto(WETRANSFER_AUTH_SIGNUP_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await waitForStableDom(page);
     await dismissConsentAndPopups(page);
     const finalUrl = page.url();
-    onPhase?.({ phase: 'navigating_to_login', detail: `Login page reachable (final URL: ${finalUrl})` });
+    onPhase?.({
+      phase: 'navigating_to_login',
+      detail: `Initial auth URL: ${WETRANSFER_AUTH_SIGNUP_URL} | redirected URL: ${finalUrl}`,
+    });
 
     return { success: true };
   } catch (error: unknown) {
