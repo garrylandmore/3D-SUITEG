@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { importLeads, listLeads } from '@/lib/campaign-service';
 
 /**
  * GET /api/campaigns/[id]/leads - List leads for a campaign
@@ -9,12 +9,12 @@ export async function GET(
   { params }: { params: { id: string } }
 ) {
   try {
-    const leads = await prisma.lead.findMany({
-      where: { campaignId: params.id },
-      orderBy: { createdAt: 'desc' },
-    });
+    const result = await listLeads(params.id);
+    const leads = result.data;
 
-    return NextResponse.json(leads);
+    return NextResponse.json(leads, {
+      headers: { 'x-3d-suite-mode': result.mode },
+    });
   } catch (error: any) {
     return NextResponse.json(
       { error: error.message },
@@ -41,53 +41,19 @@ export async function POST(
       );
     }
 
-    // Verify campaign exists
-    const campaign = await prisma.campaign.findUnique({
-      where: { id: params.id },
-    });
+    const result = await importLeads(params.id, leads);
+    const payload = result.data;
 
-    if (!campaign) {
+    if (!payload.ok) {
       return NextResponse.json(
-        { error: 'Campaign not found' },
-        { status: 404 }
+        { error: payload.message },
+        { status: payload.status, headers: { 'x-3d-suite-mode': result.mode } }
       );
     }
 
-    // Create leads
-    const createdLeads = await prisma.lead.createMany({
-      data: leads.map((lead: any) => ({
-        campaignId: params.id,
-        email: lead.email,
-        name: lead.name,
-        company: lead.company,
-        referenceNumber: lead.referenceNumber,
-        customFields: lead.customFields || {},
-        status: 'pending',
-      })),
-      skipDuplicates: true,
-    });
-
-    // Update campaign lead count
-    await prisma.campaign.update({
-      where: { id: params.id },
-      data: {
-        totalLeads: { increment: createdLeads.count },
-      },
-    });
-
-    // Log action
-    await prisma.campaignLog.create({
-      data: {
-        campaignId: params.id,
-        action: 'imported_leads',
-        status: 'success',
-        details: JSON.stringify({ count: createdLeads.count }),
-      },
-    });
-
     return NextResponse.json(
-      { message: `Imported ${createdLeads.count} leads`, count: createdLeads.count },
-      { status: 201 }
+      { message: payload.message, count: payload.count },
+      { status: payload.status, headers: { 'x-3d-suite-mode': result.mode } }
     );
   } catch (error: any) {
     return NextResponse.json(

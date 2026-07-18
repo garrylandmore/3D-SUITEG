@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
 import Papa from 'papaparse';
+import { recordCsvUpload } from '@/lib/campaign-service';
 
 /**
  * POST /api/upload/csv - Parse and validate CSV file
@@ -49,6 +49,8 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       );
     }
+
+    recordCsvUpload(file.name, validLeads.length);
 
     return NextResponse.json({
       count: validLeads.length,

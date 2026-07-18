@@ -2,10 +2,9 @@
 
 import React from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
-import { ArrowLeft, Play, Square, RefreshCw, AlertCircle, CheckCircle, Info } from 'lucide-react';
+import { ArrowLeft, Play, Square, RefreshCw, AlertCircle, Info } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Alert, AlertDescription } from '@/components/ui/alert';
@@ -53,7 +52,6 @@ interface ValidationResult {
 }
 
 export default function CampaignDetailPage({ params }: { params: { id: string } }) {
-  const router = useRouter();
   const [campaign, setCampaign] = React.useState<Campaign | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [isStarting, setIsStarting] = React.useState(false);

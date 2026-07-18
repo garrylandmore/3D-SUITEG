@@ -1,0 +1,501 @@
+import {
+  createTempMailboxIO,
+  getMailboxMessage,
+  listMailboxMessages,
+  TempMailIOMailbox,
+  TempMailIOMessage,
+} from './temp-mail-io';
+import {
+  createWeTransferTransfer,
+  probeWeTransferWebsite,
+  WeTransferSendPhase,
+} from './wetransfer';
+import type { BrowserProxyConfig } from './browser-proxy-types';
+
+export type WeTransferStepStatus =
+  | 'pending'
+  | 'running'
+  | 'opening_browser'
+  | 'loading_wetransfer'
+  | 'awaiting_sender_verification'
+  | 'waiting_for_verification'
+  | 'verification_received'
+  | 'preparing_attachment'
+  | 'upload_started'
+  | 'upload_completed'
+  | 'send_submitted'
+  | 'send_confirmed'
+  | 'success'
+  | 'failed'
+  | 'stopped';
+
+export type WeTransferExecutionStep = {
+  id: string;
+  label: string;
+  status: WeTransferStepStatus;
+  detail?: string;
+  timestamp?: string;
+  isReal: boolean;
+};
+
+export type WeTransferSession = {
+  id: string;
+  campaignId: string;
+  tempMailbox: TempMailIOMailbox | null;
+  mailboxMessageCount: number | null;
+  latestError: string | null;
+  steps: WeTransferExecutionStep[];
+  createdAt: string;
+  updatedAt: string;
+  status:
+    | 'initializing'
+    | 'ready'
+    | 'sending'
+    | 'stopped'
+    | 'completed'
+    | 'completed_with_errors'
+    | 'failed';
+};
+
+export type WeTransferSendResult = {
+  success: boolean;
+  leadEmail: string;
+  step: string;
+  detail?: string;
+  transferUrl?: string;
+  confirmationStatus: 'confirmed' | 'failed';
+};
+
+const SETUP_STEP_DEFS: Array<{ id: string; label: string }> = [
+  {
+    id: 'create_mailbox',
+    label: 'Create temp mailbox (temp-mail.io)',
+  },
+  {
+    id: 'open_wetransfer',
+    label: 'Open WeTransfer in automation browser',
+  },
+  {
+    id: 'create_account',
+    label: 'Prepare browser-based sender flow',
+  },
+  {
+    id: 'verify_email',
+    label: 'Handle sender verification email',
+  },
+];
+
+const LEAD_STEP_DEFS: Array<{ id: string; label: string }> = [
+  {
+    id: 'upload_file',
+    label: 'Upload PDF/document to WeTransfer',
+  },
+  {
+    id: 'send_to_lead',
+    label: 'Send WeTransfer transfer to lead',
+  },
+];
+
+function makeSteps(): WeTransferExecutionStep[] {
+  return [...SETUP_STEP_DEFS, ...LEAD_STEP_DEFS].map((def) => ({
+    ...def,
+    status: 'pending' as WeTransferStepStatus,
+    isReal: true,
+  }));
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function makeId(prefix: string): string {
+  return `${prefix}_${crypto.randomUUID()}`;
+}
+
+async function pause(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function extractFirstLink(messageText: string): string | null {
+  const matches = messageText.match(/https?:\/\/[^\s"'<>]+/gi) ?? [];
+  const preferred = matches.find((value) => /wetransfer\.com/i.test(value));
+  return preferred ?? matches[0] ?? null;
+}
+
+function extractVerificationCode(messageText: string): string | null {
+  const explicitCode = messageText.match(/(?:code|otp|verification)[^\d]{0,20}(\d{4,8})/i);
+  if (explicitCode?.[1]) return explicitCode[1];
+  const anyCode = messageText.match(/\b\d{6}\b/);
+  return anyCode?.[0] ?? null;
+}
+
+function messageMayBeWeTransferVerification(message: TempMailIOMessage): boolean {
+  const subject = (message.subject || '').toLowerCase();
+  const from = (message.from || '').toLowerCase();
+  const body = `${message.body_text || ''}\n${message.body_html || ''}`.toLowerCase();
+  return (
+    from.includes('wetransfer') ||
+    subject.includes('wetransfer') ||
+    subject.includes('verif') ||
+    subject.includes('confirm') ||
+    body.includes('wetransfer')
+  );
+}
+
+async function enrichMessageIfNeeded(
+  message: TempMailIOMessage,
+  tempMailApiKey: string
+): Promise<TempMailIOMessage> {
+  if ((message.body_text || message.body_html || '').trim()) {
+    return message;
+  }
+
+  try {
+    const { message: detailedMessage } = await getMailboxMessage(message.id, tempMailApiKey);
+    return {
+      ...message,
+      body_text: detailedMessage.body_text || message.body_text,
+      body_html: detailedMessage.body_html || message.body_html,
+      subject: detailedMessage.subject || message.subject,
+      from: detailedMessage.from || message.from,
+    };
+  } catch {
+    return message;
+  }
+}
+
+async function pollForVerificationEmail(
+  mailboxEmail: string,
+  tempMailApiKey: string,
+  onProgress: (messageCount: number) => void
+): Promise<{
+  found: boolean;
+  messageCount: number;
+  subject?: string;
+  verificationLink?: string;
+  verificationCode?: string;
+}> {
+  const maxAttempts = Number.parseInt(process.env.WETRANSFER_VERIFICATION_POLL_ATTEMPTS || '10', 10);
+  const delayMs = Number.parseInt(process.env.WETRANSFER_VERIFICATION_POLL_DELAY_MS || '6000', 10);
+
+  let latestCount = 0;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const { messages } = await listMailboxMessages(mailboxEmail, tempMailApiKey);
+    latestCount = messages.length;
+    onProgress(latestCount);
+
+    const candidates = messages
+      .filter(messageMayBeWeTransferVerification)
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+    for (const candidate of candidates) {
+      const detailed = await enrichMessageIfNeeded(candidate, tempMailApiKey);
+      const content = `${detailed.body_text || ''}\n${detailed.body_html || ''}`;
+      const verificationLink = extractFirstLink(content) || undefined;
+      const verificationCode = extractVerificationCode(content) || undefined;
+      if (verificationLink || verificationCode) {
+        return {
+          found: true,
+          messageCount: latestCount,
+          subject: detailed.subject || undefined,
+          verificationLink,
+          verificationCode,
+        };
+      }
+    }
+
+    if (attempt < maxAttempts) {
+      await pause(delayMs);
+    }
+  }
+
+  return { found: false, messageCount: latestCount };
+}
+
+export async function initWeTransferSession(
+  campaignId: string,
+  tempMailApiKey: string,
+  onStep?: (step: WeTransferExecutionStep, logLine: string) => void,
+  proxyConfig?: BrowserProxyConfig | null
+): Promise<WeTransferSession> {
+  const session: WeTransferSession = {
+    id: makeId('wt_session'),
+    campaignId,
+    tempMailbox: null,
+    mailboxMessageCount: null,
+    latestError: null,
+    steps: makeSteps(),
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    status: 'initializing',
+  };
+
+  function stepUpdate(stepId: string, status: WeTransferStepStatus, detail?: string): void {
+    const step = session.steps.find((s) => s.id === stepId);
+    if (!step) return;
+    step.status = status;
+    step.detail = detail;
+    step.timestamp = nowIso();
+    session.updatedAt = nowIso();
+    if (onStep) {
+      onStep(step, `[${step.label}] ${status}${detail ? ': ' + detail : ''}`);
+    }
+  }
+
+  stepUpdate('create_mailbox', 'running');
+  try {
+    const { mailbox, rateLimit } = await createTempMailboxIO(tempMailApiKey);
+    session.tempMailbox = mailbox;
+    session.latestError = null;
+    stepUpdate(
+      'create_mailbox',
+      'success',
+      `Mailbox: ${mailbox.email} | rate-limit remaining: ${rateLimit.remaining ?? 'unknown'}`
+    );
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    stepUpdate('create_mailbox', 'failed', msg);
+    session.latestError = msg;
+    session.status = 'failed';
+    return session;
+  }
+
+  stepUpdate('open_wetransfer', 'opening_browser');
+  if (proxyConfig?.enabled) {
+    stepUpdate('open_wetransfer', 'opening_browser', `Proxy enabled: ${proxyConfig.protocol}://${proxyConfig.host}:${proxyConfig.port}`);
+  }
+  const probeResult = await probeWeTransferWebsite((phaseUpdate) => {
+    if (phaseUpdate.phase === 'opening_browser') {
+      stepUpdate('open_wetransfer', 'opening_browser', phaseUpdate.detail);
+    } else if (phaseUpdate.phase === 'loading_wetransfer') {
+      stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
+    } else if (phaseUpdate.phase === 'navigating_to_login') {
+      stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
+    }
+  }, proxyConfig);
+
+  if (!probeResult.success) {
+    const detail = probeResult.error || 'Failed to open WeTransfer in browser automation mode.';
+    stepUpdate('open_wetransfer', 'failed', detail);
+    session.latestError = detail;
+    session.status = 'failed';
+    return session;
+  }
+
+  stepUpdate('open_wetransfer', 'success', 'WeTransfer login page reached successfully. Signup/verification will happen at send time.');
+
+  stepUpdate('create_account', 'success', 'Browser transport mode is active. Sender email will use temp mailbox.');
+  stepUpdate('verify_email', 'success', 'Verification mailbox is ready and will be polled during signup flow.');
+
+  session.status = 'ready';
+  return session;
+}
+
+export async function sendLeadViaWeTransfer(
+  session: WeTransferSession,
+  leadEmail: string,
+  filename: string,
+  options?: {
+    fileSource?: 'upload' | 'generated';
+    attachmentBytes?: number;
+    leadName?: string;
+    ctaLink?: string;
+    fileBuffer?: Buffer;
+    attachmentPath?: string;
+    tempMailApiKey?: string;
+    proxyConfig?: BrowserProxyConfig | null;
+  },
+  onStep?: (step: WeTransferExecutionStep, logLine: string) => void
+): Promise<WeTransferSendResult> {
+  if (!session.tempMailbox) {
+    session.latestError = 'No temp mailbox in session – session may have failed during init';
+    session.status = 'failed';
+    return {
+      success: false,
+      leadEmail,
+      step: 'send_to_lead',
+      detail: session.latestError,
+      confirmationStatus: 'failed',
+    };
+  }
+
+  if (!options?.fileBuffer || options.fileBuffer.length <= 0) {
+    const detail = 'No attachment bytes provided for WeTransfer upload';
+    session.latestError = detail;
+    session.status = 'failed';
+    return {
+      success: false,
+      leadEmail,
+      step: 'upload_file',
+      detail,
+      confirmationStatus: 'failed',
+    };
+  }
+
+  if (!options?.attachmentPath) {
+    const detail = 'No on-disk attachment path provided for browser upload';
+    session.latestError = detail;
+    session.status = 'failed';
+    return {
+      success: false,
+      leadEmail,
+      step: 'upload_file',
+      detail,
+      confirmationStatus: 'failed',
+    };
+  }
+
+  session.status = 'sending';
+  session.updatedAt = nowIso();
+
+  for (const stepId of ['upload_file', 'send_to_lead']) {
+    const step = session.steps.find((s) => s.id === stepId);
+    if (step) {
+      step.status = 'pending';
+      step.detail = undefined;
+      step.timestamp = undefined;
+    }
+  }
+
+  function stepUpdate(stepId: string, status: WeTransferStepStatus, detail?: string): void {
+    const step = session.steps.find((s) => s.id === stepId);
+    if (!step) return;
+    step.status = status;
+    step.detail = detail;
+    step.timestamp = nowIso();
+    session.updatedAt = nowIso();
+    if (onStep) {
+      onStep(step, `[${step.label}] ${status}${detail ? ': ' + detail : ''}`);
+    }
+  }
+
+  stepUpdate(
+    'upload_file',
+    'preparing_attachment',
+    `preparing_attachment | ${filename} | ${options.fileBuffer.length} bytes | source=${options.fileSource ?? 'unknown'}`
+  );
+  stepUpdate('send_to_lead', 'running', `Preparing browser send for ${leadEmail}`);
+
+  let transferUrl: string | undefined;
+  const tempMailApiKey = options.tempMailApiKey;
+  const mailboxEmail = session.tempMailbox.email;
+
+  const result = await createWeTransferTransfer(
+    filename,
+    options.fileBuffer,
+    leadEmail,
+    options?.ctaLink?.trim()
+      ? `Secure link for ${options.leadName || leadEmail}: ${options.ctaLink}`
+      : `Secure file package for ${options.leadName || leadEmail}`,
+    (phaseUpdate) => {
+      const phase = phaseUpdate.phase as WeTransferSendPhase;
+      if (phase === 'opening_browser') {
+        stepUpdate('open_wetransfer', 'opening_browser', phaseUpdate.detail);
+      } else if (phase === 'loading_wetransfer') {
+        stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
+      } else if (phase === 'navigating_to_login') {
+        stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
+      } else if (phase === 'signup_clicked') {
+        stepUpdate('create_account', 'running', phaseUpdate.detail);
+      } else if (phase === 'sender_email_entered') {
+        stepUpdate('create_account', 'running', phaseUpdate.detail);
+      } else if (phase === 'verification_code_requested') {
+        stepUpdate('verify_email', 'waiting_for_verification', phaseUpdate.detail);
+      } else if (phase === 'awaiting_sender_verification') {
+        stepUpdate('verify_email', 'awaiting_sender_verification', phaseUpdate.detail);
+      } else if (phase === 'verification_received') {
+        stepUpdate('verify_email', 'verification_received', phaseUpdate.detail);
+      } else if (phase === 'verification_submitted') {
+        stepUpdate('verify_email', 'verification_received', phaseUpdate.detail);
+      } else if (phase === 'terms_accepted') {
+        stepUpdate('create_account', 'success', phaseUpdate.detail);
+      } else if (phase === 'uploader_visible') {
+        stepUpdate('open_wetransfer', 'success', phaseUpdate.detail);
+      } else if (phase === 'preparing_attachment') {
+        stepUpdate('upload_file', 'preparing_attachment', phaseUpdate.detail);
+      } else if (phase === 'upload_started') {
+        stepUpdate('upload_file', 'upload_started', `upload_started | ${phaseUpdate.detail}`);
+      } else if (phase === 'upload_completed') {
+        stepUpdate('upload_file', 'upload_completed', `upload_completed | ${phaseUpdate.detail}`);
+      } else if (phase === 'send_submitted') {
+        stepUpdate('send_to_lead', 'send_submitted', `send_submitted | ${phaseUpdate.detail}`);
+      } else if (phase === 'send_confirmed') {
+        stepUpdate('send_to_lead', 'send_confirmed', `send_confirmed | ${phaseUpdate.detail}`);
+      } else if (phase === 'failed') {
+        stepUpdate('send_to_lead', 'failed', `failed | ${phaseUpdate.detail}`);
+      }
+    },
+    {
+      attachmentPath: options.attachmentPath,
+      senderEmail: mailboxEmail,
+      proxyConfig: options.proxyConfig,
+      onVerificationRequired:
+        tempMailApiKey
+          ? async () => {
+              const verificationResult = await pollForVerificationEmail(
+                mailboxEmail,
+                tempMailApiKey,
+                (messageCount) => {
+                  session.mailboxMessageCount = messageCount;
+                }
+              );
+              session.mailboxMessageCount = verificationResult.messageCount;
+
+              if (!verificationResult.found) {
+                return {
+                  mailboxMessageCount: verificationResult.messageCount,
+                  detail: `verification_failed | No WeTransfer verification email received (${verificationResult.messageCount} messages checked)`,
+                };
+              }
+
+              return {
+                verificationLink: verificationResult.verificationLink,
+                verificationCode: verificationResult.verificationCode,
+                mailboxMessageCount: verificationResult.messageCount,
+                detail: `verification_received | ${verificationResult.subject || 'WeTransfer verification message detected'}`,
+              };
+            }
+          : undefined,
+    }
+  );
+
+  if (!result.success) {
+    const detail = result.error || `WeTransfer send failed for ${leadEmail}`;
+    session.latestError = detail;
+    if (session.steps.find((step) => step.id === 'upload_file')?.status === 'upload_started') {
+      stepUpdate('upload_file', 'failed', `failed | ${detail}`);
+    }
+    stepUpdate('send_to_lead', 'failed', `failed | ${detail}`);
+    session.status = 'ready';
+    return {
+      success: false,
+      leadEmail,
+      step: 'send_to_lead',
+      detail,
+      confirmationStatus: 'failed',
+    };
+  }
+
+  transferUrl = result.downloadUrl;
+  if (session.steps.find((step) => step.id === 'upload_file')?.status !== 'upload_completed') {
+    stepUpdate('upload_file', 'upload_completed', `upload_completed | ${filename}`);
+  }
+  stepUpdate(
+    'send_to_lead',
+    'send_confirmed',
+    `send_confirmed | ${leadEmail}${transferUrl ? ` | ${transferUrl}` : ''}`
+  );
+  session.latestError = null;
+  session.status = 'ready';
+
+  return {
+    success: true,
+    leadEmail,
+    step: 'send_to_lead',
+    transferUrl,
+    detail: transferUrl
+      ? `Confirmed WeTransfer send for ${leadEmail}: ${transferUrl}`
+      : `Confirmed WeTransfer send for ${leadEmail}`,
+    confirmationStatus: 'confirmed',
+  };
+}
