@@ -1,6 +1,7 @@
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, Page } from 'playwright';
+import type { BrowserProxyConfig } from './browser-proxy-types';
 
 const WETRANSFER_URL = (process.env.WETRANSFER_WEB_URL || 'https://wetransfer.com').trim();
 const WETRANSFER_LOGIN_URL = `${WETRANSFER_URL.replace(/\/$/, '')}/log-in`;
@@ -40,7 +41,27 @@ export type WeTransferSendOptions = {
   attachmentPath?: string;
   senderEmail?: string;
   onVerificationRequired?: () => Promise<VerificationResolution | null>;
+  proxyConfig?: BrowserProxyConfig | null;
 };
+
+/**
+ * Build a Playwright-compatible proxy launch option from a BrowserProxyConfig.
+ * Returns an empty object when proxy is disabled or host is not set.
+ */
+function buildLaunchProxy(config?: BrowserProxyConfig | null): { proxy?: { server: string; username?: string; password?: string } } {
+  if (!config?.enabled || !config.host?.trim()) {
+    return {};
+  }
+  const server = `${config.protocol}://${config.host.trim()}:${config.port}`;
+  const proxy: { server: string; username?: string; password?: string } = { server };
+  if (config.username?.trim()) {
+    proxy.username = config.username.trim();
+  }
+  if (config.password) {
+    proxy.password = config.password;
+  }
+  return { proxy };
+}
 
 const BUTTON_HINTS = [
   'Accept',
@@ -514,13 +535,15 @@ async function confirmSend(page: Page): Promise<{ transferUrl?: string }> {
 }
 
 export async function probeWeTransferWebsite(
-  onPhase?: (update: WeTransferSendPhaseUpdate) => void
+  onPhase?: (update: WeTransferSendPhaseUpdate) => void,
+  proxyConfig?: BrowserProxyConfig | null
 ): Promise<{ success: boolean; error?: string }> {
   let browser;
   try {
     onPhase?.({ phase: 'opening_browser', detail: 'Launching automation browser' });
     browser = await chromium.launch({
       headless: (process.env.WETRANSFER_HEADLESS || 'true').trim().toLowerCase() !== 'false',
+      ...buildLaunchProxy(proxyConfig),
     });
 
     const page = await browser.newPage();
@@ -575,6 +598,7 @@ export async function createWeTransferTransfer(
     onPhase?.({ phase: 'opening_browser', detail: 'Launching automation browser' });
     browser = await chromium.launch({
       headless: (process.env.WETRANSFER_HEADLESS || 'true').trim().toLowerCase() !== 'false',
+      ...buildLaunchProxy(options.proxyConfig),
     });
 
     const page = await browser.newPage();

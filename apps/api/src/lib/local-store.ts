@@ -62,6 +62,9 @@ type RuntimeEvent = {
 };
 
 import type { WeTransferSession } from './wetransfer-engine';
+import type { BrowserProxyConfig } from './browser-proxy-types';
+
+export type { BrowserProxyConfig };
 
 type RuntimeState = {
   campaigns: Map<string, LocalCampaign>;
@@ -71,6 +74,8 @@ type RuntimeState = {
   dashboardSession: DashboardSessionState | null;
   /** Keyed by campaignId (or a standalone key for dashboard-level sessions) */
   weTransferSessions: Map<string, WeTransferSession>;
+  /** Outbound browser proxy configuration for Chromium/Playwright automation */
+  browserProxyConfig: BrowserProxyConfig | null;
 };
 
 const globalForRuntime = globalThis as typeof globalThis & {
@@ -86,6 +91,7 @@ function getState(): RuntimeState {
       events: [],
       dashboardSession: null,
       weTransferSessions: new Map(),
+      browserProxyConfig: null,
     };
   }
   // Initialise weTransferSessions for state objects created before this field existed
@@ -378,4 +384,23 @@ export function setWeTransferSessionLocal(
 export function clearWeTransferSessionLocal(key: string) {
   getState().weTransferSessions.delete(key);
   addEvent('wetransfer.session.cleared', { key });
+}
+
+// ─── Browser proxy config store ──────────────────────────────────────────────
+
+export function getBrowserProxyConfigLocal(): BrowserProxyConfig | null {
+  return getState().browserProxyConfig;
+}
+
+export function setBrowserProxyConfigLocal(config: BrowserProxyConfig): BrowserProxyConfig {
+  const state = getState();
+  state.browserProxyConfig = config;
+  addEvent('browser.proxy.config.updated', {
+    enabled: config.enabled,
+    protocol: config.enabled ? config.protocol : null,
+    host: config.enabled ? config.host : null,
+    port: config.enabled ? config.port : null,
+    // username and password are intentionally omitted from event logs
+  });
+  return config;
 }

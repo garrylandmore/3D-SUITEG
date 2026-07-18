@@ -10,6 +10,7 @@ import { generateWeTransferBusinessPdf } from '@/lib/pdf';
 import {
   getWeTransferSessionLocal,
   setWeTransferSessionLocal,
+  getBrowserProxyConfigLocal,
 } from '@/lib/local-store';
 
 type AttachmentDebugPayload = {
@@ -209,6 +210,13 @@ export async function POST(request: NextRequest) {
     await fs.writeFile(attachmentPath, attachmentBuffer);
     logs.push(`[Attachment] ON_DISK: ${attachmentPath} | bytes=${attachmentBuffer.length}`);
 
+    const proxyConfig = getBrowserProxyConfigLocal();
+    if (proxyConfig?.enabled) {
+      console.log(`[wetransfer/send-lead] Browser proxy enabled: ${proxyConfig.protocol}://${proxyConfig.host}:${proxyConfig.port}`);
+    } else {
+      console.log('[wetransfer/send-lead] Browser proxy disabled');
+    }
+
     const result = await sendLeadViaWeTransfer(
       session,
       leadEmail,
@@ -221,6 +229,7 @@ export async function POST(request: NextRequest) {
         fileBuffer: attachmentBuffer,
         attachmentPath,
         tempMailApiKey: tempMailApiKey || undefined,
+        proxyConfig,
       },
       (step, logLine) => {
         stepSnapshots.push({ ...step });
