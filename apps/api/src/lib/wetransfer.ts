@@ -47,7 +47,7 @@ export async function createWeTransferTransfer(
 
     // Step 2: Upload the file
     const uploadFormData = new FormData();
-    const blob = new Blob([fileBuffer]);
+    const blob = new Blob([new Uint8Array(fileBuffer)]);
     uploadFormData.append('file', blob, filename);
 
     await axios.post(uploadUrl, uploadFormData, {

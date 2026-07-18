@@ -27,7 +27,7 @@ import {
 
 type SenderKey = 'wetransfer' | 'adobe' | 'quickbooks' | 'docusign';
 type LeadStatus = 'pending' | 'sending' | 'sent' | 'failed' | 'skipped';
-type RunState = 'idle' | 'running' | 'stopped' | 'completed';
+type RunState = 'idle' | 'running' | 'stopped' | 'completed' | 'completed_with_errors' | 'failed';
 type LogLevel = 'info' | 'success' | 'warning' | 'error' | 'stopped' | 'system';
 type ModalKey =
   | 'credentials'
@@ -118,9 +118,60 @@ type WeTransferStep = {
 
 type WeTransferSessionState = {
   sessionId: string | null;
-  status: 'idle' | 'initializing' | 'ready' | 'sending' | 'stopped' | 'completed' | 'failed';
+  status:
+    | 'idle'
+    | 'initializing'
+    | 'ready'
+    | 'sending'
+    | 'stopped'
+    | 'completed'
+    | 'completed_with_errors'
+    | 'failed';
   mailbox: string | null;
+  mailboxMessageCount: number | null;
+  latestError: string | null;
+  attachment: WeTransferAttachmentDebug | null;
   steps: WeTransferStep[];
+};
+
+type WeTransferAttachmentDebug = {
+  name: string | null;
+  source: 'uploaded' | 'generated';
+  mimeType: string | null;
+  sizeBytes: number | null;
+  readiness: 'ready' | 'missing';
+  detail: string;
+};
+
+type WeTransferSessionApiResponse = {
+  sessionId?: string;
+  status?: WeTransferSessionState['status'];
+  mailbox?: { email?: string | null } | null;
+  mailboxMessageCount?: number | null;
+  latestError?: string | null;
+  steps?: WeTransferStep[];
+  logs?: string[];
+  error?: string;
+};
+
+type WeTransferSendLeadApiResponse = {
+  success?: boolean;
+  confirmationStatus?: 'confirmed' | 'simulated' | 'failed';
+  detail?: string | null;
+  error?: string;
+  transferUrl?: string | null;
+  logs?: string[];
+  steps?: WeTransferStep[];
+  mailboxUsed?: string | null;
+  mailboxMessageCount?: number | null;
+  latestError?: string | null;
+  attachment?: {
+    name: string;
+    source: 'uploaded' | 'generated';
+    mimeType: string | null;
+    sizeBytes: number;
+    ready: boolean;
+  } | null;
 };
 
 const SENDERS: Array<{ key: SenderKey; label: string }> = [
@@ -158,6 +209,67 @@ function formatTime(value: string) {
 
 function makeId(prefix: string) {
   return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function formatBytes(value: number | null | undefined) {
+  if (!value || value <= 0) return 'unknown';
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function getWeTransferAttachmentDebug(
+  config: SenderConfig,
+  uploadFile: File | null
+): WeTransferAttachmentDebug {
+  if (config.fileSource === 'upload') {
+    if (!uploadFile) {
+      return {
+        name: null,
+        source: 'uploaded',
+        mimeType: null,
+        sizeBytes: null,
+        readiness: 'missing',
+        detail: 'Upload mode is selected but no file is attached. Re-select the document before sending.',
+      };
+    }
+
+    return {
+      name: uploadFile.name || null,
+      source: 'uploaded',
+      mimeType: uploadFile.type || null,
+      sizeBytes: uploadFile.size || null,
+      readiness: uploadFile.size > 0 ? 'ready' : 'missing',
+      detail:
+        uploadFile.size > 0
+          ? 'Uploaded file is ready to be reused for each lead.'
+          : 'Uploaded file is empty and cannot be sent.',
+    };
+  }
+
+  return {
+    name: 'per-lead-generated-proposal.pdf',
+    source: 'generated',
+    mimeType: 'application/pdf',
+    sizeBytes: null,
+    readiness: 'ready',
+    detail: config.ctaLink.trim()
+      ? 'PDF will be generated per lead at send time.'
+      : 'PDF will be generated per lead at send time. CTA link is currently empty.',
+  };
+}
+
+async function parseApiJson<T>(response: Response): Promise<T> {
+  const text = await response.text();
+  if (!text.trim()) {
+    throw new Error(`Empty response from API (HTTP ${response.status})`);
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`Invalid JSON from API (HTTP ${response.status}): ${text.slice(0, 200)}`);
+  }
 }
 
 function normalizeLead(value: string) {
@@ -302,8 +414,16 @@ export default function DashboardPage() {
     sessionId: null,
     status: 'idle',
     mailbox: null,
+    mailboxMessageCount: null,
+    latestError: null,
+    attachment: null,
     steps: [],
   });
+
+  const wetransferAttachment = React.useMemo(
+    () => getWeTransferAttachmentDebug(senderConfigs.wetransfer, wetransferUploadFile),
+    [senderConfigs.wetransfer, wetransferUploadFile]
+  );
 
   const updateLeads = React.useCallback(
     (updater: Lead[] | ((prev: Lead[]) => Lead[])) => {
@@ -453,10 +573,45 @@ export default function DashboardPage() {
     addToast('Lead pool cleared', 'warning');
   }
 
+  function finalizeRun(sender: SenderKey) {
+    const statuses = leadsRef.current
+      .map((lead) => lead.senderStatus[sender])
+      .filter(Boolean) as LeadStatus[];
+    const sentCount = statuses.filter((status) => status === 'sent').length;
+    const failedCount = statuses.filter((status) => status === 'failed').length;
+    const skippedCount = statuses.filter((status) => status === 'skipped').length;
+
+    let nextState: RunState = 'completed';
+    let level: LogLevel = 'success';
+    let message = `Send completed for ${sender} (${sentCount} confirmed)`;
+
+    if (failedCount > 0 && sentCount === 0 && skippedCount === 0) {
+      nextState = 'failed';
+      level = 'error';
+      message = `Send failed for ${sender} (${failedCount} failed, 0 confirmed)`;
+    } else if (failedCount > 0 || skippedCount > 0) {
+      nextState = 'completed_with_errors';
+      level = failedCount > 0 ? 'error' : 'warning';
+      message =
+        `Send completed with issues for ${sender} ` +
+        `(confirmed: ${sentCount}, failed: ${failedCount}, unconfirmed: ${skippedCount})`;
+    }
+
+    setRunState(nextState);
+    if (sender === 'wetransfer') {
+      setWeTransferSession((prev) => ({ ...prev, status: nextState }));
+    }
+    appendLog(level, message, sender);
+    addToast(nextState === 'completed' ? 'Run completed' : message, level);
+  }
+
   function processNextLead(sender: SenderKey) {
     if (stopRequestedRef.current) {
       updateLeads((prev) => prev.map((lead) => (lead.status === 'sending' ? { ...lead, status: 'pending' } : lead)));
       setRunState('stopped');
+      if (sender === 'wetransfer') {
+        setWeTransferSession((prev) => ({ ...prev, status: 'stopped' }));
+      }
       appendLog('stopped', `Send stopped for ${sender}`, sender);
       addToast('Send stopped', 'stopped');
       return;
@@ -467,9 +622,7 @@ export default function DashboardPage() {
     );
 
     if (!nextLead) {
-      setRunState('completed');
-      appendLog('success', `Send completed for ${sender}`, sender);
-      addToast('Run completed', 'success');
+      finalizeRun(sender);
       return;
     }
 
@@ -486,6 +639,14 @@ export default function DashboardPage() {
       const wtConfig = senderConfigsRef.current.wetransfer;
       const leadEmail = nextLead.email || nextLead.normalized;
       const leadName = nextLead.name || '';
+      const attachment = getWeTransferAttachmentDebug(wtConfig, wetransferUploadFile);
+
+      setWeTransferSession((prev) => ({
+        ...prev,
+        status: 'sending',
+        latestError: null,
+        attachment,
+      }));
 
       const sendPayloadPromise = (async () => {
         if (wtConfig.fileSource === 'upload') {
@@ -493,57 +654,49 @@ export default function DashboardPage() {
           if (!uploadFile) {
             throw new Error('Upload file source is selected but no file is attached.');
           }
-          const rawBytes = new Uint8Array(await uploadFile.arrayBuffer());
-          let binary = '';
-          for (let i = 0; i < rawBytes.length; i += 1) {
-            binary += String.fromCharCode(rawBytes[i]);
-          }
-          return {
-            campaignId,
-            leadEmail,
-            leadName,
-            fileSource: 'upload' as const,
-            ctaLink: wtConfig.ctaLink,
-            uploadedFileName: uploadFile.name,
-            uploadedFileBase64: btoa(binary),
-          };
+          const formData = new FormData();
+          formData.append('campaignId', campaignId);
+          formData.append('leadEmail', leadEmail);
+          formData.append('leadName', leadName);
+          formData.append('fileSource', 'upload');
+          formData.append('ctaLink', wtConfig.ctaLink);
+          formData.append('uploadedFileName', uploadFile.name);
+          formData.append('uploadedFileMimeType', uploadFile.type || 'application/octet-stream');
+          formData.append('uploadedFile', uploadFile);
+          return { body: formData };
         }
 
         return {
-          campaignId,
-          leadEmail,
-          leadName,
-          fileSource: 'generated' as const,
-          ctaLink: wtConfig.ctaLink,
-          generatedTitle: wtConfig.generatedTitle,
-          generatedSubtitle: wtConfig.generatedSubtitle,
-          generatedBodyText: wtConfig.generatedBodyText,
-          generatedLayout: wtConfig.generatedLayout,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            campaignId,
+            leadEmail,
+            leadName,
+            fileSource: 'generated' as const,
+            ctaLink: wtConfig.ctaLink,
+            generatedTitle: wtConfig.generatedTitle,
+            generatedSubtitle: wtConfig.generatedSubtitle,
+            generatedBodyText: wtConfig.generatedBodyText,
+            generatedLayout: wtConfig.generatedLayout,
+          }),
         };
       })();
 
       sendPayloadPromise
-        .then((payload) =>
+        .then((requestInit) =>
           fetch('/api/wetransfer/send-lead', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+            ...requestInit,
           })
         )
-        .then((res) => res.json())
-        .then((data: {
-          success: boolean;
-          confirmationStatus?: 'confirmed' | 'simulated' | 'failed';
-          detail?: string;
-          transferUrl?: string;
-          logs?: string[];
-          steps?: WeTransferStep[];
-        }) => {
+        .then((res) => parseApiJson<WeTransferSendLeadApiResponse>(res))
+        .then((data) => {
           if (stopRequestedRef.current) {
             updateLeads((prev) =>
               prev.map((lead) => (lead.status === 'sending' ? { ...lead, status: 'pending' } : lead))
             );
             setRunState('stopped');
+            setWeTransferSession((prev) => ({ ...prev, status: 'stopped' }));
             appendLog('stopped', `Send stopped for ${sender}`, sender);
             addToast('Send stopped', 'stopped');
             return;
@@ -555,7 +708,26 @@ export default function DashboardPage() {
           if (Array.isArray(data.steps)) {
             setWeTransferSession((prev) => ({ ...prev, steps: data.steps ?? prev.steps }));
           }
+          const failureDetail = data.detail || data.error || 'WeTransfer send failed';
           const confirmationStatus = data.confirmationStatus || (data.success ? 'confirmed' : 'failed');
+          setWeTransferSession((prev) => ({
+            ...prev,
+            mailbox: data.mailboxUsed ?? prev.mailbox,
+            mailboxMessageCount: data.mailboxMessageCount ?? prev.mailboxMessageCount,
+            latestError: confirmationStatus === 'failed' ? failureDetail : data.latestError ?? null,
+            attachment: data.attachment
+              ? {
+                  name: data.attachment.name,
+                  source: data.attachment.source,
+                  mimeType: data.attachment.mimeType,
+                  sizeBytes: data.attachment.sizeBytes,
+                  readiness: data.attachment.ready ? 'ready' : 'missing',
+                  detail: data.attachment.ready
+                    ? 'Attachment is ready for the WeTransfer send flow.'
+                    : 'Attachment is not ready for the WeTransfer send flow.',
+                }
+              : prev.attachment,
+          }));
           updateLeads((prev) =>
             prev.map((lead) => {
               if (lead.id !== nextLead.id) return lead;
@@ -574,7 +746,7 @@ export default function DashboardPage() {
               ? `WeTransfer confirmed send: ${leadEmail}${data.transferUrl ? ` | ${data.transferUrl}` : ''}`
               : confirmationStatus === 'simulated'
                 ? `WeTransfer simulation only (not confirmed): ${leadEmail}${data.detail ? ` — ${data.detail}` : ''}`
-                : `WeTransfer failed: ${leadEmail}${data.detail ? ` — ${data.detail}` : ''}`,
+                : `WeTransfer failed: ${leadEmail}${failureDetail ? ` — ${failureDetail}` : ''}`,
             sender
           );
           const delayMs = Math.max(300, senderConfigsRef.current[sender].rateLimitDelay * 1000);
@@ -582,6 +754,7 @@ export default function DashboardPage() {
         })
         .catch((err: Error) => {
           appendLog('error', `WeTransfer API error: ${err.message}`, 'wetransfer');
+          setWeTransferSession((prev) => ({ ...prev, latestError: err.message }));
           updateLeads((prev) =>
             prev.map((lead) =>
               lead.id === nextLead.id
@@ -645,14 +818,18 @@ export default function DashboardPage() {
 
     if (activeSender === 'wetransfer') {
       const apiKey = credentials.wetransfer.tempMailApiKey.trim();
+      const attachment = getWeTransferAttachmentDebug(
+        senderConfigsRef.current.wetransfer,
+        wetransferUploadFile
+      );
       if (!apiKey) {
         appendLog('error', 'temp-mail.io API key is required for WeTransfer mode. Add it in Credentials.', 'wetransfer');
         addToast('Set temp-mail.io API key in Credentials', 'error');
         return;
       }
-      if (senderConfigsRef.current.wetransfer.fileSource === 'upload' && !wetransferUploadFile) {
-        appendLog('error', 'File Source is set to Upload PDF, but no file is attached.', 'wetransfer');
-        addToast('Attach a PDF/document before sending', 'error');
+      if (attachment.readiness !== 'ready') {
+        appendLog('error', attachment.detail, 'wetransfer');
+        addToast('Attachment is not ready', 'error');
         return;
       }
       if (!senderConfigsRef.current.wetransfer.ctaLink.trim()) {
@@ -660,13 +837,26 @@ export default function DashboardPage() {
       }
 
       setIsPreparing(true);
-      setWeTransferSession({ sessionId: null, status: 'initializing', mailbox: null, steps: [] });
+      setWeTransferSession({
+        sessionId: null,
+        status: 'initializing',
+        mailbox: null,
+        mailboxMessageCount: null,
+        latestError: null,
+        attachment,
+        steps: [],
+      });
       appendLog('info', 'Initialising WeTransfer session — creating temp-mail.io mailbox…', 'wetransfer');
       appendLog(
         'info',
         senderConfigsRef.current.wetransfer.fileSource === 'generate'
-          ? 'Attachment strategy: generate a per-lead PDF in-app using parsed lead fields.'
-          : `Attachment strategy: reuse uploaded file "${wetransferUploadFile?.name || 'unknown'}" for each lead.`,
+          ? `Attachment strategy: generate a per-lead PDF in-app using parsed lead fields (${attachment.name}, ${attachment.mimeType ?? 'application/pdf'}, ${attachment.detail}).`
+          : `Attachment strategy: reuse uploaded file "${attachment.name ?? 'missing'}" (${formatBytes(attachment.sizeBytes)}, ${attachment.mimeType ?? 'unknown'}) for each lead.`,
+        'wetransfer'
+      );
+      appendLog(
+        'info',
+        `Attachment readiness: ${attachment.readiness} | source: ${attachment.source} | detail: ${attachment.detail}`,
         'wetransfer'
       );
 
@@ -676,21 +866,14 @@ export default function DashboardPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ campaignId, tempMailApiKey: apiKey }),
       })
-        .then((res) => res.json())
-        .then((data: {
-          sessionId?: string;
-          status?: string;
-          mailbox?: { email: string };
-          steps?: WeTransferStep[];
-          logs?: string[];
-          error?: string;
-        }) => {
+        .then((res) => parseApiJson<WeTransferSessionApiResponse>(res))
+        .then((data) => {
           setIsPreparing(false);
           if (data.error || data.status === 'failed') {
             const msg = data.error || 'WeTransfer session initialisation failed';
             appendLog('error', msg, 'wetransfer');
             addToast(msg, 'error');
-            setWeTransferSession((prev) => ({ ...prev, status: 'failed' }));
+            setWeTransferSession((prev) => ({ ...prev, status: 'failed', latestError: msg }));
             return;
           }
           // Log each step line from the init
@@ -701,17 +884,21 @@ export default function DashboardPage() {
             sessionId: data.sessionId ?? null,
             status: (data.status as WeTransferSessionState['status']) ?? 'ready',
             mailbox: data.mailbox?.email ?? null,
+            mailboxMessageCount: data.mailboxMessageCount ?? null,
+            latestError: data.latestError ?? null,
+            attachment,
             steps: (data.steps as WeTransferStep[]) ?? [],
           });
           appendLog(
             'info',
-            `WeTransfer session prepared | mailbox: ${data.mailbox?.email ?? 'unknown'} (real mailbox, automation steps may still be simulated)`,
+            `WeTransfer session prepared | mailbox: ${data.mailbox?.email ?? 'unknown'} | inbox messages: ${data.mailboxMessageCount ?? 'unknown'} (real mailbox, automation steps may still be simulated)`,
             'wetransfer'
           );
           addToast(`Temp mailbox: ${data.mailbox?.email ?? '?'}`, 'success');
 
           setRunState('running');
           stopRequestedRef.current = false;
+          setWeTransferSession((prev) => ({ ...prev, status: 'sending' }));
           appendLog(
             'warning',
             `WeTransfer run started (${pendingForSender.length} pending). Browser upload/send remain simulation placeholders until automation is integrated.`,
@@ -723,7 +910,7 @@ export default function DashboardPage() {
           setIsPreparing(false);
           appendLog('error', `Failed to init WeTransfer session: ${err.message}`, 'wetransfer');
           addToast('WeTransfer init failed', 'error');
-          setWeTransferSession((prev) => ({ ...prev, status: 'failed' }));
+          setWeTransferSession((prev) => ({ ...prev, status: 'failed', latestError: err.message }));
         });
       return;
     }
@@ -1046,7 +1233,7 @@ export default function DashboardPage() {
                       </label>
                       <div className="text-xs text-slate-600">
                         {wetransferUploadFile
-                          ? `Attached: ${wetransferUploadFile.name} (${Math.max(1, Math.round(wetransferUploadFile.size / 1024))} KB)`
+                          ? `Attached: ${wetransferUploadFile.name} (${formatBytes(wetransferUploadFile.size)})`
                           : 'No file selected yet'}
                       </div>
                     </div>
@@ -1114,6 +1301,26 @@ export default function DashboardPage() {
                       </div>
                     </div>
                   )}
+                  <div className="mt-3 rounded border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700 space-y-1">
+                    <div className="font-semibold text-slate-800">WeTransfer attachment debug</div>
+                    <div>
+                      Readiness:{' '}
+                      <span
+                        className={
+                          wetransferAttachment.readiness === 'ready'
+                            ? 'text-emerald-600 font-semibold'
+                            : 'text-red-600 font-semibold'
+                        }
+                      >
+                        {wetransferAttachment.readiness}
+                      </span>
+                    </div>
+                    <div>Name: {wetransferAttachment.name ?? 'none selected'}</div>
+                    <div>Source: {wetransferAttachment.source}</div>
+                    <div>MIME: {wetransferAttachment.mimeType ?? 'unknown'}</div>
+                    <div>Size: {formatBytes(wetransferAttachment.sizeBytes)}</div>
+                    <div className="text-slate-500">{wetransferAttachment.detail}</div>
+                  </div>
                   <label className="mt-3 flex items-center gap-2 text-sm">
                     <input
                       type="checkbox"
@@ -1535,6 +1742,26 @@ function WeTransferStepsPanel({ session }: { session: WeTransferSessionState }) 
             Temp mailbox: {session.mailbox}
           </div>
         )}
+        {session.mailboxMessageCount !== null && (
+          <div className="mb-2 text-xs px-2 py-1 rounded bg-slate-50 text-slate-700">
+            Mailbox messages: {session.mailboxMessageCount}
+          </div>
+        )}
+        {session.attachment && (
+          <div className="mb-2 text-xs px-2 py-2 rounded bg-slate-50 text-slate-700 space-y-1">
+            <div className="font-semibold text-slate-800">Attachment</div>
+            <div>Name: {session.attachment.name ?? 'none selected'}</div>
+            <div>Source: {session.attachment.source}</div>
+            <div>MIME: {session.attachment.mimeType ?? 'unknown'}</div>
+            <div>Size: {formatBytes(session.attachment.sizeBytes)}</div>
+            <div>Readiness: {session.attachment.readiness}</div>
+          </div>
+        )}
+        {session.latestError && (
+          <div className="mb-2 text-xs px-2 py-2 rounded bg-red-50 text-red-700">
+            Latest error: {session.latestError}
+          </div>
+        )}
         {session.status === 'initializing' && session.steps.length === 0 && (
           <div className="text-xs text-slate-400 italic animate-pulse">Initialising session…</div>
         )}
@@ -1568,6 +1795,11 @@ function WeTransferStepsPanel({ session }: { session: WeTransferSessionState }) 
         {session.status === 'failed' && (
           <div className="mt-2 text-xs text-red-600 font-semibold">
             Session failed. Check the log panel below.
+          </div>
+        )}
+        {session.status === 'completed_with_errors' && (
+          <div className="mt-2 text-xs text-amber-600 font-semibold">
+            Run finished with unconfirmed or failed leads. Review the latest error and step details.
           </div>
         )}
       </div>

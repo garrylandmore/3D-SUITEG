@@ -8,6 +8,18 @@ import {
   setWeTransferSessionLocal,
 } from '@/lib/local-store';
 
+type WeTransferSessionResponse = {
+  sessionId?: string;
+  campaignId?: string;
+  status?: string;
+  mailbox?: { email: string; token?: string } | null;
+  mailboxMessageCount?: number | null;
+  latestError?: string | null;
+  steps?: WeTransferExecutionStep[];
+  logs?: string[];
+  error?: string;
+};
+
 /**
  * POST /api/wetransfer/session
  *
@@ -43,28 +55,35 @@ export async function POST(request: NextRequest) {
   const logs: string[] = [];
   const steps: WeTransferExecutionStep[] = [];
 
-  const session = await initWeTransferSession(
-    campaignId,
-    tempMailApiKey,
-    (step, logLine) => {
-      steps.push({ ...step });
-      logs.push(logLine);
-    }
-  );
+  try {
+    const session = await initWeTransferSession(
+      campaignId,
+      tempMailApiKey,
+      (step, logLine) => {
+        steps.push({ ...step });
+        logs.push(logLine);
+      }
+    );
 
-  setWeTransferSessionLocal(campaignId, session);
+    setWeTransferSessionLocal(campaignId, session);
 
-  return NextResponse.json(
-    {
+    const response: WeTransferSessionResponse = {
       sessionId: session.id,
       campaignId,
       status: session.status,
       mailbox: session.tempMailbox,
+      mailboxMessageCount: session.mailboxMessageCount,
+      latestError: session.latestError,
       steps: session.steps,
       logs,
-    },
-    { status: session.status === 'failed' ? 500 : 200 }
-  );
+      error: session.status === 'failed' ? session.latestError ?? 'WeTransfer session initialisation failed' : undefined,
+    };
+
+    return NextResponse.json(response, { status: session.status === 'failed' ? 500 : 200 });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'WeTransfer session initialisation failed';
+    return NextResponse.json({ error: message } satisfies WeTransferSessionResponse, { status: 500 });
+  }
 }
 
 /**
@@ -88,6 +107,8 @@ export async function GET(request: NextRequest) {
     campaignId: session.campaignId,
     status: session.status,
     mailbox: session.tempMailbox,
+    mailboxMessageCount: session.mailboxMessageCount,
+    latestError: session.latestError,
     steps: session.steps,
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,

@@ -43,10 +43,19 @@ export type WeTransferSession = {
   id: string;
   campaignId: string;
   tempMailbox: TempMailIOMailbox | null;
+  mailboxMessageCount: number | null;
+  latestError: string | null;
   steps: WeTransferExecutionStep[];
   createdAt: string;
   updatedAt: string;
-  status: 'initializing' | 'ready' | 'sending' | 'stopped' | 'completed' | 'failed';
+  status:
+    | 'initializing'
+    | 'ready'
+    | 'sending'
+    | 'stopped'
+    | 'completed'
+    | 'completed_with_errors'
+    | 'failed';
 };
 
 export type WeTransferSendResult = {
@@ -141,6 +150,8 @@ export async function initWeTransferSession(
     id: makeId('wt_session'),
     campaignId,
     tempMailbox: null,
+    mailboxMessageCount: null,
+    latestError: null,
     steps: makeSteps(),
     createdAt: nowIso(),
     updatedAt: nowIso(),
@@ -168,6 +179,7 @@ export async function initWeTransferSession(
   try {
     const { mailbox, rateLimit } = await createTempMailboxIO(tempMailApiKey);
     session.tempMailbox = mailbox;
+    session.latestError = null;
     stepUpdate(
       'create_mailbox',
       'success',
@@ -176,6 +188,7 @@ export async function initWeTransferSession(
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
     stepUpdate('create_mailbox', 'failed', msg);
+    session.latestError = msg;
     session.status = 'failed';
     return session;
   }
@@ -217,6 +230,7 @@ export async function initWeTransferSession(
       session.tempMailbox!.email,
       tempMailApiKey
     );
+    session.mailboxMessageCount = messages.length;
     const verifMsg = messages.find(
       (m) =>
         m.subject?.toLowerCase().includes('verif') ||
@@ -239,6 +253,7 @@ export async function initWeTransferSession(
     }
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
+    session.latestError = `Inbox poll error: ${msg}`;
     stepUpdate(
       'verify_email',
       'skipped',
@@ -280,14 +295,19 @@ export async function sendLeadViaWeTransfer(
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void
 ): Promise<WeTransferSendResult> {
   if (!session.tempMailbox) {
+    session.latestError = 'No temp mailbox in session – session may have failed during init';
+    session.status = 'failed';
     return {
       success: false,
       leadEmail,
       step: 'send_to_lead',
-      detail: 'No temp mailbox in session – session may have failed during init',
+      detail: session.latestError,
       confirmationStatus: 'failed',
     };
   }
+
+  session.status = 'sending';
+  session.updatedAt = nowIso();
 
   // Reset per-lead steps so the same session can be reused across leads
   for (const stepId of ['upload_file', 'send_to_lead']) {
@@ -337,16 +357,17 @@ export async function sendLeadViaWeTransfer(
 
   const shouldFail = !leadEmail.includes('@') || leadEmail.includes('fail');
   if (shouldFail) {
+    session.latestError = `SIMULATED: Transfer to ${leadEmail} failed`;
     stepUpdate(
       'send_to_lead',
       'failed',
-      `SIMULATED: Transfer to ${leadEmail} failed`
+      session.latestError
     );
     return {
       success: false,
       leadEmail,
       step: 'send_to_lead',
-      detail: `SIMULATED: Transfer to ${leadEmail} failed`,
+      detail: session.latestError,
       confirmationStatus: 'failed',
     };
   }
@@ -357,6 +378,7 @@ export async function sendLeadViaWeTransfer(
     'skipped',
     `SIMULATED PLACEHOLDER: No live WeTransfer send confirmation for ${leadEmail}. Generated reference link: ${transferUrl}. Mailbox: ${session.tempMailbox.email}`
   );
+  session.status = 'ready';
 
   return {
     success: false,
