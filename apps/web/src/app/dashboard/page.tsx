@@ -652,6 +652,58 @@ export default function DashboardPage() {
     setActiveModal(item);
   }
 
+  async function saveBrowserProxySettings() {
+    setBrowserProxyError(null);
+    const portNum = parseInt(browserProxy.port, 10);
+    if (browserProxy.enabled) {
+      if (!browserProxy.host.trim()) {
+        setBrowserProxyError('Host is required when proxy is enabled.');
+        return;
+      }
+      if (!Number.isFinite(portNum) || portNum < 1 || portNum > 65535) {
+        setBrowserProxyError('Port must be a number between 1 and 65535.');
+        return;
+      }
+    }
+    setBrowserProxySaving(true);
+    try {
+      const body: Record<string, unknown> = {
+        enabled: browserProxy.enabled,
+        protocol: browserProxy.protocol,
+        host: browserProxy.host.trim(),
+        port: portNum || 8080,
+        username: browserProxy.username.trim(),
+      };
+      if (browserProxy.password !== '') {
+        body.password = browserProxy.password;
+      }
+      const res = await fetch('/api/browser-proxy', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json() as Record<string, unknown>;
+      if (!res.ok) {
+        setBrowserProxyError(String(data.error ?? 'Failed to save proxy settings'));
+      } else {
+        setBrowserProxyHasPassword(Boolean(data.hasPassword));
+        setBrowserProxy((p) => ({ ...p, password: '' }));
+        appendLog(
+          'success',
+          browserProxy.enabled
+            ? `Browser proxy enabled: ${browserProxy.protocol}://${browserProxy.host.trim()}:${portNum}`
+            : 'Browser proxy disabled',
+          'system'
+        );
+        addToast('Proxy settings saved', 'success');
+      }
+    } catch {
+      setBrowserProxyError('Network error — could not save proxy settings');
+    } finally {
+      setBrowserProxySaving(false);
+    }
+  }
+
   function importLeadLines(lines: string[]) {
     const toImport = dedupeEnabled ? dedupeLeads(leads, lines) : lines.map((raw) => {
       const identity = parseLeadIdentity(raw);
@@ -1461,6 +1513,112 @@ export default function DashboardPage() {
                       Lead autograb supports plain emails and <span className="font-mono">Name &lt;email&gt;</span>. In Generate mode, PDFs are created per lead before each send attempt.
                     </p>
                 </Panel>
+
+                <Panel title="Chromium / Browser Proxy Settings">
+                  <div className="space-y-4 text-sm">
+                    <p className="text-slate-500 text-xs">
+                      Dedicated proxy configuration for Chromium/Playwright browser automation.
+                    </p>
+                    <div className="flex items-center gap-3">
+                      <label className="flex items-center gap-2 cursor-pointer font-medium">
+                        <input
+                          type="checkbox"
+                          checked={browserProxy.enabled}
+                          onChange={(e) => setBrowserProxy((p) => ({ ...p, enabled: e.target.checked }))}
+                        />
+                        Enable browser proxy
+                      </label>
+                      <span className={`px-2 py-0.5 rounded text-xs font-mono ${browserProxy.enabled ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+                        {browserProxy.enabled ? 'ON' : 'OFF'}
+                      </span>
+                    </div>
+                    <fieldset
+                      disabled={!browserProxy.enabled}
+                      className={`grid sm:grid-cols-2 gap-3 rounded border border-slate-200 p-3 transition-opacity ${browserProxy.enabled ? 'bg-white opacity-100' : 'bg-slate-50 opacity-60'}`}
+                    >
+                      <Field label="Protocol">
+                        <select
+                          className="input"
+                          value={browserProxy.protocol}
+                          onChange={(e) => setBrowserProxy((p) => ({ ...p, protocol: e.target.value as 'http' | 'socks5' }))}
+                          disabled={!browserProxy.enabled}
+                        >
+                          <option value="http">http</option>
+                          <option value="socks5">socks5</option>
+                        </select>
+                      </Field>
+                      <Field label="Host">
+                        <input
+                          className="input"
+                          value={browserProxy.host}
+                          onChange={(e) => setBrowserProxy((p) => ({ ...p, host: e.target.value }))}
+                          placeholder="e.g. gate.nodemaven.com"
+                          disabled={!browserProxy.enabled}
+                        />
+                      </Field>
+                      <Field label="Port">
+                        <input
+                          type="number"
+                          className="input"
+                          value={browserProxy.port}
+                          onChange={(e) => setBrowserProxy((p) => ({ ...p, port: e.target.value }))}
+                          placeholder="8080"
+                          min={1}
+                          max={65535}
+                          disabled={!browserProxy.enabled}
+                        />
+                      </Field>
+                      <Field label="Username">
+                        <input
+                          className="input"
+                          value={browserProxy.username}
+                          onChange={(e) => setBrowserProxy((p) => ({ ...p, username: e.target.value }))}
+                          placeholder="Proxy username"
+                          autoComplete="off"
+                          disabled={!browserProxy.enabled}
+                        />
+                      </Field>
+                      <div className="sm:col-span-2">
+                        <Field label="Password">
+                          <div className="flex gap-2 items-center">
+                            <input
+                              type="password"
+                              className="input flex-1"
+                              value={browserProxy.password}
+                              onChange={(e) => setBrowserProxy((p) => ({ ...p, password: e.target.value }))}
+                              placeholder={browserProxyHasPassword ? '••••••• (set — re-enter to change)' : 'Leave blank if no auth'}
+                              autoComplete="new-password"
+                              disabled={!browserProxy.enabled}
+                            />
+                            {browserProxyHasPassword && (
+                              <button
+                                className="px-2 py-1 rounded border text-xs text-red-600 border-red-300 hover:bg-red-50 disabled:opacity-50"
+                                onClick={() => { setBrowserProxy((p) => ({ ...p, password: '' })); setBrowserProxyHasPassword(false); }}
+                                title="Clear stored password"
+                                type="button"
+                                disabled={!browserProxy.enabled}
+                              >
+                                Clear
+                              </button>
+                            )}
+                          </div>
+                        </Field>
+                      </div>
+                    </fieldset>
+                    {browserProxyError && (
+                      <p className="text-red-600 text-xs mt-1">{browserProxyError}</p>
+                    )}
+                    <div className="flex gap-2 mt-2">
+                      <button
+                        className="px-3 py-2 rounded bg-[#6C63FF] text-white disabled:opacity-50"
+                        disabled={browserProxySaving}
+                        onClick={saveBrowserProxySettings}
+                      >
+                        {browserProxySaving ? 'Saving…' : 'Save Proxy Settings'}
+                      </button>
+                    </div>
+                  </div>
+                </Panel>
               </div>
 
               {/* WeTransfer execution steps panel */}
@@ -1702,57 +1860,7 @@ export default function DashboardPage() {
                 <button
                   className="px-3 py-2 rounded bg-[#6C63FF] text-white disabled:opacity-50"
                   disabled={browserProxySaving}
-                  onClick={async () => {
-                    setBrowserProxyError(null);
-                    const portNum = parseInt(browserProxy.port, 10);
-                    if (browserProxy.enabled) {
-                      if (!browserProxy.host.trim()) {
-                        setBrowserProxyError('Host is required when proxy is enabled.');
-                        return;
-                      }
-                      if (!Number.isFinite(portNum) || portNum < 1 || portNum > 65535) {
-                        setBrowserProxyError('Port must be a number between 1 and 65535.');
-                        return;
-                      }
-                    }
-                    setBrowserProxySaving(true);
-                    try {
-                      const body: Record<string, unknown> = {
-                        enabled: browserProxy.enabled,
-                        protocol: browserProxy.protocol,
-                        host: browserProxy.host.trim(),
-                        port: portNum || 8080,
-                        username: browserProxy.username.trim(),
-                      };
-                      if (browserProxy.password !== '') {
-                        body.password = browserProxy.password;
-                      }
-                      const res = await fetch('/api/browser-proxy', {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(body),
-                      });
-                      const data = await res.json() as Record<string, unknown>;
-                      if (!res.ok) {
-                        setBrowserProxyError(String(data.error ?? 'Failed to save proxy settings'));
-                      } else {
-                        setBrowserProxyHasPassword(Boolean(data.hasPassword));
-                        setBrowserProxy((p) => ({ ...p, password: '' }));
-                        appendLog(
-                          'success',
-                          browserProxy.enabled
-                            ? `Browser proxy enabled: ${browserProxy.protocol}://${browserProxy.host.trim()}:${portNum}`
-                            : 'Browser proxy disabled',
-                          'system'
-                        );
-                        addToast('Proxy settings saved', 'success');
-                      }
-                    } catch {
-                      setBrowserProxyError('Network error — could not save proxy settings');
-                    } finally {
-                      setBrowserProxySaving(false);
-                    }
-                  }}
+                  onClick={saveBrowserProxySettings}
                 >
                   {browserProxySaving ? 'Saving…' : 'Save Proxy Settings'}
                 </button>
