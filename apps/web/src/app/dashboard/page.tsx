@@ -89,13 +89,31 @@ type DashboardSettings = {
 };
 
 type CredentialsState = {
-  wetransfer: { provider: string; account: string; proxy: string };
+  wetransfer: { provider: string; account: string; proxy: string; tempMailApiKey: string };
   adobe: { clientId: string; tenant: string };
   quickbooks: { companyId: string; environment: string };
   docusign: { accountId: string; integrationKey: string };
 };
 
 type Toast = { id: string; message: string; level: LogLevel };
+
+type WeTransferStepStatus = 'pending' | 'running' | 'success' | 'failed' | 'skipped';
+
+type WeTransferStep = {
+  id: string;
+  label: string;
+  status: WeTransferStepStatus;
+  detail?: string;
+  timestamp?: string;
+  isReal: boolean;
+};
+
+type WeTransferSessionState = {
+  sessionId: string | null;
+  status: 'idle' | 'initializing' | 'ready' | 'sending' | 'stopped' | 'completed' | 'failed';
+  mailbox: string | null;
+  steps: WeTransferStep[];
+};
 
 const SENDERS: Array<{ key: SenderKey; label: string }> = [
   { key: 'wetransfer', label: 'WeTransfer' },
@@ -210,7 +228,7 @@ export default function DashboardPage() {
   });
 
   const [credentials, setCredentials] = React.useState<CredentialsState>({
-    wetransfer: { provider: 'TempMail', account: '', proxy: '' },
+    wetransfer: { provider: 'temp-mail.io', account: '', proxy: '', tempMailApiKey: '' },
     adobe: { clientId: '', tenant: '' },
     quickbooks: { companyId: '', environment: 'sandbox' },
     docusign: { accountId: '', integrationKey: '' },
@@ -227,6 +245,14 @@ export default function DashboardPage() {
   const timerRef = React.useRef<NodeJS.Timeout | null>(null);
   const leadsRef = React.useRef<Lead[]>([]);
   const senderConfigsRef = React.useRef(senderConfigs);
+  const wtCampaignId = React.useRef<string>(`dashboard_${Date.now()}`);
+
+  const [weTransferSession, setWeTransferSession] = React.useState<WeTransferSessionState>({
+    sessionId: null,
+    status: 'idle',
+    mailbox: null,
+    steps: [],
+  });
 
   const updateLeads = React.useCallback(
     (updater: Lead[] | ((prev: Lead[]) => Lead[])) => {
@@ -393,6 +419,65 @@ export default function DashboardPage() {
       )
     );
 
+    if (sender === 'wetransfer') {
+      // WeTransfer mode: call backend send-lead API (real temp mailbox + simulated browser steps)
+      const campaignId = wtCampaignId.current;
+      const filename = senderConfigsRef.current.wetransfer.fileType === 'PDF' ? 'document.pdf' : `document.${senderConfigsRef.current.wetransfer.fileType.toLowerCase()}`;
+      fetch('/api/wetransfer/send-lead', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ campaignId, leadEmail: nextLead.normalized, filename }),
+      })
+        .then((res) => res.json())
+        .then((data: { success: boolean; detail?: string; transferUrl?: string; logs?: string[] }) => {
+          if (stopRequestedRef.current) {
+            updateLeads((prev) =>
+              prev.map((lead) => (lead.status === 'sending' ? { ...lead, status: 'pending' } : lead))
+            );
+            setRunState('stopped');
+            appendLog('stopped', `Send stopped for ${sender}`, sender);
+            addToast('Send stopped', 'stopped');
+            return;
+          }
+          // Log backend step lines
+          if (Array.isArray(data.logs)) {
+            data.logs.forEach((line: string) => appendLog('info', line, 'wetransfer'));
+          }
+          updateLeads((prev) =>
+            prev.map((lead) => {
+              if (lead.id !== nextLead.id) return lead;
+              if (!data.success) {
+                return { ...lead, status: 'failed', failedAt: nowIso(), senderStatus: { ...lead.senderStatus, [sender]: 'failed' } };
+              }
+              return { ...lead, status: 'sent', sentAt: nowIso(), senderStatus: { ...lead.senderStatus, [sender]: 'sent' } };
+            })
+          );
+          appendLog(
+            data.success ? 'success' : 'error',
+            data.success
+              ? `WeTransfer sent: ${nextLead.normalized}${data.transferUrl ? ` | ${data.transferUrl}` : ''}`
+              : `WeTransfer failed: ${nextLead.normalized}${data.detail ? ` — ${data.detail}` : ''}`,
+            sender
+          );
+          const delayMs = Math.max(300, senderConfigsRef.current[sender].rateLimitDelay * 1000);
+          timerRef.current = setTimeout(() => processNextLead(sender), delayMs);
+        })
+        .catch((err: Error) => {
+          appendLog('error', `WeTransfer API error: ${err.message}`, 'wetransfer');
+          updateLeads((prev) =>
+            prev.map((lead) =>
+              lead.id === nextLead.id
+                ? { ...lead, status: 'failed', failedAt: nowIso(), senderStatus: { ...lead.senderStatus, [sender]: 'failed' } }
+                : lead
+            )
+          );
+          const delayMs = Math.max(300, senderConfigsRef.current[sender].rateLimitDelay * 1000);
+          timerRef.current = setTimeout(() => processNextLead(sender), delayMs);
+        });
+      return;
+    }
+
+    // Non-WeTransfer senders: local simulation
     const delayMs = Math.max(300, senderConfigsRef.current[sender].rateLimitDelay * 1000);
     timerRef.current = setTimeout(() => {
       const shouldFail = nextLead.normalized.includes('fail') || Math.random() < 0.08;
@@ -437,6 +522,68 @@ export default function DashboardPage() {
     if (!pendingForSender.length) {
       appendLog('warning', 'No pending leads to send. Resume skipped.', activeSender);
       addToast('No pending leads', 'warning');
+      return;
+    }
+
+    if (activeSender === 'wetransfer') {
+      const apiKey = credentials.wetransfer.tempMailApiKey.trim();
+      if (!apiKey) {
+        appendLog('error', 'temp-mail.io API key is required for WeTransfer mode. Add it in Credentials.', 'wetransfer');
+        addToast('Set temp-mail.io API key in Credentials', 'error');
+        return;
+      }
+
+      setIsPreparing(true);
+      setWeTransferSession({ sessionId: null, status: 'initializing', mailbox: null, steps: [] });
+      appendLog('info', 'Initialising WeTransfer session — creating temp-mail.io mailbox…', 'wetransfer');
+
+      const campaignId = wtCampaignId.current;
+      fetch('/api/wetransfer/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ campaignId, tempMailApiKey: apiKey }),
+      })
+        .then((res) => res.json())
+        .then((data: {
+          sessionId?: string;
+          status?: string;
+          mailbox?: { email: string };
+          steps?: WeTransferStep[];
+          logs?: string[];
+          error?: string;
+        }) => {
+          setIsPreparing(false);
+          if (data.error || data.status === 'failed') {
+            const msg = data.error || 'WeTransfer session initialisation failed';
+            appendLog('error', msg, 'wetransfer');
+            addToast(msg, 'error');
+            setWeTransferSession((prev) => ({ ...prev, status: 'failed' }));
+            return;
+          }
+          // Log each step line from the init
+          if (Array.isArray(data.logs)) {
+            data.logs.forEach((line: string) => appendLog('info', line, 'wetransfer'));
+          }
+          setWeTransferSession({
+            sessionId: data.sessionId ?? null,
+            status: (data.status as WeTransferSessionState['status']) ?? 'ready',
+            mailbox: data.mailbox?.email ?? null,
+            steps: (data.steps as WeTransferStep[]) ?? [],
+          });
+          appendLog('success', `WeTransfer session ready | mailbox: ${data.mailbox?.email ?? 'unknown'}`, 'wetransfer');
+          addToast(`Temp mailbox: ${data.mailbox?.email ?? '?'}`, 'success');
+
+          setRunState('running');
+          stopRequestedRef.current = false;
+          appendLog('info', `WeTransfer send started (${pendingForSender.length} pending)`, 'wetransfer');
+          processNextLead('wetransfer');
+        })
+        .catch((err: Error) => {
+          setIsPreparing(false);
+          appendLog('error', `Failed to init WeTransfer session: ${err.message}`, 'wetransfer');
+          addToast('WeTransfer init failed', 'error');
+          setWeTransferSession((prev) => ({ ...prev, status: 'failed' }));
+        });
       return;
     }
 
@@ -577,151 +724,164 @@ export default function DashboardPage() {
 
         <section className="px-4 pb-4 flex-1 overflow-auto space-y-4">
           {activeSender === 'wetransfer' ? (
-            <div className="grid lg:grid-cols-2 gap-4">
-              <Panel title="Connection & Account">
-                <div className="grid sm:grid-cols-2 gap-3 text-sm">
-                  <Field label="Status">
-                    <span className={`px-2 py-1 rounded ${activeConfig.connected ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
-                      {activeConfig.connected ? 'Connected' : 'Disconnected'}
-                    </span>
-                  </Field>
-                  <Field label="Temp Provider">
-                    <input
-                      className="input"
-                      value={activeConfig.tempProvider}
-                      onChange={(event) =>
-                        setSenderConfigs((prev) => ({
-                          ...prev,
-                          wetransfer: { ...prev.wetransfer, tempProvider: event.target.value },
-                        }))
-                      }
-                    />
-                  </Field>
-                  <Field label="Pool Size">
-                    <input
-                      type="number"
-                      className="input"
-                      value={activeConfig.poolSize}
-                      onChange={(event) =>
-                        setSenderConfigs((prev) => ({
-                          ...prev,
-                          wetransfer: { ...prev.wetransfer, poolSize: Number(event.target.value || 0) },
-                        }))
-                      }
-                    />
-                  </Field>
-                  <Field label="Rate Delay (sec)">
-                    <input
-                      type="number"
-                      className="input"
-                      value={activeConfig.rateLimitDelay}
-                      onChange={(event) =>
-                        setSenderConfigs((prev) => ({
-                          ...prev,
-                          wetransfer: { ...prev.wetransfer, rateLimitDelay: Number(event.target.value || 1) },
-                        }))
-                      }
-                    />
-                  </Field>
-                </div>
-                <div className="mt-3 flex items-center gap-3 text-sm">
-                  <label className="flex items-center gap-2">
+            <div className="space-y-4">
+              <div className="grid lg:grid-cols-2 gap-4">
+                <Panel title="Connection & Account">
+                  <div className="grid sm:grid-cols-2 gap-3 text-sm">
+                    <Field label="Status">
+                      <span className={`px-2 py-1 rounded ${activeConfig.connected ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
+                        {activeConfig.connected ? 'Connected' : 'Disconnected'}
+                      </span>
+                    </Field>
+                    <Field label="Temp Provider">
+                      <span className="px-2 py-1 rounded bg-blue-50 text-blue-700 text-xs font-mono">temp-mail.io</span>
+                    </Field>
+                    <Field label="Pool Size">
+                      <input
+                        type="number"
+                        className="input"
+                        value={activeConfig.poolSize}
+                        onChange={(event) =>
+                          setSenderConfigs((prev) => ({
+                            ...prev,
+                            wetransfer: { ...prev.wetransfer, poolSize: Number(event.target.value || 0) },
+                          }))
+                        }
+                      />
+                    </Field>
+                    <Field label="Rate Delay (sec)">
+                      <input
+                        type="number"
+                        className="input"
+                        value={activeConfig.rateLimitDelay}
+                        onChange={(event) =>
+                          setSenderConfigs((prev) => ({
+                            ...prev,
+                            wetransfer: { ...prev.wetransfer, rateLimitDelay: Number(event.target.value || 1) },
+                          }))
+                        }
+                      />
+                    </Field>
+                  </div>
+                  <div className="mt-3 text-sm">
+                    <Field label="temp-mail.io API Key">
+                      <div className="flex gap-2">
+                        <input
+                          type="password"
+                          className="input flex-1"
+                          value={credentials.wetransfer.tempMailApiKey}
+                          onChange={(e) =>
+                            setCredentials((p) => ({
+                              ...p,
+                              wetransfer: { ...p.wetransfer, tempMailApiKey: e.target.value },
+                            }))
+                          }
+                          placeholder="Paste your temp-mail.io API key"
+                        />
+                        <span
+                          className={`px-2 py-1 rounded text-xs flex items-center ${credentials.wetransfer.tempMailApiKey ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}
+                        >
+                          {credentials.wetransfer.tempMailApiKey ? '✓ Set' : '! Required'}
+                        </span>
+                      </div>
+                    </Field>
+                  </div>
+                  <div className="mt-3 flex items-center gap-3 text-sm">
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={activeConfig.autoRotate}
+                        onChange={(event) =>
+                          setSenderConfigs((prev) => ({
+                            ...prev,
+                            wetransfer: { ...prev.wetransfer, autoRotate: event.target.checked },
+                          }))
+                        }
+                      />
+                      Auto-rotate
+                    </label>
+                  </div>
+                </Panel>
+
+                <Panel title="File / Message / CTA">
+                  <div className="grid sm:grid-cols-2 gap-3 text-sm">
+                    <Field label="File Type">
+                      <select
+                        className="input"
+                        value={activeConfig.fileType}
+                        onChange={(event) =>
+                          setSenderConfigs((prev) => ({
+                            ...prev,
+                            wetransfer: { ...prev.wetransfer, fileType: event.target.value },
+                          }))
+                        }
+                      >
+                        {['PDF', 'PPTX', 'DOCX', 'ZIP'].map((option) => (
+                          <option key={option}>{option}</option>
+                        ))}
+                      </select>
+                    </Field>
+                    <Field label="PDF Orientation">
+                      <select
+                        className="input"
+                        value={activeConfig.orientation}
+                        onChange={(event) =>
+                          setSenderConfigs((prev) => ({
+                            ...prev,
+                            wetransfer: { ...prev.wetransfer, orientation: event.target.value as 'landscape' | 'portrait' },
+                          }))
+                        }
+                      >
+                        <option value="landscape">Horizontal / Landscape</option>
+                        <option value="portrait">Vertical / Portrait</option>
+                      </select>
+                    </Field>
+                    <Field label="Design">
+                      <input
+                        className="input"
+                        value={activeConfig.design}
+                        onChange={(event) =>
+                          setSenderConfigs((prev) => ({
+                            ...prev,
+                            wetransfer: { ...prev.wetransfer, design: event.target.value },
+                          }))
+                        }
+                      />
+                    </Field>
+                    <Field label="CTA">
+                      <select
+                        className="input"
+                        value={activeConfig.cta}
+                        onChange={(event) =>
+                          setSenderConfigs((prev) => ({
+                            ...prev,
+                            wetransfer: { ...prev.wetransfer, cta: event.target.value as 'button' | 'qr' },
+                          }))
+                        }
+                      >
+                        <option value="button">Button</option>
+                        <option value="qr">QR code</option>
+                      </select>
+                    </Field>
+                  </div>
+                  <label className="mt-3 flex items-center gap-2 text-sm">
                     <input
                       type="checkbox"
-                      checked={activeConfig.autoRotate}
+                      checked={activeConfig.useCustomMessage}
                       onChange={(event) =>
                         setSenderConfigs((prev) => ({
                           ...prev,
-                          wetransfer: { ...prev.wetransfer, autoRotate: event.target.checked },
+                          wetransfer: { ...prev.wetransfer, useCustomMessage: event.target.checked },
                         }))
                       }
                     />
-                    Auto-rotate
+                    Custom transfer message
                   </label>
-                  <button
-                    className="px-2 py-1 rounded border text-xs"
-                    onClick={() => appendLog('info', 'Temp email pool refreshed', 'wetransfer')}
-                  >
-                    Refresh temp email pool
-                  </button>
-                </div>
-              </Panel>
+                </Panel>
+              </div>
 
-              <Panel title="File / Message / CTA">
-                <div className="grid sm:grid-cols-2 gap-3 text-sm">
-                  <Field label="File Type">
-                    <select
-                      className="input"
-                      value={activeConfig.fileType}
-                      onChange={(event) =>
-                        setSenderConfigs((prev) => ({
-                          ...prev,
-                          wetransfer: { ...prev.wetransfer, fileType: event.target.value },
-                        }))
-                      }
-                    >
-                      {['PDF', 'PPTX', 'DOCX', 'ZIP'].map((option) => (
-                        <option key={option}>{option}</option>
-                      ))}
-                    </select>
-                  </Field>
-                  <Field label="PDF Orientation">
-                    <select
-                      className="input"
-                      value={activeConfig.orientation}
-                      onChange={(event) =>
-                        setSenderConfigs((prev) => ({
-                          ...prev,
-                          wetransfer: { ...prev.wetransfer, orientation: event.target.value as 'landscape' | 'portrait' },
-                        }))
-                      }
-                    >
-                      <option value="landscape">Horizontal / Landscape</option>
-                      <option value="portrait">Vertical / Portrait</option>
-                    </select>
-                  </Field>
-                  <Field label="Design">
-                    <input
-                      className="input"
-                      value={activeConfig.design}
-                      onChange={(event) =>
-                        setSenderConfigs((prev) => ({
-                          ...prev,
-                          wetransfer: { ...prev.wetransfer, design: event.target.value },
-                        }))
-                      }
-                    />
-                  </Field>
-                  <Field label="CTA">
-                    <select
-                      className="input"
-                      value={activeConfig.cta}
-                      onChange={(event) =>
-                        setSenderConfigs((prev) => ({
-                          ...prev,
-                          wetransfer: { ...prev.wetransfer, cta: event.target.value as 'button' | 'qr' },
-                        }))
-                      }
-                    >
-                      <option value="button">Button</option>
-                      <option value="qr">QR code</option>
-                    </select>
-                  </Field>
-                </div>
-                <label className="mt-3 flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={activeConfig.useCustomMessage}
-                    onChange={(event) =>
-                      setSenderConfigs((prev) => ({
-                        ...prev,
-                        wetransfer: { ...prev.wetransfer, useCustomMessage: event.target.checked },
-                      }))
-                    }
-                  />
-                  Custom transfer message
-                </label>
-              </Panel>
+              {/* WeTransfer execution steps panel */}
+              <WeTransferStepsPanel session={weTransferSession} />
             </div>
           ) : (
             <MockSenderPanel
@@ -811,13 +971,46 @@ export default function DashboardPage() {
           )}
 
           {activeModal === 'credentials' && (
-            <div className="grid sm:grid-cols-2 gap-3 text-sm">
-              <Field label="WeTransfer provider"><input className="input" value={credentials.wetransfer.provider} onChange={(e) => setCredentials((p) => ({ ...p, wetransfer: { ...p.wetransfer, provider: e.target.value } }))} /></Field>
-              <Field label="WeTransfer account"><input className="input" value={credentials.wetransfer.account} onChange={(e) => setCredentials((p) => ({ ...p, wetransfer: { ...p.wetransfer, account: e.target.value } }))} /></Field>
-              <Field label="Adobe Client ID"><input className="input" value={credentials.adobe.clientId} onChange={(e) => setCredentials((p) => ({ ...p, adobe: { ...p.adobe, clientId: e.target.value } }))} /></Field>
-              <Field label="Adobe Tenant"><input className="input" value={credentials.adobe.tenant} onChange={(e) => setCredentials((p) => ({ ...p, adobe: { ...p.adobe, tenant: e.target.value } }))} /></Field>
-              <Field label="QuickBooks Company ID"><input className="input" value={credentials.quickbooks.companyId} onChange={(e) => setCredentials((p) => ({ ...p, quickbooks: { ...p.quickbooks, companyId: e.target.value } }))} /></Field>
-              <Field label="DocuSign Account ID"><input className="input" value={credentials.docusign.accountId} onChange={(e) => setCredentials((p) => ({ ...p, docusign: { ...p.docusign, accountId: e.target.value } }))} /></Field>
+            <div className="space-y-4 text-sm">
+              <div>
+                <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">WeTransfer / temp-mail.io</p>
+                <div className="grid sm:grid-cols-2 gap-3">
+                  <Field label="Provider">
+                    <span className="px-2 py-1 rounded bg-blue-50 text-blue-700 text-xs font-mono">temp-mail.io</span>
+                  </Field>
+                  <Field label="Base URL">
+                    <span className="px-2 py-1 rounded bg-slate-100 text-slate-600 text-xs font-mono">https://api.temp-mail.io</span>
+                  </Field>
+                  <div className="sm:col-span-2">
+                    <Field label="temp-mail.io API Key (X-API-Key)">
+                      <div className="flex gap-2">
+                        <input
+                          type="password"
+                          className="input flex-1"
+                          value={credentials.wetransfer.tempMailApiKey}
+                          onChange={(e) => setCredentials((p) => ({ ...p, wetransfer: { ...p.wetransfer, tempMailApiKey: e.target.value } }))}
+                          placeholder="Paste your temp-mail.io API key"
+                        />
+                        <span className={`px-2 py-1 rounded text-xs flex items-center whitespace-nowrap ${credentials.wetransfer.tempMailApiKey ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
+                          {credentials.wetransfer.tempMailApiKey ? '✓ Set' : '! Required for WeTransfer'}
+                        </span>
+                      </div>
+                    </Field>
+                  </div>
+                  <Field label="WeTransfer Account (optional)"><input className="input" value={credentials.wetransfer.account} onChange={(e) => setCredentials((p) => ({ ...p, wetransfer: { ...p.wetransfer, account: e.target.value } }))} /></Field>
+                  <Field label="Proxy (optional)"><input className="input" value={credentials.wetransfer.proxy} onChange={(e) => setCredentials((p) => ({ ...p, wetransfer: { ...p.wetransfer, proxy: e.target.value } }))} /></Field>
+                </div>
+              </div>
+              <hr className="border-slate-200" />
+              <div>
+                <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Other Senders</p>
+                <div className="grid sm:grid-cols-2 gap-3">
+                  <Field label="Adobe Client ID"><input className="input" value={credentials.adobe.clientId} onChange={(e) => setCredentials((p) => ({ ...p, adobe: { ...p.adobe, clientId: e.target.value } }))} /></Field>
+                  <Field label="Adobe Tenant"><input className="input" value={credentials.adobe.tenant} onChange={(e) => setCredentials((p) => ({ ...p, adobe: { ...p.adobe, tenant: e.target.value } }))} /></Field>
+                  <Field label="QuickBooks Company ID"><input className="input" value={credentials.quickbooks.companyId} onChange={(e) => setCredentials((p) => ({ ...p, quickbooks: { ...p.quickbooks, companyId: e.target.value } }))} /></Field>
+                  <Field label="DocuSign Account ID"><input className="input" value={credentials.docusign.accountId} onChange={(e) => setCredentials((p) => ({ ...p, docusign: { ...p.docusign, accountId: e.target.value } }))} /></Field>
+                </div>
+              </div>
             </div>
           )}
 
@@ -1052,4 +1245,79 @@ function levelColor(level: LogLevel) {
   if (level === 'error' || level === 'stopped') return '#EF4444';
   if (level === 'system') return '#A78BFA';
   return '#60A5FA';
+}
+
+function stepStatusColor(status: WeTransferStepStatus) {
+  if (status === 'success') return '#22C55E';
+  if (status === 'failed') return '#EF4444';
+  if (status === 'running') return '#60A5FA';
+  if (status === 'skipped') return '#94A3B8';
+  return '#CBD5E1'; // pending
+}
+
+function stepStatusIcon(status: WeTransferStepStatus) {
+  if (status === 'success') return '✓';
+  if (status === 'failed') return '✗';
+  if (status === 'running') return '⟳';
+  if (status === 'skipped') return '—';
+  return '○';
+}
+
+function WeTransferStepsPanel({ session }: { session: WeTransferSessionState }) {
+  if (session.status === 'idle') {
+    return (
+      <Panel title="WeTransfer Execution Steps">
+        <p className="text-xs text-slate-400 italic">
+          Steps will appear here when you click Send. Ensure your temp-mail.io API key is set in the Connection panel above.
+        </p>
+      </Panel>
+    );
+  }
+
+  return (
+    <Panel title="WeTransfer Execution Steps">
+      <div className="space-y-1">
+        {session.mailbox && (
+          <div className="mb-2 text-xs px-2 py-1 rounded bg-blue-50 text-blue-700 font-mono">
+            Temp mailbox: {session.mailbox}
+          </div>
+        )}
+        {session.status === 'initializing' && session.steps.length === 0 && (
+          <div className="text-xs text-slate-400 italic animate-pulse">Initialising session…</div>
+        )}
+        {session.steps.map((step) => (
+          <div key={step.id} className="flex items-start gap-2 text-xs py-1 border-b border-slate-100 last:border-0">
+            <span
+              className="font-mono font-bold min-w-[16px] text-center"
+              style={{ color: stepStatusColor(step.status) }}
+            >
+              {stepStatusIcon(step.status)}
+            </span>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <span className={step.status === 'running' ? 'font-semibold' : ''}>{step.label}</span>
+                {!step.isReal && (
+                  <span className="px-1 rounded bg-amber-50 text-amber-600 text-[10px]">SIMULATED</span>
+                )}
+                {step.isReal && step.status !== 'pending' && (
+                  <span className="px-1 rounded bg-emerald-50 text-emerald-600 text-[10px]">REAL</span>
+                )}
+              </div>
+              {step.detail && (
+                <div className="text-slate-500 mt-0.5 truncate" title={step.detail}>{step.detail}</div>
+              )}
+            </div>
+            <span className="text-slate-400 whitespace-nowrap">
+              {step.timestamp ? formatTime(step.timestamp) : ''}
+            </span>
+          </div>
+        ))}
+        {session.status === 'failed' && (
+          <div className="mt-2 text-xs text-red-600 font-semibold">
+            Session failed. Check the log panel below.
+          </div>
+        )}
+      </div>
+    </Panel>
+  );
 }
