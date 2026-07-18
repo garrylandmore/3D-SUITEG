@@ -10,6 +10,9 @@ import {
 const WETRANSFER_URL = (process.env.WETRANSFER_WEB_URL || 'https://wetransfer.com').trim();
 const WETRANSFER_LOGIN_URL = `${WETRANSFER_URL.replace(/\/$/, '')}/log-in`;
 
+// Element visibility timeout (increased from 20s to 60s for slow proxy connections)
+const ELEMENT_TIMEOUT = parseInt(process.env.ELEMENT_TIMEOUT || '60000', 10);
+
 type VerificationResolution = {
   verificationLink?: string;
   verificationCode?: string;
@@ -442,7 +445,7 @@ async function performSignupAndVerification(
 
   // Step 3: Fill input#email with senderEmail
   const emailInput = page.locator('input#email').first();
-  await emailInput.waitFor({ state: 'visible', timeout: 20000 });
+  await emailInput.waitFor({ state: 'visible', timeout: ELEMENT_TIMEOUT });
   await emailInput.fill(senderEmail);
   onPhase?.({ phase: 'sender_email_entered', detail: `Sender email entered: ${senderEmail}` });
 
@@ -491,7 +494,7 @@ async function performSignupAndVerification(
     const primaryVisible = await codeInput.isVisible().catch(() => false);
     const activeCodeInput = primaryVisible ? codeInput : codeInputFallback;
 
-    await activeCodeInput.waitFor({ state: 'visible', timeout: 20000 });
+    await activeCodeInput.waitFor({ state: 'visible', timeout: ELEMENT_TIMEOUT });
     await activeCodeInput.fill(resolution.verificationCode);
 
     const verifyBtn = page.getByRole('button', { name: /verify/i }).first();
