@@ -457,6 +457,28 @@ function normalizeSenderConfigs(value: unknown): Record<SenderKey, SenderConfig>
   };
 }
 
+function normalizeBrowserProxyPanelState(value: unknown): BrowserProxyPanelState {
+  const defaults: BrowserProxyPanelState = {
+    enabled: false,
+    protocol: 'http',
+    host: '',
+    port: '8080',
+    username: '',
+    password: '',
+  };
+  if (!value || typeof value !== 'object') return defaults;
+  const config = value as Partial<BrowserProxyPanelState>;
+  return {
+    ...defaults,
+    enabled: Boolean(config.enabled),
+    protocol: config.protocol === 'socks5' ? 'socks5' : 'http',
+    host: normalizeString(config.host),
+    port: normalizeString(config.port, defaults.port),
+    username: normalizeString(config.username),
+    password: '',
+  };
+}
+
 const LOCAL_STORAGE_KEY = 'crm-console-session-v2';
 
 export default function DashboardPage() {
@@ -576,6 +598,7 @@ export default function DashboardPage() {
       if (Array.isArray(parsed.logs)) setLogs(parsed.logs);
       if (parsed.settingsState) setSettingsState(parsed.settingsState);
       setSenderConfigs(normalizeSenderConfigs(parsed.senderConfigs));
+      if (parsed.browserProxy) setBrowserProxy(normalizeBrowserProxyPanelState(parsed.browserProxy));
       if (parsed.credentials) setCredentials(parsed.credentials);
       if (parsed.moduleNotes) setModuleNotes(parsed.moduleNotes);
       appendLog('system', 'Restored local session cache', 'system');
@@ -636,13 +659,14 @@ export default function DashboardPage() {
         logs,
         settingsState,
         senderConfigs,
+        browserProxy: { ...browserProxy, password: '' },
         credentials,
         moduleNotes,
       })
     );
     appendLog('success', 'Campaign saved to local session storage', 'system');
     addToast('Session saved', 'success');
-  }, [campaignName, activeSender, leads, logs, settingsState, senderConfigs, credentials, moduleNotes, appendLog, addToast]);
+  }, [campaignName, activeSender, leads, logs, settingsState, senderConfigs, browserProxy, credentials, moduleNotes, appendLog, addToast]);
 
   function openModule(item: 'crm-sender' | ModalKey) {
     if (item === 'crm-sender') {
@@ -1756,11 +1780,117 @@ export default function DashboardPage() {
           )}
 
           {activeModal === 'settings' && (
-            <div className="grid sm:grid-cols-2 gap-3 text-sm">
-              <Field label="Proxy"><input className="input" value={settingsState.proxy} onChange={(e) => setSettingsState((p) => ({ ...p, proxy: e.target.value }))} /></Field>
-              <Field label="Default Rate Limit (sec)"><input type="number" className="input" value={settingsState.defaultDelay} onChange={(e) => setSettingsState((p) => ({ ...p, defaultDelay: Number(e.target.value || 1) }))} /></Field>
-              <Field label="Default File Type"><input className="input" value={settingsState.defaultFileType} onChange={(e) => setSettingsState((p) => ({ ...p, defaultFileType: e.target.value }))} /></Field>
-              <Field label="Default Temp Provider"><input className="input" value={settingsState.defaultTempProvider} onChange={(e) => setSettingsState((p) => ({ ...p, defaultTempProvider: e.target.value }))} /></Field>
+            <div className="space-y-4 text-sm">
+              <div className="grid sm:grid-cols-2 gap-3">
+                <Field label="Proxy"><input className="input" value={settingsState.proxy} onChange={(e) => setSettingsState((p) => ({ ...p, proxy: e.target.value }))} /></Field>
+                <Field label="Default Rate Limit (sec)"><input type="number" className="input" value={settingsState.defaultDelay} onChange={(e) => setSettingsState((p) => ({ ...p, defaultDelay: Number(e.target.value || 1) }))} /></Field>
+                <Field label="Default File Type"><input className="input" value={settingsState.defaultFileType} onChange={(e) => setSettingsState((p) => ({ ...p, defaultFileType: e.target.value }))} /></Field>
+                <Field label="Default Temp Provider"><input className="input" value={settingsState.defaultTempProvider} onChange={(e) => setSettingsState((p) => ({ ...p, defaultTempProvider: e.target.value }))} /></Field>
+              </div>
+              <div className="rounded border border-slate-200 p-3 space-y-3">
+                <div>
+                  <h3 className="font-semibold text-slate-800">Chromium Proxy</h3>
+                  <p className="text-xs text-slate-500">Controls outbound browser traffic for Chromium / Playwright automation.</p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <label className="flex items-center gap-2 cursor-pointer font-medium">
+                    <input
+                      type="checkbox"
+                      checked={browserProxy.enabled}
+                      onChange={(e) => setBrowserProxy((p) => ({ ...p, enabled: e.target.checked }))}
+                    />
+                    Enable proxy
+                  </label>
+                  <span className={`px-2 py-0.5 rounded text-xs font-mono ${browserProxy.enabled ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
+                    {browserProxy.enabled ? 'ON' : 'OFF'}
+                  </span>
+                </div>
+                <fieldset
+                  disabled={!browserProxy.enabled}
+                  className={`grid sm:grid-cols-2 gap-3 rounded border border-slate-200 p-3 transition-opacity ${browserProxy.enabled ? 'bg-white opacity-100' : 'bg-slate-50 opacity-60'}`}
+                >
+                  <Field label="Protocol">
+                    <select
+                      className="input"
+                      value={browserProxy.protocol}
+                      onChange={(e) => setBrowserProxy((p) => ({ ...p, protocol: e.target.value as 'http' | 'socks5' }))}
+                      disabled={!browserProxy.enabled}
+                    >
+                      <option value="http">http</option>
+                      <option value="socks5">socks5</option>
+                    </select>
+                  </Field>
+                  <Field label="Host">
+                    <input
+                      className="input"
+                      value={browserProxy.host}
+                      onChange={(e) => setBrowserProxy((p) => ({ ...p, host: e.target.value }))}
+                      placeholder="e.g. gate.nodemaven.com"
+                      disabled={!browserProxy.enabled}
+                    />
+                  </Field>
+                  <Field label="Port">
+                    <input
+                      type="number"
+                      className="input"
+                      value={browserProxy.port}
+                      onChange={(e) => setBrowserProxy((p) => ({ ...p, port: e.target.value }))}
+                      placeholder="8080"
+                      min={1}
+                      max={65535}
+                      disabled={!browserProxy.enabled}
+                    />
+                  </Field>
+                  <Field label="Username">
+                    <input
+                      className="input"
+                      value={browserProxy.username}
+                      onChange={(e) => setBrowserProxy((p) => ({ ...p, username: e.target.value }))}
+                      placeholder="Proxy username"
+                      autoComplete="off"
+                      disabled={!browserProxy.enabled}
+                    />
+                  </Field>
+                  <div className="sm:col-span-2">
+                    <Field label="Password">
+                      <div className="flex gap-2 items-center">
+                        <input
+                          type="password"
+                          className="input flex-1"
+                          value={browserProxy.password}
+                          onChange={(e) => setBrowserProxy((p) => ({ ...p, password: e.target.value }))}
+                          placeholder={browserProxyHasPassword ? '••••••• (set — re-enter to change)' : 'Leave blank if no auth'}
+                          autoComplete="new-password"
+                          disabled={!browserProxy.enabled}
+                        />
+                        {browserProxyHasPassword && (
+                          <button
+                            className="px-2 py-1 rounded border text-xs text-red-600 border-red-300 hover:bg-red-50 disabled:opacity-50"
+                            onClick={() => { setBrowserProxy((p) => ({ ...p, password: '' })); setBrowserProxyHasPassword(false); }}
+                            title="Clear stored password"
+                            type="button"
+                            disabled={!browserProxy.enabled}
+                          >
+                            Clear
+                          </button>
+                        )}
+                      </div>
+                    </Field>
+                  </div>
+                </fieldset>
+                {browserProxyError && (
+                  <p className="text-red-600 text-xs mt-1">{browserProxyError}</p>
+                )}
+                <div className="flex gap-2 mt-2">
+                  <button
+                    className="px-3 py-2 rounded bg-[#6C63FF] text-white disabled:opacity-50"
+                    disabled={browserProxySaving}
+                    onClick={saveBrowserProxySettings}
+                  >
+                    {browserProxySaving ? 'Saving…' : 'Save Proxy Settings'}
+                  </button>
+                </div>
+              </div>
             </div>
           )}
 
