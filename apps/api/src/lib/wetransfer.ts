@@ -81,44 +81,201 @@ async function waitForStableDom(page: Page): Promise<void> {
   await page.waitForTimeout(600);
 }
 
-async function fillEmailField(page: Page, targetEmail: string, mode: 'recipient' | 'sender'): Promise<boolean> {
+/**
+ * Attempt to attach a file to the WeTransfer upload area using multiple selector strategies.
+ *
+ * Strategy order:
+ *   A) hidden input path  — look for input[type="file"] directly
+ *   B) file chooser path  — click an "Add files" trigger and intercept the file chooser
+ *      B1: getByRole button with name "Add files"
+ *      B2: [role="button"] containing "Add files" text
+ *      B3: button element containing "Add files" text
+ *      B4: button that contains img[src*="add-files"] (WeTransfer-specific SVG)
+ *      B5: img[src*="add-files"] parent element (catches non-button wrappers)
+ *      B6: getByText "Add files" (any visible element)
+ *
+ * Logs the winning strategy via `onLog`. On total failure, throws with the list of
+ * attempted strategies so logs are diagnostic rather than generic.
+ */
+async function uploadAttachment(
+  page: Page,
+  attachmentPath: string,
+  onLog?: (msg: string) => void
+): Promise<void> {
+  // Strategy A: direct hidden file input
+  const fileInput = page.locator('input[type="file"]').first();
+  if (await fileInput.count()) {
+    onLog?.('hidden input path: found input[type="file"] — setting files directly');
+    await fileInput.setInputFiles(attachmentPath);
+    return;
+  }
+  onLog?.('hidden input path: input[type="file"] absent — trying file chooser path');
+
+  // Strategy B: trigger file chooser via "Add files" UI
+  type LocatorDef = { label: string; locator: ReturnType<Page['locator']> };
+  const addFilesTargets: LocatorDef[] = [
+    {
+      label: 'add-files text: getByRole(button, "Add files")',
+      locator: page.getByRole('button', { name: /add files/i }),
+    },
+    {
+      label: 'add-files text: [role="button"] hasText /add files/i',
+      locator: page.locator('[role="button"]').filter({ hasText: /add files/i }),
+    },
+    {
+      label: 'add-files text: button hasText /add files/i',
+      locator: page.locator('button').filter({ hasText: /add files/i }),
+    },
+    {
+      // WeTransfer-specific: button wrapping the add-files-v2.svg image
+      label: 'add-files text: button:has(img[src*="add-files"])',
+      locator: page.locator('button:has(img[src*="add-files"])'),
+    },
+    {
+      // WeTransfer-specific: any ancestor of the add-files img that is clickable
+      label: 'add-files text: img[src*="add-files"] parent element',
+      locator: page.locator('img[src*="add-files"]').locator('xpath=..'),
+    },
+    {
+      label: 'add-files text: getByText("Add files", exact)',
+      locator: page.getByText('Add files', { exact: true }),
+    },
+  ];
+
+  const attemptedLabels: string[] = [];
+
+  for (const { label, locator } of addFilesTargets) {
+    let count = 0;
+    try { count = await locator.count(); } catch { /* skip */ }
+    if (count === 0) {
+      attemptedLabels.push(`${label} (DOM cue absent)`);
+      continue;
+    }
+
+    const el = locator.first();
+    const visible = await el.isVisible().catch(() => false);
+    if (!visible) {
+      attemptedLabels.push(`${label} (found but not visible)`);
+      continue;
+    }
+
+    try {
+      const [fileChooser] = await Promise.all([
+        page.waitForEvent('filechooser', { timeout: 8000 }),
+        el.click({ timeout: 3000 }),
+      ]);
+      onLog?.(`file chooser path: succeeded via ${label}`);
+      await fileChooser.setFiles(attachmentPath);
+      return;
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      attemptedLabels.push(`${label} (click did not open file chooser: ${reason})`);
+    }
+  }
+
+  throw new Error(
+    `Could not find file input or upload trigger on WeTransfer page. ` +
+      `Strategies attempted: ${attemptedLabels.join('; ')}`
+  );
+}
+
+/**
+ * Fill an email field on the WeTransfer page.
+ *
+ * Recipient mode strategy order:
+ *   1) input#autosuggest  (WeTransfer current stable ID)
+ *   2) input[name="autosuggest"]
+ *   3) getByLabel(/email to/i)  (WeTransfer current label text)
+ *   4) heuristic placeholder/name selectors
+ *   5) first input[type="email"]
+ *
+ * Logs the winning strategy via `onLog`.
+ */
+async function fillEmailField(
+  page: Page,
+  targetEmail: string,
+  mode: 'recipient' | 'sender',
+  onLog?: (msg: string) => void
+): Promise<boolean> {
   const normalized = targetEmail.trim();
   if (!normalized) return false;
 
-  const selectorHints = mode === 'recipient'
-    ? [
-        'input[placeholder*="email" i][name*="recipient" i]',
-        'input[placeholder*="to" i][type="email"]',
-        'input[name*="recipient" i][type="email"]',
-      ]
-    : [
-        'input[placeholder*="your" i][type="email"]',
-        'input[placeholder*="from" i][type="email"]',
-        'input[name*="sender" i][type="email"]',
-      ];
+  if (mode === 'recipient') {
+    // Strategy 1 & 2: WeTransfer stable selectors observed in current DOM
+    const stableSelectors = [
+      { label: 'recipient field detection: input#autosuggest', selector: 'input#autosuggest' },
+      { label: 'recipient field detection: input[name="autosuggest"]', selector: 'input[name="autosuggest"]' },
+    ];
+    for (const { label, selector } of stableSelectors) {
+      const field = page.locator(selector).first();
+      if (await field.isVisible().catch(() => false)) {
+        onLog?.(label);
+        await field.fill(normalized);
+        // Confirm the autosuggest entry so WeTransfer registers the recipient
+        await field.press('Enter').catch(() => undefined);
+        await page.waitForTimeout(300);
+        return true;
+      }
+    }
 
-  for (const selector of selectorHints) {
+    // Strategy 3: getByLabel "Email to"
+    const byLabel = page.getByLabel(/email to/i);
+    if (await byLabel.isVisible().catch(() => false)) {
+      onLog?.('recipient field detection: getByLabel("Email to")');
+      await byLabel.fill(normalized);
+      await byLabel.press('Enter').catch(() => undefined);
+      await page.waitForTimeout(300);
+      return true;
+    }
+
+    // Strategy 4: heuristic placeholder/name selectors
+    const heuristicSelectors = [
+      'input[placeholder*="email" i][name*="recipient" i]',
+      'input[placeholder*="to" i][type="email"]',
+      'input[name*="recipient" i][type="email"]',
+    ];
+    for (const selector of heuristicSelectors) {
+      const field = page.locator(selector).first();
+      if (await field.isVisible().catch(() => false)) {
+        onLog?.(`recipient field detection: heuristic selector ${selector}`);
+        await field.fill(normalized);
+        return true;
+      }
+    }
+
+    // Strategy 5: first visible email input
+    const emailFields = page.locator('input[type="email"]');
+    const count = await emailFields.count();
+    if (count > 0) {
+      onLog?.('recipient field detection: first input[type="email"] fallback');
+      await emailFields.first().fill(normalized);
+      return true;
+    }
+
+    onLog?.('recipient field detection: no matching field found');
+    return false;
+  }
+
+  // sender mode
+  const senderHints = [
+    'input[placeholder*="your" i][type="email"]',
+    'input[placeholder*="from" i][type="email"]',
+    'input[name*="sender" i][type="email"]',
+  ];
+  for (const selector of senderHints) {
     const field = page.locator(selector).first();
     if (await field.isVisible().catch(() => false)) {
       await field.fill(normalized);
       return true;
     }
   }
-
   const emailFields = page.locator('input[type="email"]');
   const count = await emailFields.count();
   if (count === 0) return false;
-
-  if (mode === 'recipient') {
-    await emailFields.first().fill(normalized);
-    return true;
-  }
-
   if (count > 1) {
     await emailFields.nth(1).fill(normalized);
     return true;
   }
-
   return false;
 }
 
@@ -134,22 +291,6 @@ function getAntiBotHint(html: string): string | null {
     return 'WeTransfer browser flow appears blocked by anti-bot verification (captcha/human check).';
   }
   return null;
-}
-
-async function uploadAttachment(page: Page, attachmentPath: string): Promise<void> {
-  const input = page.locator('input[type="file"]').first();
-  if (await input.count()) {
-    await input.setInputFiles(attachmentPath);
-    return;
-  }
-
-  const fileChooserPromise = page.waitForEvent('filechooser', { timeout: 8000 });
-  const clicked = await clickFirstVisibleByText(page, ['Add files', 'Upload files', 'Select files', 'Add your files']);
-  if (!clicked) {
-    throw new Error('Could not find file input or upload trigger on WeTransfer page');
-  }
-  const chooser = await fileChooserPromise;
-  await chooser.setFiles(attachmentPath);
 }
 
 async function handleVerificationIfPrompted(
@@ -308,11 +449,23 @@ export async function createWeTransferTransfer(
 
     onPhase?.({ phase: 'preparing_attachment', detail: `Using file ${path.basename(attachmentPath)}` });
     onPhase?.({ phase: 'upload_started', detail: `Uploading "${filename}" (${fileBuffer.length} bytes)` });
-    await uploadAttachment(page, attachmentPath);
-    await page.waitForTimeout(1000);
-    onPhase?.({ phase: 'upload_completed', detail: `Upload completed for "${filename}"` });
 
-    const recipientFilled = await fillEmailField(page, normalizedRecipient, 'recipient');
+    const uploadStrategyLog: string[] = [];
+    await uploadAttachment(page, attachmentPath, (msg) => {
+      uploadStrategyLog.push(msg);
+      onPhase?.({ phase: 'upload_started', detail: msg });
+    });
+    await page.waitForTimeout(1000);
+    onPhase?.({
+      phase: 'upload_completed',
+      detail: `Upload completed for "${filename}"${uploadStrategyLog.length ? ` [${uploadStrategyLog.join(', ')}]` : ''}`,
+    });
+
+    const recipientStrategyLog: string[] = [];
+    const recipientFilled = await fillEmailField(page, normalizedRecipient, 'recipient', (msg) => {
+      recipientStrategyLog.push(msg);
+      onPhase?.({ phase: 'send_submitted', detail: msg });
+    });
     if (!recipientFilled) {
       throw new Error('Could not locate recipient email field in WeTransfer browser flow.');
     }
@@ -332,7 +485,19 @@ export async function createWeTransferTransfer(
 
     await clickFirstVisibleByText(page, ['I agree', 'Accept terms', 'Agree']);
 
-    const sendClicked = await clickFirstVisibleByText(page, SEND_BUTTON_HINTS);
+    // Transfer button: prefer the stable data-testid attribute, fall back to text-based search
+    let sendClicked = false;
+    const transferByTestId = page.locator('[data-testid="uploaderForm-transfer-button"]');
+    if (await transferByTestId.isVisible().catch(() => false)) {
+      onPhase?.({ phase: 'send_submitted', detail: 'transfer button detection: data-testid="uploaderForm-transfer-button"' });
+      await transferByTestId.click({ timeout: 5000 });
+      sendClicked = true;
+    } else {
+      sendClicked = await clickFirstVisibleByText(page, SEND_BUTTON_HINTS);
+      if (sendClicked) {
+        onPhase?.({ phase: 'send_submitted', detail: 'transfer button detection: text-based selector (Transfer/Send/etc.)' });
+      }
+    }
     if (!sendClicked) {
       throw new Error('Could not find send/transfer submit button in WeTransfer browser flow.');
     }
