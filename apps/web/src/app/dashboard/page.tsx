@@ -107,6 +107,19 @@ type BrowserProxyPanelState = {
   password: string;
 };
 
+type BrowserProxyTestApiResponse = {
+  success?: boolean;
+  message?: string;
+  diagnostics?: string;
+  error?: string;
+};
+
+type BrowserProxyTestResult = {
+  level: 'success' | 'error' | 'warning';
+  message: string;
+  diagnostics?: string;
+};
+
 type CredentialsState = {
   wetransfer: { provider: string; account: string; proxy: string; tempMailApiKey: string };
   adobe: { clientId: string; tenant: string };
@@ -517,7 +530,9 @@ export default function DashboardPage() {
   });
   const [browserProxyError, setBrowserProxyError] = React.useState<string | null>(null);
   const [browserProxySaving, setBrowserProxySaving] = React.useState(false);
+  const [browserProxyTesting, setBrowserProxyTesting] = React.useState(false);
   const [browserProxyHasPassword, setBrowserProxyHasPassword] = React.useState(false);
+  const [browserProxyTestResult, setBrowserProxyTestResult] = React.useState<BrowserProxyTestResult | null>(null);
 
   const [credentials, setCredentials] = React.useState<CredentialsState>({
     wetransfer: { provider: 'temp-mail.io', account: '', proxy: '', tempMailApiKey: '' },
@@ -676,8 +691,32 @@ export default function DashboardPage() {
     setActiveModal(item);
   }
 
+  function syncStoredLogs(nextLogs: RuntimeLog[]) {
+    try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_KEY);
+      if (!saved) return;
+      const parsed = JSON.parse(saved) as Record<string, unknown>;
+      localStorage.setItem(
+        LOCAL_STORAGE_KEY,
+        JSON.stringify({
+          ...parsed,
+          logs: nextLogs,
+        })
+      );
+    } catch {
+      // Ignore local cache write failures while clearing logs.
+    }
+  }
+
+  function clearVisibleLogs() {
+    setLogs([]);
+    syncStoredLogs([]);
+    addToast('Logs cleared', 'success');
+  }
+
   async function saveBrowserProxySettings() {
     setBrowserProxyError(null);
+    setBrowserProxyTestResult(null);
     const portNum = parseInt(browserProxy.port, 10);
     if (browserProxy.enabled) {
       if (!browserProxy.host.trim()) {
@@ -698,7 +737,7 @@ export default function DashboardPage() {
         port: portNum || 8080,
         username: browserProxy.username.trim(),
       };
-      if (browserProxy.password !== '') {
+      if (browserProxy.password !== '' || !browserProxyHasPassword) {
         body.password = browserProxy.password;
       }
       const res = await fetch('/api/browser-proxy', {
@@ -725,6 +764,75 @@ export default function DashboardPage() {
       setBrowserProxyError('Network error — could not save proxy settings');
     } finally {
       setBrowserProxySaving(false);
+    }
+  }
+
+  async function testBrowserProxy() {
+    setBrowserProxyError(null);
+    setBrowserProxyTestResult(null);
+
+    if (!browserProxy.enabled) {
+      const message = 'Enable the browser proxy before testing it.';
+      setBrowserProxyTestResult({ level: 'warning', message });
+      addToast(message, 'warning');
+      return;
+    }
+
+    const portNum = parseInt(browserProxy.port, 10);
+    if (!browserProxy.host.trim()) {
+      setBrowserProxyError('Host is required when proxy is enabled.');
+      return;
+    }
+    if (!Number.isFinite(portNum) || portNum < 1 || portNum > 65535) {
+      setBrowserProxyError('Port must be a number between 1 and 65535.');
+      return;
+    }
+
+    setBrowserProxyTesting(true);
+    try {
+      const body: Record<string, unknown> = {
+        enabled: browserProxy.enabled,
+        protocol: browserProxy.protocol,
+        host: browserProxy.host.trim(),
+        port: portNum,
+        username: browserProxy.username.trim(),
+      };
+      if (browserProxy.password !== '' || !browserProxyHasPassword) {
+        body.password = browserProxy.password;
+      }
+
+      const res = await fetch('/api/browser-proxy/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await parseApiJson<BrowserProxyTestApiResponse>(res);
+      const success = Boolean(res.ok && data.success);
+      const message =
+        data.message ||
+        data.error ||
+        (success ? 'Proxy test succeeded.' : 'Proxy test failed.');
+
+      setBrowserProxyTestResult({
+        level: success ? 'success' : 'error',
+        message,
+        diagnostics: data.diagnostics,
+      });
+      addToast(message, success ? 'success' : 'error');
+      appendLog(
+        success ? 'success' : 'error',
+        success
+          ? `Proxy test passed: ${browserProxy.protocol}://${browserProxy.host.trim()}:${portNum}`
+          : `Proxy test failed: ${message}`,
+        'system'
+      );
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Proxy test failed unexpectedly';
+      setBrowserProxyTestResult({ level: 'error', message });
+      addToast(message, 'error');
+      appendLog('error', `Proxy test failed: ${message}`, 'system');
+    } finally {
+      setBrowserProxyTesting(false);
     }
   }
 
@@ -1632,11 +1740,37 @@ export default function DashboardPage() {
                     {browserProxyError && (
                       <p className="text-red-600 text-xs mt-1">{browserProxyError}</p>
                     )}
+                    {browserProxyTestResult && (
+                      <div className={`rounded border px-3 py-2 text-xs ${
+                        browserProxyTestResult.level === 'success'
+                          ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                          : browserProxyTestResult.level === 'warning'
+                            ? 'border-amber-200 bg-amber-50 text-amber-700'
+                            : 'border-red-200 bg-red-50 text-red-700'
+                      }`}>
+                        <div>{browserProxyTestResult.message}</div>
+                        {browserProxyTestResult.diagnostics && (
+                          <div className="mt-1 font-mono text-[11px] opacity-80">
+                            {browserProxyTestResult.diagnostics}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     <div className="flex gap-2 mt-2">
                       <button
+                        className="px-3 py-2 rounded border border-slate-300 text-slate-700 disabled:opacity-50"
+                        disabled={!browserProxy.enabled || browserProxySaving || browserProxyTesting}
+                        onClick={testBrowserProxy}
+                        type="button"
+                        title={browserProxy.enabled ? 'Validate the configured proxy using the browser automation path' : 'Enable proxy to test it'}
+                      >
+                        {browserProxyTesting ? 'Testing…' : 'Test Proxy'}
+                      </button>
+                      <button
                         className="px-3 py-2 rounded bg-[#6C63FF] text-white disabled:opacity-50"
-                        disabled={browserProxySaving}
+                        disabled={browserProxySaving || browserProxyTesting}
                         onClick={saveBrowserProxySettings}
+                        type="button"
                       >
                         {browserProxySaving ? 'Saving…' : 'Save Proxy Settings'}
                       </button>
@@ -1661,6 +1795,16 @@ export default function DashboardPage() {
         </section>
 
         <section className="bg-[#1A1A2E] text-white px-4 py-3 border-t border-[#2D2D44] h-56 overflow-auto font-mono text-xs">
+          <div className="mb-3 flex items-center justify-between">
+            <span className="text-slate-300 uppercase tracking-wide">Runtime Logs</span>
+            <button
+              type="button"
+              className="rounded border border-slate-600 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-800"
+              onClick={clearVisibleLogs}
+            >
+              Clear Logs
+            </button>
+          </div>
           <div className="space-y-1">
             {logs.length === 0 && <div className="text-slate-400">No runtime actions yet.</div>}
             {logs.map((log) => (
@@ -1881,11 +2025,37 @@ export default function DashboardPage() {
                 {browserProxyError && (
                   <p className="text-red-600 text-xs mt-1">{browserProxyError}</p>
                 )}
+                {browserProxyTestResult && (
+                  <div className={`rounded border px-3 py-2 text-xs ${
+                    browserProxyTestResult.level === 'success'
+                      ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                      : browserProxyTestResult.level === 'warning'
+                        ? 'border-amber-200 bg-amber-50 text-amber-700'
+                        : 'border-red-200 bg-red-50 text-red-700'
+                  }`}>
+                    <div>{browserProxyTestResult.message}</div>
+                    {browserProxyTestResult.diagnostics && (
+                      <div className="mt-1 font-mono text-[11px] opacity-80">
+                        {browserProxyTestResult.diagnostics}
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div className="flex gap-2 mt-2">
                   <button
+                    className="px-3 py-2 rounded border border-slate-300 text-slate-700 disabled:opacity-50"
+                    disabled={!browserProxy.enabled || browserProxySaving || browserProxyTesting}
+                    onClick={testBrowserProxy}
+                    type="button"
+                    title={browserProxy.enabled ? 'Validate the configured proxy using the browser automation path' : 'Enable proxy to test it'}
+                  >
+                    {browserProxyTesting ? 'Testing…' : 'Test Proxy'}
+                  </button>
+                  <button
                     className="px-3 py-2 rounded bg-[#6C63FF] text-white disabled:opacity-50"
-                    disabled={browserProxySaving}
+                    disabled={browserProxySaving || browserProxyTesting}
                     onClick={saveBrowserProxySettings}
+                    type="button"
                   >
                     {browserProxySaving ? 'Saving…' : 'Save Proxy Settings'}
                   </button>
@@ -1894,7 +2064,7 @@ export default function DashboardPage() {
             </div>
           )}
 
-          {activeModal === 'logs' && <LogsModal logs={logs} />}
+          {activeModal === 'logs' && <LogsModal logs={logs} onClear={clearVisibleLogs} />}
 
           {activeModal === 'browser-proxy' && (
             <div className="space-y-4 text-sm">
@@ -1986,11 +2156,37 @@ export default function DashboardPage() {
               {browserProxyError && (
                 <p className="text-red-600 text-xs mt-1">{browserProxyError}</p>
               )}
+              {browserProxyTestResult && (
+                <div className={`rounded border px-3 py-2 text-xs ${
+                  browserProxyTestResult.level === 'success'
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                    : browserProxyTestResult.level === 'warning'
+                      ? 'border-amber-200 bg-amber-50 text-amber-700'
+                      : 'border-red-200 bg-red-50 text-red-700'
+                }`}>
+                  <div>{browserProxyTestResult.message}</div>
+                  {browserProxyTestResult.diagnostics && (
+                    <div className="mt-1 font-mono text-[11px] opacity-80">
+                      {browserProxyTestResult.diagnostics}
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="flex gap-2 mt-2">
                 <button
+                  className="px-3 py-2 rounded border border-slate-300 text-slate-700 disabled:opacity-50"
+                  disabled={!browserProxy.enabled || browserProxySaving || browserProxyTesting}
+                  onClick={testBrowserProxy}
+                  type="button"
+                  title={browserProxy.enabled ? 'Validate the configured proxy using the browser automation path' : 'Enable proxy to test it'}
+                >
+                  {browserProxyTesting ? 'Testing…' : 'Test Proxy'}
+                </button>
+                <button
                   className="px-3 py-2 rounded bg-[#6C63FF] text-white disabled:opacity-50"
-                  disabled={browserProxySaving}
+                  disabled={browserProxySaving || browserProxyTesting}
                   onClick={saveBrowserProxySettings}
+                  type="button"
                 >
                   {browserProxySaving ? 'Saving…' : 'Save Proxy Settings'}
                 </button>
@@ -2107,7 +2303,7 @@ function ModalShell({ title, onClose, children }: { title: string; onClose: () =
   );
 }
 
-function LogsModal({ logs }: { logs: RuntimeLog[] }) {
+function LogsModal({ logs, onClear }: { logs: RuntimeLog[]; onClear: () => void }) {
   const [senderFilter, setSenderFilter] = React.useState<'all' | SenderKey | 'system'>('all');
   const [levelFilter, setLevelFilter] = React.useState<'all' | LogLevel>('all');
 
@@ -2131,13 +2327,24 @@ function LogsModal({ logs }: { logs: RuntimeLog[] }) {
           ))}
         </select>
       </div>
-      <button
-        className="px-2 py-1 rounded border text-xs"
-        onClick={() => navigator.clipboard.writeText(JSON.stringify(filtered, null, 2))}
-      >
-        Copy filtered logs
-      </button>
+      <div className="flex gap-2">
+        <button
+          className="px-2 py-1 rounded border text-xs"
+          onClick={() => navigator.clipboard.writeText(JSON.stringify(filtered, null, 2))}
+          type="button"
+        >
+          Copy filtered logs
+        </button>
+        <button
+          className="px-2 py-1 rounded border text-xs"
+          onClick={onClear}
+          type="button"
+        >
+          Clear Logs
+        </button>
+      </div>
       <div className="max-h-72 overflow-auto rounded border border-slate-200 p-2 font-mono text-xs space-y-1 bg-slate-50">
+        {filtered.length === 0 && <div className="text-slate-400">No logs for the current filters.</div>}
         {filtered.map((log) => (
           <div key={log.id}>[{formatTime(log.timestamp)}] [{log.sender}] {log.level}: {log.message}</div>
         ))}

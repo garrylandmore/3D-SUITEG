@@ -4,6 +4,10 @@ import {
   setBrowserProxyConfigLocal,
 } from '@/lib/local-store';
 import type { BrowserProxyConfig } from '@/lib/browser-proxy-types';
+import {
+  getBrowserProxyDiagnostics,
+  validateBrowserProxyConfig,
+} from '@/lib/browser-proxy';
 
 type BrowserProxyGetResponse = {
   enabled: boolean;
@@ -111,6 +115,10 @@ export async function PUT(request: NextRequest): Promise<NextResponse> {
   }
 
   const config: BrowserProxyConfig = { enabled, protocol, host, port, username, password };
+  const validationError = validateBrowserProxyConfig(config);
+  if (validationError) {
+    return NextResponse.json({ error: validationError }, { status: 400 });
+  }
   setBrowserProxyConfigLocal(config);
 
   const response: BrowserProxyPutResponse = {
@@ -124,8 +132,11 @@ export async function PUT(request: NextRequest): Promise<NextResponse> {
   };
 
   console.log(
-    `[browser-proxy] config updated: enabled=${config.enabled}` +
-      (config.enabled ? ` protocol=${config.protocol} host=${config.host} port=${config.port}` : '')
+    `[browser-proxy] config updated: ${getBrowserProxyDiagnostics(
+      config,
+      'browser-proxy-config',
+      'PUT /api/browser-proxy'
+    )}`
   );
 
   return NextResponse.json(response);

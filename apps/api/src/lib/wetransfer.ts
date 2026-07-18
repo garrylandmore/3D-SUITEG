@@ -2,6 +2,10 @@ import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, Page } from 'playwright';
 import type { BrowserProxyConfig } from './browser-proxy-types';
+import {
+  buildPlaywrightProxyLaunchOptions,
+  getBrowserProxyDiagnostics,
+} from './browser-proxy';
 
 const WETRANSFER_URL = (process.env.WETRANSFER_WEB_URL || 'https://wetransfer.com').trim();
 const WETRANSFER_LOGIN_URL = `${WETRANSFER_URL.replace(/\/$/, '')}/log-in`;
@@ -44,23 +48,68 @@ export type WeTransferSendOptions = {
   proxyConfig?: BrowserProxyConfig | null;
 };
 
-/**
- * Build a Playwright-compatible proxy launch option from a BrowserProxyConfig.
- * Returns an empty object when proxy is disabled or host is not set.
- */
-function buildLaunchProxy(config?: BrowserProxyConfig | null): { proxy?: { server: string; username?: string; password?: string } } {
-  if (!config?.enabled || !config.host?.trim()) {
-    return {};
+function isHeadlessEnabled(): boolean {
+  return (process.env.WETRANSFER_HEADLESS || 'true').trim().toLowerCase() !== 'false';
+}
+
+async function launchWeTransferBrowser(
+  proxyConfig: BrowserProxyConfig | null | undefined,
+  onPhase: ((update: WeTransferSendPhaseUpdate) => void) | undefined,
+  launchPath: string
+) {
+  onPhase?.({
+    phase: 'opening_browser',
+    detail: getBrowserProxyDiagnostics(proxyConfig, 'launchWeTransferBrowser', launchPath),
+  });
+  onPhase?.({ phase: 'opening_browser', detail: 'Launching automation browser' });
+
+  return chromium.launch({
+    headless: isHeadlessEnabled(),
+    ...buildPlaywrightProxyLaunchOptions(proxyConfig),
+  });
+}
+
+async function openWeTransferLoginPage(
+  page: Page,
+  proxyConfig: BrowserProxyConfig | null | undefined,
+  onPhase: ((update: WeTransferSendPhaseUpdate) => void) | undefined,
+  launchPath: string
+): Promise<void> {
+  const maxAttempts = proxyConfig?.enabled ? 2 : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      onPhase?.({
+        phase: 'loading_wetransfer',
+        detail: `Loading ${WETRANSFER_LOGIN_URL} | helper=launchWeTransferBrowser | path=${launchPath} | attempt=${attempt}/${maxAttempts}`,
+      });
+      await page.goto(WETRANSFER_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await waitForStableDom(page);
+      await dismissConsentAndPopups(page);
+      const finalUrl = page.url();
+      onPhase?.({
+        phase: 'navigating_to_login',
+        detail: `Login page reachable (final URL: ${finalUrl}) | helper=launchWeTransferBrowser | path=${launchPath}`,
+      });
+      return;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      const shouldRetry =
+        proxyConfig?.enabled &&
+        attempt < maxAttempts &&
+        /ERR_TUNNEL_CONNECTION_FAILED/i.test(message);
+
+      if (!shouldRetry) {
+        throw error;
+      }
+
+      onPhase?.({
+        phase: 'loading_wetransfer',
+        detail: `Proxy tunnel failed while loading WeTransfer (attempt ${attempt}/${maxAttempts}); retrying once`,
+      });
+      await page.waitForTimeout(1200);
+    }
   }
-  const server = `${config.protocol}://${config.host.trim()}:${config.port}`;
-  const proxy: { server: string; username?: string; password?: string } = { server };
-  if (config.username?.trim()) {
-    proxy.username = config.username.trim();
-  }
-  if (config.password) {
-    proxy.password = config.password;
-  }
-  return { proxy };
 }
 
 const BUTTON_HINTS = [
@@ -367,12 +416,7 @@ async function performSignupAndVerification(
   onPhase?: (update: WeTransferSendPhaseUpdate) => void
 ): Promise<void> {
   // Step 1: Navigate to the login page
-  onPhase?.({ phase: 'navigating_to_login', detail: `Navigating to ${WETRANSFER_LOGIN_URL}` });
-  await page.goto(WETRANSFER_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await waitForStableDom(page);
-  await dismissConsentAndPopups(page);
-  const loginUrl = page.url();
-  onPhase?.({ phase: 'navigating_to_login', detail: `Login page loaded (final URL: ${loginUrl})` });
+  await openWeTransferLoginPage(page, options.proxyConfig, onPhase, 'send-signup');
 
   // Step 2: Click "Sign up"
   const signUpCandidates = [
@@ -536,23 +580,15 @@ async function confirmSend(page: Page): Promise<{ transferUrl?: string }> {
 
 export async function probeWeTransferWebsite(
   onPhase?: (update: WeTransferSendPhaseUpdate) => void,
-  proxyConfig?: BrowserProxyConfig | null
+  proxyConfig?: BrowserProxyConfig | null,
+  launchPath = 'probe'
 ): Promise<{ success: boolean; error?: string }> {
   let browser;
   try {
-    onPhase?.({ phase: 'opening_browser', detail: 'Launching automation browser' });
-    browser = await chromium.launch({
-      headless: (process.env.WETRANSFER_HEADLESS || 'true').trim().toLowerCase() !== 'false',
-      ...buildLaunchProxy(proxyConfig),
-    });
+    browser = await launchWeTransferBrowser(proxyConfig, onPhase, launchPath);
 
     const page = await browser.newPage();
-    onPhase?.({ phase: 'loading_wetransfer', detail: `Loading ${WETRANSFER_LOGIN_URL}` });
-    await page.goto(WETRANSFER_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await waitForStableDom(page);
-    await dismissConsentAndPopups(page);
-    const finalUrl = page.url();
-    onPhase?.({ phase: 'navigating_to_login', detail: `Login page reachable (final URL: ${finalUrl})` });
+    await openWeTransferLoginPage(page, proxyConfig, onPhase, launchPath);
 
     return { success: true };
   } catch (error: unknown) {
@@ -595,11 +631,7 @@ export async function createWeTransferTransfer(
       );
     }
 
-    onPhase?.({ phase: 'opening_browser', detail: 'Launching automation browser' });
-    browser = await chromium.launch({
-      headless: (process.env.WETRANSFER_HEADLESS || 'true').trim().toLowerCase() !== 'false',
-      ...buildLaunchProxy(options.proxyConfig),
-    });
+    browser = await launchWeTransferBrowser(options.proxyConfig, onPhase, 'send-transfer');
 
     const page = await browser.newPage();
 
