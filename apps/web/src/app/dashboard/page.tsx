@@ -105,7 +105,17 @@ type CredentialsState = {
 
 type Toast = { id: string; message: string; level: LogLevel };
 
-type WeTransferStepStatus = 'pending' | 'running' | 'success' | 'failed' | 'skipped';
+type WeTransferStepStatus =
+  | 'pending'
+  | 'running'
+  | 'waiting_for_verification'
+  | 'verification_received'
+  | 'upload_started'
+  | 'upload_completed'
+  | 'send_submitted'
+  | 'send_confirmed'
+  | 'success'
+  | 'failed';
 
 type WeTransferStep = {
   id: string;
@@ -156,7 +166,7 @@ type WeTransferSessionApiResponse = {
 
 type WeTransferSendLeadApiResponse = {
   success?: boolean;
-  confirmationStatus?: 'confirmed' | 'simulated' | 'failed';
+  confirmationStatus?: 'confirmed' | 'failed';
   detail?: string | null;
   error?: string;
   transferUrl?: string | null;
@@ -799,19 +809,14 @@ export default function DashboardPage() {
               if (confirmationStatus === 'failed') {
                 return { ...lead, status: 'failed', failedAt: nowIso(), senderStatus: { ...lead.senderStatus, [sender]: 'failed' } };
               }
-              if (confirmationStatus === 'simulated') {
-                return { ...lead, status: 'skipped', senderStatus: { ...lead.senderStatus, [sender]: 'skipped' } };
-              }
               return { ...lead, status: 'sent', sentAt: nowIso(), senderStatus: { ...lead.senderStatus, [sender]: 'sent' } };
             })
           );
           appendLog(
-            confirmationStatus === 'confirmed' ? 'success' : confirmationStatus === 'simulated' ? 'warning' : 'error',
+            confirmationStatus === 'confirmed' ? 'success' : 'error',
             confirmationStatus === 'confirmed'
               ? `WeTransfer confirmed send: ${leadEmail}${data.transferUrl ? ` | ${data.transferUrl}` : ''}`
-              : confirmationStatus === 'simulated'
-                ? `WeTransfer simulation only (not confirmed): ${leadEmail}${data.detail ? ` — ${data.detail}` : ''}`
-                : `WeTransfer failed: ${leadEmail}${failureDetail ? ` — ${failureDetail}` : ''}`,
+              : `WeTransfer failed: ${leadEmail}${failureDetail ? ` — ${failureDetail}` : ''}`,
             sender
           );
           const delayMs = Math.max(300, senderConfigsRef.current[sender].rateLimitDelay * 1000);
@@ -956,7 +961,7 @@ export default function DashboardPage() {
           });
           appendLog(
             'info',
-            `WeTransfer session prepared | mailbox: ${data.mailbox?.email ?? 'unknown'} | inbox messages: ${data.mailboxMessageCount ?? 'unknown'} (real mailbox, automation steps may still be simulated)`,
+            `WeTransfer session prepared | mailbox: ${data.mailbox?.email ?? 'unknown'} | inbox messages: ${data.mailboxMessageCount ?? 'unknown'}`,
             'wetransfer'
           );
           addToast(`Temp mailbox: ${data.mailbox?.email ?? '?'}`, 'success');
@@ -965,8 +970,8 @@ export default function DashboardPage() {
           stopRequestedRef.current = false;
           setWeTransferSession((prev) => ({ ...prev, status: 'sending' }));
           appendLog(
-            'warning',
-            `WeTransfer run started (${pendingForSender.length} pending). Browser upload/send remain simulation placeholders until automation is integrated.`,
+            'info',
+            `WeTransfer run started (${pendingForSender.length} pending). Real upload/send attempts will be executed and only confirmed sends are marked successful.`,
             'wetransfer'
           );
           processNextLead('wetransfer');
@@ -1774,17 +1779,27 @@ function levelColor(level: LogLevel) {
 
 function stepStatusColor(status: WeTransferStepStatus) {
   if (status === 'success') return '#22C55E';
+  if (status === 'verification_received') return '#22C55E';
+  if (status === 'upload_completed') return '#22C55E';
+  if (status === 'send_confirmed') return '#22C55E';
   if (status === 'failed') return '#EF4444';
+  if (status === 'waiting_for_verification') return '#60A5FA';
+  if (status === 'upload_started') return '#60A5FA';
+  if (status === 'send_submitted') return '#60A5FA';
   if (status === 'running') return '#60A5FA';
-  if (status === 'skipped') return '#94A3B8';
   return '#CBD5E1'; // pending
 }
 
 function stepStatusIcon(status: WeTransferStepStatus) {
   if (status === 'success') return '✓';
+  if (status === 'verification_received') return '✓';
+  if (status === 'upload_completed') return '✓';
+  if (status === 'send_confirmed') return '✓';
   if (status === 'failed') return '✗';
+  if (status === 'waiting_for_verification') return '⏳';
+  if (status === 'upload_started') return '↑';
+  if (status === 'send_submitted') return '⇢';
   if (status === 'running') return '⟳';
-  if (status === 'skipped') return '—';
   return '○';
 }
 
@@ -1841,10 +1856,7 @@ function WeTransferStepsPanel({ session }: { session: WeTransferSessionState }) 
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2">
                 <span className={step.status === 'running' ? 'font-semibold' : ''}>{step.label}</span>
-                {!step.isReal && (
-                  <span className="px-1 rounded bg-amber-50 text-amber-600 text-[10px]">SIMULATED</span>
-                )}
-                {step.isReal && step.status !== 'pending' && (
+                {step.status !== 'pending' && (
                   <span className="px-1 rounded bg-emerald-50 text-emerald-600 text-[10px]">REAL</span>
                 )}
               </div>

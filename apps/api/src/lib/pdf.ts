@@ -1,4 +1,5 @@
 import PDFDocument from 'pdfkit';
+import fs from 'node:fs';
 
 interface PlaceholderMap {
   [key: string]: string;
@@ -22,6 +23,30 @@ function safeText(value: string | undefined, fallback: string): string {
   return trimmed || fallback;
 }
 
+function resolveRuntimeFontPath(): string | null {
+  const candidates = [
+    process.env.PDF_FONT_PATH,
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+    'C:\\Windows\\Fonts\\arial.ttf',
+    '/System/Library/Fonts/Supplemental/Arial.ttf',
+  ].filter(Boolean) as string[];
+
+  for (const fontPath of candidates) {
+    if (fs.existsSync(fontPath)) {
+      return fontPath;
+    }
+  }
+  return null;
+}
+
+function applyRuntimeSafeFont(doc: PDFKit.PDFDocument) {
+  const fontPath = resolveRuntimeFontPath();
+  if (fontPath) {
+    doc.font(fontPath);
+  }
+}
+
 /**
  * Generate a personalized PDF by replacing placeholders in a template
  * This is a simplified version - for production, consider using a library like pdf-lib
@@ -39,6 +64,7 @@ export async function generatePersonalizedPdf(
       doc.on('data', (chunk) => chunks.push(chunk));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
+      applyRuntimeSafeFont(doc);
 
       // Keep parameters explicit for future template-backed implementation
       void templatePath;
@@ -72,6 +98,7 @@ export async function generateWeTransferBusinessPdf(
       doc.on('data', (chunk) => chunks.push(chunk));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
+      applyRuntimeSafeFont(doc);
 
       const accent = input.layoutMode === 'highlight' ? '#4338CA' : '#0F172A';
       const accentSoft = input.layoutMode === 'highlight' ? '#EEF2FF' : '#F1F5F9';

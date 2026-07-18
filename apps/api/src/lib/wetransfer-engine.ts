@@ -1,33 +1,21 @@
-/**
- * WeTransfer Engine Service
- *
- * Orchestrates the WeTransfer-first sending flow.
- *
- * REAL parts:
- *   - temp-mail.io mailbox creation (POST /v1/emails)
- *   - temp-mail.io inbox polling (GET /v1/emails/{email}/messages)
- *
- * SIMULATED parts (structured placeholders ready for Playwright/Puppeteer):
- *   - Opening WeTransfer in a headless browser
- *   - Creating/signing into a WeTransfer account with the temp mailbox
- *   - Handling the WeTransfer verification email click
- *   - Uploading a PDF/document to WeTransfer
- *   - Sending the transfer to a lead
- *
- * Architecture note:
- *   Each simulated step is clearly marked [AUTOMATION PLACEHOLDER] and
- *   describes exactly what a real Playwright/Puppeteer implementation would do.
- *   The session/step data structures are designed for drop-in replacement
- *   once browser automation is added.
- */
-
 import {
   createTempMailboxIO,
   listMailboxMessages,
   TempMailIOMailbox,
 } from './temp-mail-io';
+import { createWeTransferTransfer, WeTransferSendPhase } from './wetransfer';
 
-export type WeTransferStepStatus = 'pending' | 'running' | 'success' | 'failed' | 'skipped';
+export type WeTransferStepStatus =
+  | 'pending'
+  | 'running'
+  | 'waiting_for_verification'
+  | 'verification_received'
+  | 'upload_started'
+  | 'upload_completed'
+  | 'send_submitted'
+  | 'send_confirmed'
+  | 'success'
+  | 'failed';
 
 export type WeTransferExecutionStep = {
   id: string;
@@ -35,7 +23,6 @@ export type WeTransferExecutionStep = {
   status: WeTransferStepStatus;
   detail?: string;
   timestamp?: string;
-  /** true = live integration, false = simulated placeholder */
   isReal: boolean;
 };
 
@@ -64,44 +51,36 @@ export type WeTransferSendResult = {
   step: string;
   detail?: string;
   transferUrl?: string;
-  confirmationStatus: 'confirmed' | 'simulated' | 'failed';
+  confirmationStatus: 'confirmed' | 'failed';
 };
 
-// ─── Step definitions ──────────────────────────────────────────────────────────
-
-const SETUP_STEP_DEFS: Array<{ id: string; label: string; isReal: boolean }> = [
+const SETUP_STEP_DEFS: Array<{ id: string; label: string }> = [
   {
     id: 'create_mailbox',
     label: 'Create temp mailbox (temp-mail.io)',
-    isReal: true,
   },
   {
     id: 'open_wetransfer',
-    label: 'Open WeTransfer in automation browser',
-    isReal: false,
+    label: 'Initialize WeTransfer API session',
   },
   {
     id: 'create_account',
-    label: 'Create WeTransfer account with temp mailbox',
-    isReal: false,
+    label: 'Validate WeTransfer API access',
   },
   {
     id: 'verify_email',
     label: 'Poll temp mailbox for verification email',
-    isReal: true,
   },
 ];
 
-const LEAD_STEP_DEFS: Array<{ id: string; label: string; isReal: boolean }> = [
+const LEAD_STEP_DEFS: Array<{ id: string; label: string }> = [
   {
     id: 'upload_file',
     label: 'Upload PDF/document to WeTransfer',
-    isReal: false,
   },
   {
     id: 'send_to_lead',
     label: 'Send WeTransfer link to lead',
-    isReal: false,
   },
 ];
 
@@ -109,6 +88,7 @@ function makeSteps(): WeTransferExecutionStep[] {
   return [...SETUP_STEP_DEFS, ...LEAD_STEP_DEFS].map((def) => ({
     ...def,
     status: 'pending' as WeTransferStepStatus,
+    isReal: true,
   }));
 }
 
@@ -124,23 +104,61 @@ async function pause(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-// ─── Session initialisation ─────────────────────────────────────────────────
+function extractFirstLink(messageText: string): string | null {
+  const match = messageText.match(/https?:\/\/[^\s"'<>]+/i);
+  return match?.[0] ?? null;
+}
 
-/**
- * Create and initialise a WeTransfer engine session.
- *
- * REAL steps:
- *   1. create_mailbox  – POST https://api.temp-mail.io/v1/emails
- *   4. verify_email    – GET  https://api.temp-mail.io/v1/emails/{email}/messages
- *
- * SIMULATED steps:
- *   2. open_wetransfer – [AUTOMATION PLACEHOLDER] launch headless browser, navigate to wetransfer.com
- *   3. create_account  – [AUTOMATION PLACEHOLDER] fill signup form, submit
- *
- * @param campaignId       Campaign this session belongs to
- * @param tempMailApiKey   User-supplied temp-mail.io API key
- * @param onStep           Optional callback fired after each step completes
- */
+async function pollForVerificationEmail(
+  mailboxEmail: string,
+  tempMailApiKey: string,
+  onProgress: (messageCount: number) => void
+): Promise<{
+  found: boolean;
+  messageCount: number;
+  subject?: string;
+  verificationLink?: string;
+}> {
+  const maxAttempts = Number.parseInt(
+    process.env.WETRANSFER_VERIFICATION_POLL_ATTEMPTS || '6',
+    10
+  );
+  const delayMs = Number.parseInt(
+    process.env.WETRANSFER_VERIFICATION_POLL_DELAY_MS || '5000',
+    10
+  );
+
+  let latestCount = 0;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const { messages } = await listMailboxMessages(mailboxEmail, tempMailApiKey);
+    latestCount = messages.length;
+    onProgress(latestCount);
+    const verificationMessage = messages.find((message) => {
+      const subject = (message.subject || '').toLowerCase();
+      const from = (message.from || '').toLowerCase();
+      return subject.includes('verif') || from.includes('wetransfer');
+    });
+    if (verificationMessage) {
+      const content = `${verificationMessage.body_text || ''}\n${verificationMessage.body_html || ''}`;
+      return {
+        found: true,
+        messageCount: latestCount,
+        subject: verificationMessage.subject || undefined,
+        verificationLink: extractFirstLink(content) || undefined,
+      };
+    }
+    if (attempt < maxAttempts) {
+      await pause(delayMs);
+    }
+  }
+
+  return { found: false, messageCount: latestCount };
+}
+
+function requireVerification() {
+  return (process.env.WETRANSFER_REQUIRE_EMAIL_VERIFICATION || '').trim().toLowerCase() === 'true';
+}
+
 export async function initWeTransferSession(
   campaignId: string,
   tempMailApiKey: string,
@@ -158,11 +176,7 @@ export async function initWeTransferSession(
     status: 'initializing',
   };
 
-  function stepUpdate(
-    stepId: string,
-    status: WeTransferStepStatus,
-    detail?: string
-  ): void {
+  function stepUpdate(stepId: string, status: WeTransferStepStatus, detail?: string): void {
     const step = session.steps.find((s) => s.id === stepId);
     if (!step) return;
     step.status = status;
@@ -174,7 +188,6 @@ export async function initWeTransferSession(
     }
   }
 
-  // ── Step 1 (REAL): Create temp mailbox ────────────────────────────────────
   stepUpdate('create_mailbox', 'running');
   try {
     const { mailbox, rateLimit } = await createTempMailboxIO(tempMailApiKey);
@@ -193,95 +206,70 @@ export async function initWeTransferSession(
     return session;
   }
 
-  // ── Step 2 (SIMULATED): Open WeTransfer ───────────────────────────────────
-  // [AUTOMATION PLACEHOLDER]
-  // const browser = await chromium.launch({ headless: true });
-  // const page = await browser.newPage();
-  // await page.goto('https://wetransfer.com', { waitUntil: 'networkidle' });
-  stepUpdate('open_wetransfer', 'running');
-  await pause(150);
+  stepUpdate('open_wetransfer', 'running', 'Using configured WeTransfer API endpoint');
   stepUpdate(
     'open_wetransfer',
-    'skipped',
-    'SIMULATED PLACEHOLDER: Browser automation is not wired; no real navigation confirmation.'
+    'success',
+    `API endpoint ready: ${(process.env.WETRANSFER_API_URL || 'https://dev.wetransfer.com').trim()}`
   );
 
-  // ── Step 3 (SIMULATED): Create WeTransfer account ─────────────────────────
-  // [AUTOMATION PLACEHOLDER]
-  // await page.click('[data-testid="signup-link"]');
-  // await page.fill('[name="email"]', session.tempMailbox!.email);
-  // await page.click('[data-testid="submit-signup"]');
-  stepUpdate('create_account', 'running');
-  await pause(150);
-  stepUpdate(
-    'create_account',
-    'skipped',
-    `SIMULATED PLACEHOLDER: Account signup is not automated yet for ${session.tempMailbox!.email}.`
-  );
+  stepUpdate('create_account', 'running', 'Checking WETRANSFER_API_KEY availability');
+  if (!(process.env.WETRANSFER_API_KEY || '').trim()) {
+    const error = 'WETRANSFER_API_KEY is missing. Cannot perform real WeTransfer uploads/sends.';
+    stepUpdate('create_account', 'failed', error);
+    session.latestError = error;
+    session.status = 'failed';
+    return session;
+  }
+  stepUpdate('create_account', 'success', 'API key detected. Real upload/send path enabled.');
 
-  // ── Step 4 (REAL infra + SIMULATED click): Verify email ───────────────────
-  // We do a real inbox poll here. In the full automation flow we would wait
-  // for the verification email, extract the link, and navigate to it.
-  // The click/navigation itself remains a placeholder until browser automation
-  // is wired in.
-  stepUpdate('verify_email', 'running');
+  stepUpdate('verify_email', 'waiting_for_verification');
   try {
-    const { messages, rateLimit } = await listMailboxMessages(
+    const verificationResult = await pollForVerificationEmail(
       session.tempMailbox!.email,
-      tempMailApiKey
+      tempMailApiKey,
+      (messageCount) => {
+        session.mailboxMessageCount = messageCount;
+      }
     );
-    session.mailboxMessageCount = messages.length;
-    const verifMsg = messages.find(
-      (m) =>
-        m.subject?.toLowerCase().includes('verif') ||
-        m.from?.toLowerCase().includes('wetransfer')
-    );
-    if (verifMsg) {
+    session.mailboxMessageCount = verificationResult.messageCount;
+
+    if (verificationResult.found) {
       stepUpdate(
         'verify_email',
-        'success',
-        `Verification email found: "${verifMsg.subject}" ` +
-          `[rate-limit remaining: ${rateLimit.remaining ?? 'unknown'}]`
+        'verification_received',
+        `Verification email received${
+          verificationResult.subject ? `: "${verificationResult.subject}"` : ''
+        }${verificationResult.verificationLink ? ` | link: ${verificationResult.verificationLink}` : ''}`
       );
+    } else if (requireVerification()) {
+      const detail = `No verification email received (${verificationResult.messageCount} messages checked)`;
+      stepUpdate('verify_email', 'failed', detail);
+      session.latestError = detail;
+      session.status = 'failed';
+      return session;
     } else {
       stepUpdate(
         'verify_email',
-        'skipped',
-        `SIMULATED: No verification email yet (${messages.length} messages in inbox). ` +
-          `Real automation would poll until email arrives then click the link.`
+        'success',
+        `No verification email received (${verificationResult.messageCount} messages checked); continuing because verification is not required for token-based API flow.`
       );
     }
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
-    session.latestError = `Inbox poll error: ${msg}`;
-    stepUpdate(
-      'verify_email',
-      'skipped',
-      `SIMULATED PLACEHOLDER: Inbox poll error (${msg}); verification click cannot be confirmed.`
-    );
+    if (requireVerification()) {
+      stepUpdate('verify_email', 'failed', msg);
+      session.latestError = `Verification inbox polling failed: ${msg}`;
+      session.status = 'failed';
+      return session;
+    }
+    stepUpdate('verify_email', 'success', `Mailbox poll error (non-blocking): ${msg}`);
   }
 
   session.status = 'ready';
   return session;
 }
 
-// ─── Per-lead send ──────────────────────────────────────────────────────────
-
-/**
- * Send a file to a single lead via the WeTransfer session.
- *
- * SIMULATED steps:
- *   5. upload_file  – [AUTOMATION PLACEHOLDER] attach PDF via WeTransfer UI
- *   6. send_to_lead – [AUTOMATION PLACEHOLDER] fill recipient, click Send
- *
- * The session's real temp mailbox is logged against each attempt so that
- * the audit trail clearly shows which mailbox was used.
- *
- * @param session       Initialised WeTransfer session from initWeTransferSession
- * @param leadEmail     Recipient's email address
- * @param filename      Name of the file being transferred
- * @param onStep        Optional callback for step progress
- */
 export async function sendLeadViaWeTransfer(
   session: WeTransferSession,
   leadEmail: string,
@@ -291,6 +279,7 @@ export async function sendLeadViaWeTransfer(
     attachmentBytes?: number;
     leadName?: string;
     ctaLink?: string;
+    fileBuffer?: Buffer;
   },
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void
 ): Promise<WeTransferSendResult> {
@@ -306,10 +295,22 @@ export async function sendLeadViaWeTransfer(
     };
   }
 
+  if (!options?.fileBuffer || options.fileBuffer.length <= 0) {
+    const detail = 'No attachment bytes provided for WeTransfer upload';
+    session.latestError = detail;
+    session.status = 'failed';
+    return {
+      success: false,
+      leadEmail,
+      step: 'upload_file',
+      detail,
+      confirmationStatus: 'failed',
+    };
+  }
+
   session.status = 'sending';
   session.updatedAt = nowIso();
 
-  // Reset per-lead steps so the same session can be reused across leads
   for (const stepId of ['upload_file', 'send_to_lead']) {
     const step = session.steps.find((s) => s.id === stepId);
     if (step) {
@@ -319,11 +320,7 @@ export async function sendLeadViaWeTransfer(
     }
   }
 
-  function stepUpdate(
-    stepId: string,
-    status: WeTransferStepStatus,
-    detail?: string
-  ): void {
+  function stepUpdate(stepId: string, status: WeTransferStepStatus, detail?: string): void {
     const step = session.steps.find((s) => s.id === stepId);
     if (!step) return;
     step.status = status;
@@ -335,61 +332,76 @@ export async function sendLeadViaWeTransfer(
     }
   }
 
-  // ── Step 5 (SIMULATED): Upload file ───────────────────────────────────────
-  // [AUTOMATION PLACEHOLDER]
-  // await page.setInputFiles('[data-testid="file-input"]', localPdfPath);
-  // await page.waitForSelector('[data-testid="upload-complete"]');
-  stepUpdate('upload_file', 'running');
-  await pause(120);
   stepUpdate(
     'upload_file',
-    'skipped',
-    `SIMULATED PLACEHOLDER: "${filename}" (${options?.attachmentBytes ?? 0} bytes, source: ${options?.fileSource ?? 'unknown'}) prepared locally only.`
+    'upload_started',
+    `upload_started | ${filename} | ${options.fileBuffer.length} bytes | source=${options.fileSource ?? 'unknown'}`
+  );
+  stepUpdate(
+    'send_to_lead',
+    'running',
+    `Preparing send for ${leadEmail} (mailbox: ${session.tempMailbox.email})`
   );
 
-  // ── Step 6 (SIMULATED): Send to lead ──────────────────────────────────────
-  // [AUTOMATION PLACEHOLDER]
-  // await page.fill('[data-testid="recipient-email"]', leadEmail);
-  // await page.click('[data-testid="send-button"]');
-  // await page.waitForURL(/transfer/);
-  stepUpdate('send_to_lead', 'running');
-  await pause(120);
+  let transferUrl: string | undefined;
+  const result = await createWeTransferTransfer(
+    filename,
+    options.fileBuffer,
+    leadEmail,
+    options?.ctaLink?.trim()
+      ? `Secure link for ${options.leadName || leadEmail}: ${options.ctaLink}`
+      : `Secure file package for ${options.leadName || leadEmail}`,
+    (phaseUpdate) => {
+      const phase = phaseUpdate.phase as WeTransferSendPhase;
+      if (phase === 'upload_started') {
+        stepUpdate('upload_file', 'upload_started', `upload_started | ${phaseUpdate.detail}`);
+      } else if (phase === 'upload_completed') {
+        stepUpdate('upload_file', 'upload_completed', `upload_completed | ${phaseUpdate.detail}`);
+      } else if (phase === 'send_submitted') {
+        stepUpdate('send_to_lead', 'send_submitted', `send_submitted | ${phaseUpdate.detail}`);
+      } else if (phase === 'send_confirmed') {
+        stepUpdate('send_to_lead', 'send_confirmed', `send_confirmed | ${phaseUpdate.detail}`);
+      }
+    }
+  );
 
-  const shouldFail = !leadEmail.includes('@') || leadEmail.includes('fail');
-  if (shouldFail) {
-    session.latestError = `SIMULATED: Transfer to ${leadEmail} failed`;
-    stepUpdate(
-      'send_to_lead',
-      'failed',
-      session.latestError
-    );
+  if (!result.success) {
+    const detail = result.error || `WeTransfer send failed for ${leadEmail}`;
+    session.latestError = detail;
+    if (session.steps.find((step) => step.id === 'upload_file')?.status === 'upload_started') {
+      stepUpdate('upload_file', 'failed', `failed | ${detail}`);
+    }
+    stepUpdate('send_to_lead', 'failed', `failed | ${detail}`);
+    session.status = 'ready';
     return {
       success: false,
       leadEmail,
       step: 'send_to_lead',
-      detail: session.latestError,
+      detail,
       confirmationStatus: 'failed',
     };
   }
 
-  const transferUrl = `https://wetransfer.com/downloads/simulated_${makeId('xfer')}`;
+  transferUrl = result.downloadUrl;
+  if (session.steps.find((step) => step.id === 'upload_file')?.status !== 'upload_completed') {
+    stepUpdate('upload_file', 'upload_completed', `upload_completed | ${filename}`);
+  }
   stepUpdate(
     'send_to_lead',
-    'skipped',
-    `SIMULATED PLACEHOLDER: No live WeTransfer send confirmation for ${leadEmail}. Generated reference link: ${transferUrl}. Mailbox: ${session.tempMailbox.email}`
+    'send_confirmed',
+    `send_confirmed | ${leadEmail}${transferUrl ? ` | ${transferUrl}` : ''}`
   );
+  session.latestError = null;
   session.status = 'ready';
 
   return {
-    success: false,
+    success: true,
     leadEmail,
     step: 'send_to_lead',
     transferUrl,
-    detail:
-      `SIMULATED PLACEHOLDER: Send step not confirmed. ` +
-      `Prepared file "${filename}" for ${options?.leadName ?? leadEmail}. ` +
-      `CTA: ${options?.ctaLink?.trim() ? options.ctaLink : 'none'}. ` +
-      `Mailbox used: ${session.tempMailbox.email}`,
-    confirmationStatus: 'simulated',
+    detail: transferUrl
+      ? `Confirmed WeTransfer send for ${leadEmail}: ${transferUrl}`
+      : `Confirmed WeTransfer send for ${leadEmail}`,
+    confirmationStatus: 'confirmed',
   };
 }
