@@ -1,5 +1,28 @@
 type CampaignStatus = 'draft' | 'active' | 'paused' | 'completed';
 type LogStatus = 'success' | 'error' | 'warning' | 'info';
+type SessionSendStatus = 'idle' | 'running' | 'stopped';
+
+type SessionLead = {
+  id: string;
+  email: string;
+  name: string;
+  status: 'pending' | 'sent' | 'failed';
+  addedAt: string;
+  sentAt: string | null;
+};
+
+type SessionSettings = {
+  proxyHost: string;
+  proxyPort: string;
+  proxyUser: string;
+  proxyPass: string;
+  weTransferApiKey: string;
+  smtpHost: string;
+  smtpUser: string;
+  smtpPass: string;
+  maxRetries: string;
+  updatedAt: string;
+};
 
 type LocalCampaign = {
   id: string;
@@ -67,6 +90,9 @@ type RuntimeState = {
   logsByCampaign: Map<string, LocalCampaignLog[]>;
   events: RuntimeEvent[];
   dashboardSession: DashboardSessionState | null;
+  sessionLeads: SessionLead[];
+  sessionSettings: SessionSettings | null;
+  sessionStatus: SessionSendStatus;
 };
 
 const globalForRuntime = globalThis as typeof globalThis & {
@@ -81,6 +107,9 @@ function getState(): RuntimeState {
       logsByCampaign: new Map(),
       events: [],
       dashboardSession: null,
+      sessionLeads: [],
+      sessionSettings: null,
+      sessionStatus: 'idle',
     };
   }
   return globalForRuntime.__runtimeState;
@@ -343,4 +372,105 @@ export function recordUploadMetadataLocal(details: {
 
 export function listRuntimeEventsLocal(limit = 50) {
   return getState().events.slice(0, limit);
+}
+
+// ---------------------------------------------------------------------------
+// Session leads — flat list independent of campaigns, for CRM sender tracking
+// ---------------------------------------------------------------------------
+
+export function addSessionLeads(lines: string[]): { added: number; total: number; leads: SessionLead[] } {
+  const state = getState();
+  const existingEmails = new Set(state.sessionLeads.map((l) => l.email.toLowerCase()));
+  let added = 0;
+
+  for (const raw of lines) {
+    const email = raw.trim().toLowerCase();
+    if (!email || existingEmails.has(email)) continue;
+    existingEmails.add(email);
+    const name = email.split('@')[0]?.replace(/[._-]/g, ' ') || email;
+    state.sessionLeads.push({
+      id: makeId('sl'),
+      email,
+      name,
+      status: 'pending',
+      addedAt: new Date().toISOString(),
+      sentAt: null,
+    });
+    added++;
+  }
+
+  if (added > 0) {
+    addEvent('session.leads.added', { added, total: state.sessionLeads.length });
+  }
+  return { added, total: state.sessionLeads.length, leads: state.sessionLeads };
+}
+
+export function getSessionLeads(): SessionLead[] {
+  return getState().sessionLeads;
+}
+
+export function markSessionLeadsSent(emails: string[]): void {
+  const state = getState();
+  const emailSet = new Set(emails.map((e) => e.toLowerCase()));
+  let marked = 0;
+  for (const lead of state.sessionLeads) {
+    if (emailSet.has(lead.email) && lead.status === 'pending') {
+      lead.status = 'sent';
+      lead.sentAt = new Date().toISOString();
+      marked++;
+    }
+  }
+  if (marked > 0) {
+    addEvent('session.leads.marked_sent', { count: marked });
+  }
+}
+
+export function getSessionStats(): {
+  total: number;
+  sent: number;
+  pending: number;
+  failed: number;
+  status: SessionSendStatus;
+} {
+  const state = getState();
+  const total = state.sessionLeads.length;
+  const sent = state.sessionLeads.filter((l) => l.status === 'sent').length;
+  const failed = state.sessionLeads.filter((l) => l.status === 'failed').length;
+  const pending = total - sent - failed;
+  return { total, sent, pending, failed, status: state.sessionStatus };
+}
+
+export function setSessionStatus(status: SessionSendStatus): void {
+  const state = getState();
+  const prev = state.sessionStatus;
+  state.sessionStatus = status;
+  addEvent('session.status.changed', { from: prev, to: status });
+}
+
+// ---------------------------------------------------------------------------
+// Session settings — local-mode config (proxy, API keys, etc.)
+// ---------------------------------------------------------------------------
+
+export function getSessionSettings(): SessionSettings | null {
+  return getState().sessionSettings;
+}
+
+export function updateSessionSettings(s: Omit<SessionSettings, 'updatedAt'>): SessionSettings {
+  const state = getState();
+  const next: SessionSettings = { ...s, updatedAt: new Date().toISOString() };
+  state.sessionSettings = next;
+  addEvent('session.settings.updated', {});
+  return next;
+}
+
+// ---------------------------------------------------------------------------
+// Campaign logs — fallback list for local mode
+// ---------------------------------------------------------------------------
+
+export function listCampaignLogsLocal(campaignId: string, limit = 100, offset = 0): LocalCampaignLog[] {
+  const state = getState();
+  const all = [...(state.logsByCampaign.get(campaignId) || [])].sort(
+    (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
+  );
+  return all.slice(offset, offset + limit);
 }
