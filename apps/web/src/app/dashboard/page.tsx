@@ -174,6 +174,8 @@ type WeTransferSendLeadApiResponse = {
   } | null;
 };
 
+const SENDER_KEYS: SenderKey[] = ['wetransfer', 'adobe', 'quickbooks', 'docusign'];
+
 const SENDERS: Array<{ key: SenderKey; label: string }> = [
   { key: 'wetransfer', label: 'WeTransfer' },
   { key: 'adobe', label: 'Adobe Acrobat' },
@@ -222,6 +224,7 @@ function getWeTransferAttachmentDebug(
   config: SenderConfig,
   uploadFile: File | null
 ): WeTransferAttachmentDebug {
+  const ctaLink = safeTrim(config.ctaLink);
   if (config.fileSource === 'upload') {
     if (!uploadFile) {
       return {
@@ -253,7 +256,7 @@ function getWeTransferAttachmentDebug(
     mimeType: 'application/pdf',
     sizeBytes: null,
     readiness: 'ready',
-    detail: config.ctaLink.trim()
+    detail: ctaLink
       ? 'PDF will be generated per lead at send time.'
       : 'PDF will be generated per lead at send time. CTA link is currently empty.',
   };
@@ -362,6 +365,71 @@ function createDefaultSenderConfig(): SenderConfig {
   };
 }
 
+function createDefaultSenderConfigs(): Record<SenderKey, SenderConfig> {
+  return {
+    wetransfer: createDefaultSenderConfig(),
+    adobe: createDefaultSenderConfig(),
+    quickbooks: createDefaultSenderConfig(),
+    docusign: createDefaultSenderConfig(),
+  };
+}
+
+function normalizeString(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function safeTrim(value: unknown): string {
+  return normalizeString(value).trim();
+}
+
+function isSenderKey(value: unknown): value is SenderKey {
+  return typeof value === 'string' && SENDER_KEYS.includes(value as SenderKey);
+}
+
+function normalizeSenderConfig(value: unknown): SenderConfig {
+  const defaults = createDefaultSenderConfig();
+  if (!value || typeof value !== 'object') return defaults;
+  const config = value as Partial<SenderConfig>;
+
+  return {
+    ...defaults,
+    connected: typeof config.connected === 'boolean' ? config.connected : defaults.connected,
+    fileType: normalizeString(config.fileType, defaults.fileType),
+    fileSource: config.fileSource === 'upload' ? 'upload' : 'generate',
+    orientation: config.orientation === 'portrait' ? 'portrait' : 'landscape',
+    design: normalizeString(config.design, defaults.design),
+    generatedLayout: config.generatedLayout === 'highlight' ? 'highlight' : 'classic',
+    generatedTitle: normalizeString(config.generatedTitle, defaults.generatedTitle),
+    generatedSubtitle: normalizeString(config.generatedSubtitle, defaults.generatedSubtitle),
+    generatedBodyText: normalizeString(config.generatedBodyText, defaults.generatedBodyText),
+    ctaLink: normalizeString(config.ctaLink),
+    cta: config.cta === 'qr' ? 'qr' : 'button',
+    useCustomMessage:
+      typeof config.useCustomMessage === 'boolean' ? config.useCustomMessage : defaults.useCustomMessage,
+    rateLimitDelay:
+      typeof config.rateLimitDelay === 'number' && Number.isFinite(config.rateLimitDelay)
+        ? config.rateLimitDelay
+        : defaults.rateLimitDelay,
+    tempProvider: normalizeString(config.tempProvider, defaults.tempProvider),
+    poolSize: typeof config.poolSize === 'number' && Number.isFinite(config.poolSize) ? config.poolSize : defaults.poolSize,
+    autoRotate: typeof config.autoRotate === 'boolean' ? config.autoRotate : defaults.autoRotate,
+    notes: normalizeString(config.notes),
+  };
+}
+
+function normalizeSenderConfigs(value: unknown): Record<SenderKey, SenderConfig> {
+  const defaults = createDefaultSenderConfigs();
+  if (!value || typeof value !== 'object') return defaults;
+  const parsed = value as Partial<Record<SenderKey, unknown>>;
+
+  return {
+    wetransfer: normalizeSenderConfig(parsed.wetransfer),
+    adobe: normalizeSenderConfig(parsed.adobe),
+    quickbooks: normalizeSenderConfig(parsed.quickbooks),
+    docusign: normalizeSenderConfig(parsed.docusign),
+  };
+}
+
 const LOCAL_STORAGE_KEY = 'crm-console-session-v2';
 
 export default function DashboardPage() {
@@ -397,12 +465,9 @@ export default function DashboardPage() {
     docusign: { accountId: '', integrationKey: '' },
   });
 
-  const [senderConfigs, setSenderConfigs] = React.useState<Record<SenderKey, SenderConfig>>({
-    wetransfer: createDefaultSenderConfig(),
-    adobe: createDefaultSenderConfig(),
-    quickbooks: createDefaultSenderConfig(),
-    docusign: createDefaultSenderConfig(),
-  });
+  const [senderConfigs, setSenderConfigs] = React.useState<Record<SenderKey, SenderConfig>>(
+    createDefaultSenderConfigs
+  );
 
   const stopRequestedRef = React.useRef(false);
   const timerRef = React.useRef<NodeJS.Timeout | null>(null);
@@ -464,14 +529,14 @@ export default function DashboardPage() {
     try {
       const parsed = JSON.parse(saved);
       if (parsed.campaignName) setCampaignName(parsed.campaignName);
-      if (parsed.activeSender) setActiveSender(parsed.activeSender);
+      if (isSenderKey(parsed.activeSender)) setActiveSender(parsed.activeSender);
       if (Array.isArray(parsed.leads)) {
         leadsRef.current = parsed.leads;
         setLeads(parsed.leads);
       }
       if (Array.isArray(parsed.logs)) setLogs(parsed.logs);
       if (parsed.settingsState) setSettingsState(parsed.settingsState);
-      if (parsed.senderConfigs) setSenderConfigs(parsed.senderConfigs);
+      setSenderConfigs(normalizeSenderConfigs(parsed.senderConfigs));
       if (parsed.credentials) setCredentials(parsed.credentials);
       if (parsed.moduleNotes) setModuleNotes(parsed.moduleNotes);
       appendLog('system', 'Restored local session cache', 'system');
@@ -636,7 +701,7 @@ export default function DashboardPage() {
 
     if (sender === 'wetransfer') {
       const campaignId = wtCampaignId.current;
-      const wtConfig = senderConfigsRef.current.wetransfer;
+      const wtConfig = normalizeSenderConfig(senderConfigsRef.current.wetransfer);
       const leadEmail = nextLead.email || nextLead.normalized;
       const leadName = nextLead.name || '';
       const attachment = getWeTransferAttachmentDebug(wtConfig, wetransferUploadFile);
@@ -817,7 +882,7 @@ export default function DashboardPage() {
     }
 
     if (activeSender === 'wetransfer') {
-      const apiKey = credentials.wetransfer.tempMailApiKey.trim();
+      const apiKey = safeTrim(credentials.wetransfer.tempMailApiKey);
       const attachment = getWeTransferAttachmentDebug(
         senderConfigsRef.current.wetransfer,
         wetransferUploadFile
@@ -832,7 +897,7 @@ export default function DashboardPage() {
         addToast('Attachment is not ready', 'error');
         return;
       }
-      if (!senderConfigsRef.current.wetransfer.ctaLink.trim()) {
+      if (!safeTrim(senderConfigsRef.current.wetransfer.ctaLink)) {
         appendLog('warning', 'CTA link is empty. Generated PDFs will render a missing-link warning block.', 'wetransfer');
       }
 
