@@ -81,6 +81,166 @@ async function waitForStableDom(page: Page): Promise<void> {
   await page.waitForTimeout(600);
 }
 
+type TransferModeDiagnostics = {
+  uploaderInitiallyVisible: boolean;
+  sendEmailSelectorFound: boolean;
+  sendEmailClicked: boolean;
+  optionsTriggerClicked: boolean;
+  uploaderVisibleAfterModeSwitch: boolean;
+};
+
+async function isUploaderVisible(page: Page): Promise<boolean> {
+  const selectorChecks = [
+    'input[type="file"]',
+    'input#autosuggest',
+    'input[name="autosuggest"]',
+    'label[for="autosuggest"]',
+    '[data-testid="uploaderForm-transfer-button"]',
+  ];
+
+  for (const selector of selectorChecks) {
+    const visible = await page.locator(selector).first().isVisible().catch(() => false);
+    if (visible) {
+      return true;
+    }
+  }
+
+  if (await page.getByRole('button', { name: /add files/i }).first().isVisible().catch(() => false)) {
+    return true;
+  }
+  if (await page.getByText(/add files/i).first().isVisible().catch(() => false)) {
+    return true;
+  }
+
+  return false;
+}
+
+async function trySelectSendEmail(
+  page: Page,
+  diagnostics: TransferModeDiagnostics,
+  onLog?: (msg: string) => void
+): Promise<boolean> {
+  const selectionTargets: Array<{ label: string; action: () => Promise<void> }> = [
+    {
+      label: 'label[for="transfer__type-email"]',
+      action: async () => {
+        const label = page.locator('label[for="transfer__type-email"]').first();
+        if ((await label.count()) === 0) return;
+        diagnostics.sendEmailSelectorFound = true;
+        if (await label.isVisible().catch(() => false)) {
+          await label.click({ timeout: 3000 });
+          diagnostics.sendEmailClicked = true;
+          onLog?.('selected Send email via label[for="transfer__type-email"]');
+        }
+      },
+    },
+    {
+      label: 'text=Send email',
+      action: async () => {
+        const byText = page.getByText('Send email', { exact: false }).first();
+        if ((await byText.count()) === 0) return;
+        diagnostics.sendEmailSelectorFound = true;
+        if (await byText.isVisible().catch(() => false)) {
+          await byText.click({ timeout: 3000 });
+          diagnostics.sendEmailClicked = true;
+          onLog?.('selected Send email via visible text');
+        }
+      },
+    },
+    {
+      label: '#transfer__type-email',
+      action: async () => {
+        const input = page.locator('#transfer__type-email').first();
+        if ((await input.count()) === 0) return;
+        diagnostics.sendEmailSelectorFound = true;
+        await input.check({ force: true, timeout: 3000 }).catch(() => undefined);
+        const checked = await input.isChecked().catch(() => false);
+        if (checked) {
+          diagnostics.sendEmailClicked = true;
+          onLog?.('selected Send email via #transfer__type-email');
+        }
+      },
+    },
+  ];
+
+  for (const target of selectionTargets) {
+    if (diagnostics.sendEmailClicked) break;
+    await target.action().catch(() => undefined);
+  }
+
+  return diagnostics.sendEmailClicked;
+}
+
+async function ensureEmailTransferMode(
+  page: Page,
+  onLog?: (msg: string) => void
+): Promise<TransferModeDiagnostics> {
+  const diagnostics: TransferModeDiagnostics = {
+    uploaderInitiallyVisible: false,
+    sendEmailSelectorFound: false,
+    sendEmailClicked: false,
+    optionsTriggerClicked: false,
+    uploaderVisibleAfterModeSwitch: false,
+  };
+
+  onLog?.('checking transfer mode');
+  diagnostics.uploaderInitiallyVisible = await isUploaderVisible(page);
+  if (diagnostics.uploaderInitiallyVisible) {
+    onLog?.('uploader already visible; mode switch not required');
+    diagnostics.uploaderVisibleAfterModeSwitch = true;
+    return diagnostics;
+  }
+
+  onLog?.('email mode not active; attempting mode switch');
+  await trySelectSendEmail(page, diagnostics, onLog);
+
+  if (!diagnostics.sendEmailClicked) {
+    const modeTriggerCandidates: Array<{ label: string; selector: string }> = [
+      { label: 'button[aria-haspopup="menu"]', selector: 'button[aria-haspopup="menu"]' },
+      { label: 'button[aria-expanded]', selector: 'button[aria-expanded]' },
+      {
+        label: 'button[class*="OptionButtonExpirySelector"]',
+        selector: 'button[class*="OptionButtonExpirySelector"]',
+      },
+      {
+        label: 'button:has-text("Options"), [role="button"]:has-text("Options")',
+        selector: 'button:has-text("Options"), [role="button"]:has-text("Options")',
+      },
+    ];
+
+    for (const candidate of modeTriggerCandidates) {
+      if (diagnostics.sendEmailClicked) break;
+      const trigger = page.locator(candidate.selector).first();
+      if (!(await trigger.isVisible().catch(() => false))) continue;
+      await trigger.click({ timeout: 3000 }).catch(() => undefined);
+      diagnostics.optionsTriggerClicked = true;
+      onLog?.(`clicked mode/options trigger: ${candidate.label}`);
+      await page.waitForTimeout(500);
+      await trySelectSendEmail(page, diagnostics, onLog);
+    }
+  }
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    if (await isUploaderVisible(page)) {
+      diagnostics.uploaderVisibleAfterModeSwitch = true;
+      break;
+    }
+    await page.waitForTimeout(500);
+  }
+
+  if (diagnostics.uploaderVisibleAfterModeSwitch) {
+    onLog?.('uploader visible after mode switch');
+  } else {
+    onLog?.(
+      `mode switch result: sendEmailSelectorFound=${diagnostics.sendEmailSelectorFound}, ` +
+        `sendEmailClicked=${diagnostics.sendEmailClicked}, ` +
+        `uploaderVisibleAfterModeSwitch=${diagnostics.uploaderVisibleAfterModeSwitch}`
+    );
+  }
+
+  return diagnostics;
+}
+
 /**
  * Attempt to attach a file to the WeTransfer upload area using multiple selector strategies.
  *
@@ -446,15 +606,29 @@ export async function createWeTransferTransfer(
     await page.goto(WETRANSFER_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await waitForStableDom(page);
     await dismissConsentAndPopups(page);
+    const modeDiagnostics = await ensureEmailTransferMode(page, (msg) => {
+      onPhase?.({ phase: 'preparing_attachment', detail: msg });
+    });
 
     onPhase?.({ phase: 'preparing_attachment', detail: `Using file ${path.basename(attachmentPath)}` });
     onPhase?.({ phase: 'upload_started', detail: `Uploading "${filename}" (${fileBuffer.length} bytes)` });
 
     const uploadStrategyLog: string[] = [];
-    await uploadAttachment(page, attachmentPath, (msg) => {
-      uploadStrategyLog.push(msg);
-      onPhase?.({ phase: 'upload_started', detail: msg });
-    });
+    try {
+      await uploadAttachment(page, attachmentPath, (msg) => {
+        uploadStrategyLog.push(msg);
+        onPhase?.({ phase: 'upload_started', detail: msg });
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `${message} Mode selection diagnostics: ` +
+          `sendEmailSelectorFound=${modeDiagnostics.sendEmailSelectorFound}; ` +
+          `sendEmailClicked=${modeDiagnostics.sendEmailClicked}; ` +
+          `optionsTriggerClicked=${modeDiagnostics.optionsTriggerClicked}; ` +
+          `uploaderVisibleAfterModeSwitch=${modeDiagnostics.uploaderVisibleAfterModeSwitch}`
+      );
+    }
     await page.waitForTimeout(1000);
     onPhase?.({
       phase: 'upload_completed',
