@@ -61,12 +61,16 @@ type RuntimeEvent = {
   details: Record<string, unknown>;
 };
 
+import type { WeTransferSession } from './wetransfer-engine';
+
 type RuntimeState = {
   campaigns: Map<string, LocalCampaign>;
   leadsByCampaign: Map<string, LocalLead[]>;
   logsByCampaign: Map<string, LocalCampaignLog[]>;
   events: RuntimeEvent[];
   dashboardSession: DashboardSessionState | null;
+  /** Keyed by campaignId (or a standalone key for dashboard-level sessions) */
+  weTransferSessions: Map<string, WeTransferSession>;
 };
 
 const globalForRuntime = globalThis as typeof globalThis & {
@@ -81,7 +85,12 @@ function getState(): RuntimeState {
       logsByCampaign: new Map(),
       events: [],
       dashboardSession: null,
+      weTransferSessions: new Map(),
     };
+  }
+  // Initialise weTransferSessions for state objects created before this field existed
+  if (!globalForRuntime.__runtimeState.weTransferSessions) {
+    globalForRuntime.__runtimeState.weTransferSessions = new Map();
   }
   return globalForRuntime.__runtimeState;
 }
@@ -343,4 +352,30 @@ export function recordUploadMetadataLocal(details: {
 
 export function listRuntimeEventsLocal(limit = 50) {
   return getState().events.slice(0, limit);
+}
+
+// ─── WeTransfer session store ────────────────────────────────────────────────
+
+export function getWeTransferSessionLocal(key: string) {
+  return getState().weTransferSessions.get(key) ?? null;
+}
+
+export function setWeTransferSessionLocal(
+  key: string,
+  session: import('./wetransfer-engine').WeTransferSession
+) {
+  const state = getState();
+  state.weTransferSessions.set(key, session);
+  addEvent('wetransfer.session.updated', {
+    key,
+    sessionId: session.id,
+    status: session.status,
+    mailbox: session.tempMailbox?.email ?? null,
+  });
+  return session;
+}
+
+export function clearWeTransferSessionLocal(key: string) {
+  getState().weTransferSessions.delete(key);
+  addEvent('wetransfer.session.cleared', { key });
 }
