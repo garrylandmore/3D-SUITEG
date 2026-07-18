@@ -49,6 +49,8 @@ type Lead = {
   id: string;
   rawInput: string;
   normalized: string;
+  email?: string;
+  name?: string;
   status: LeadStatus;
   senderStatus: Partial<Record<SenderKey, LeadStatus>>;
   addedAt: string;
@@ -68,8 +70,14 @@ type RuntimeLog = {
 type SenderConfig = {
   connected: boolean;
   fileType: string;
+  fileSource: 'upload' | 'generate';
   orientation: 'landscape' | 'portrait';
   design: string;
+  generatedLayout: 'classic' | 'highlight';
+  generatedTitle: string;
+  generatedSubtitle: string;
+  generatedBodyText: string;
+  ctaLink: string;
   cta: 'button' | 'qr';
   useCustomMessage: boolean;
   rateLimitDelay: number;
@@ -156,6 +164,38 @@ function normalizeLead(value: string) {
   return value.trim().toLowerCase();
 }
 
+function parseLeadIdentity(raw: string): { email?: string; name?: string } {
+  const line = raw.trim();
+  if (!line) return {};
+
+  const angleMatch = line.match(/^"?([^"<]+?)"?\s*<\s*([^\s<>]+@[^\s<>]+)\s*>$/);
+  if (angleMatch) {
+    return {
+      name: angleMatch[1].trim() || undefined,
+      email: angleMatch[2].trim().toLowerCase(),
+    };
+  }
+
+  const csvParts = line.split(/[,\t;|]/).map((part) => part.trim()).filter(Boolean);
+  if (csvParts.length >= 2) {
+    const firstIsEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(csvParts[0]);
+    const secondIsEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(csvParts[1]);
+    if (firstIsEmail) {
+      return { email: csvParts[0].toLowerCase(), name: csvParts[1] || undefined };
+    }
+    if (secondIsEmail) {
+      return { email: csvParts[1].toLowerCase(), name: csvParts[0] || undefined };
+    }
+  }
+
+  const plainEmailMatch = line.match(/[^\s@<>,;|]+@[^\s@<>,;|]+\.[^\s@<>,;|]+/);
+  if (plainEmailMatch) {
+    return { email: plainEmailMatch[0].toLowerCase() };
+  }
+
+  return {};
+}
+
 function parseLeadLines(input: string) {
   return input
     .split(/\r?\n/)
@@ -168,13 +208,16 @@ function dedupeLeads(existing: Lead[], values: string[]) {
   const added: Lead[] = [];
 
   values.forEach((raw) => {
-    const normalized = normalizeLead(raw);
+    const identity = parseLeadIdentity(raw);
+    const normalized = normalizeLead(identity.email || raw);
     if (!normalized || known.has(normalized)) return;
     known.add(normalized);
     added.push({
       id: makeId('lead'),
       rawInput: raw,
       normalized,
+      email: identity.email,
+      name: identity.name,
       status: 'pending',
       senderStatus: {},
       addedAt: nowIso(),
@@ -188,8 +231,15 @@ function createDefaultSenderConfig(): SenderConfig {
   return {
     connected: true,
     fileType: 'PDF',
+    fileSource: 'generate',
     orientation: 'landscape',
     design: 'Modern',
+    generatedLayout: 'classic',
+    generatedTitle: 'Business Proposal Pack',
+    generatedSubtitle: 'Tender-ready document set for review',
+    generatedBodyText:
+      'Please review this pack and use the secure call-to-action link to continue.',
+    ctaLink: '',
     cta: 'button',
     useCustomMessage: true,
     rateLimitDelay: 2,
@@ -211,6 +261,7 @@ export default function DashboardPage() {
   const [showStopConfirm, setShowStopConfirm] = React.useState(false);
   const [toasts, setToasts] = React.useState<Toast[]>([]);
   const [isPreparing, setIsPreparing] = React.useState(false);
+  const [wetransferUploadFile, setWetransferUploadFile] = React.useState<File | null>(null);
 
   const [leads, setLeads] = React.useState<Lead[]>([]);
   const [logs, setLogs] = React.useState<RuntimeLog[]>([]);
@@ -356,14 +407,19 @@ export default function DashboardPage() {
   }
 
   function importLeadLines(lines: string[]) {
-    const toImport = dedupeEnabled ? dedupeLeads(leads, lines) : lines.map((raw) => ({
-      id: makeId('lead'),
-      rawInput: raw,
-      normalized: normalizeLead(raw),
-      status: 'pending' as LeadStatus,
-      senderStatus: {},
-      addedAt: nowIso(),
-    })).filter((lead) => Boolean(lead.normalized));
+    const toImport = dedupeEnabled ? dedupeLeads(leads, lines) : lines.map((raw) => {
+      const identity = parseLeadIdentity(raw);
+      return {
+        id: makeId('lead'),
+        rawInput: raw,
+        normalized: normalizeLead(identity.email || raw),
+        email: identity.email,
+        name: identity.name,
+        status: 'pending' as LeadStatus,
+        senderStatus: {},
+        addedAt: nowIso(),
+      };
+    }).filter((lead) => Boolean(lead.normalized));
 
     if (!toImport.length) {
       addToast('No new leads imported', 'warning');
@@ -372,7 +428,13 @@ export default function DashboardPage() {
     }
 
     updateLeads((prev) => [...prev, ...toImport]);
-    appendLog('success', `Leads imported: ${toImport.length}`, 'system');
+    const withEmail = toImport.filter((lead) => Boolean(lead.email)).length;
+    const withName = toImport.filter((lead) => Boolean(lead.name)).length;
+    appendLog(
+      'success',
+      `Leads imported: ${toImport.length} (autograb email: ${withEmail}, name: ${withName})`,
+      'system'
+    );
     addToast(`Imported ${toImport.length} lead(s)`, 'success');
   }
 
@@ -420,16 +482,63 @@ export default function DashboardPage() {
     );
 
     if (sender === 'wetransfer') {
-      // WeTransfer mode: call backend send-lead API (real temp mailbox + simulated browser steps)
       const campaignId = wtCampaignId.current;
-      const filename = senderConfigsRef.current.wetransfer.fileType === 'PDF' ? 'document.pdf' : `document.${senderConfigsRef.current.wetransfer.fileType.toLowerCase()}`;
-      fetch('/api/wetransfer/send-lead', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ campaignId, leadEmail: nextLead.normalized, filename }),
-      })
+      const wtConfig = senderConfigsRef.current.wetransfer;
+      const leadEmail = nextLead.email || nextLead.normalized;
+      const leadName = nextLead.name || '';
+
+      const sendPayloadPromise = (async () => {
+        if (wtConfig.fileSource === 'upload') {
+          const uploadFile = wetransferUploadFile;
+          if (!uploadFile) {
+            throw new Error('Upload file source is selected but no file is attached.');
+          }
+          const rawBytes = new Uint8Array(await uploadFile.arrayBuffer());
+          let binary = '';
+          for (let i = 0; i < rawBytes.length; i += 1) {
+            binary += String.fromCharCode(rawBytes[i]);
+          }
+          return {
+            campaignId,
+            leadEmail,
+            leadName,
+            fileSource: 'upload' as const,
+            ctaLink: wtConfig.ctaLink,
+            uploadedFileName: uploadFile.name,
+            uploadedFileBase64: btoa(binary),
+          };
+        }
+
+        return {
+          campaignId,
+          leadEmail,
+          leadName,
+          fileSource: 'generated' as const,
+          ctaLink: wtConfig.ctaLink,
+          generatedTitle: wtConfig.generatedTitle,
+          generatedSubtitle: wtConfig.generatedSubtitle,
+          generatedBodyText: wtConfig.generatedBodyText,
+          generatedLayout: wtConfig.generatedLayout,
+        };
+      })();
+
+      sendPayloadPromise
+        .then((payload) =>
+          fetch('/api/wetransfer/send-lead', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          })
+        )
         .then((res) => res.json())
-        .then((data: { success: boolean; detail?: string; transferUrl?: string; logs?: string[] }) => {
+        .then((data: {
+          success: boolean;
+          confirmationStatus?: 'confirmed' | 'simulated' | 'failed';
+          detail?: string;
+          transferUrl?: string;
+          logs?: string[];
+          steps?: WeTransferStep[];
+        }) => {
           if (stopRequestedRef.current) {
             updateLeads((prev) =>
               prev.map((lead) => (lead.status === 'sending' ? { ...lead, status: 'pending' } : lead))
@@ -443,20 +552,29 @@ export default function DashboardPage() {
           if (Array.isArray(data.logs)) {
             data.logs.forEach((line: string) => appendLog('info', line, 'wetransfer'));
           }
+          if (Array.isArray(data.steps)) {
+            setWeTransferSession((prev) => ({ ...prev, steps: data.steps ?? prev.steps }));
+          }
+          const confirmationStatus = data.confirmationStatus || (data.success ? 'confirmed' : 'failed');
           updateLeads((prev) =>
             prev.map((lead) => {
               if (lead.id !== nextLead.id) return lead;
-              if (!data.success) {
+              if (confirmationStatus === 'failed') {
                 return { ...lead, status: 'failed', failedAt: nowIso(), senderStatus: { ...lead.senderStatus, [sender]: 'failed' } };
+              }
+              if (confirmationStatus === 'simulated') {
+                return { ...lead, status: 'skipped', senderStatus: { ...lead.senderStatus, [sender]: 'skipped' } };
               }
               return { ...lead, status: 'sent', sentAt: nowIso(), senderStatus: { ...lead.senderStatus, [sender]: 'sent' } };
             })
           );
           appendLog(
-            data.success ? 'success' : 'error',
-            data.success
-              ? `WeTransfer sent: ${nextLead.normalized}${data.transferUrl ? ` | ${data.transferUrl}` : ''}`
-              : `WeTransfer failed: ${nextLead.normalized}${data.detail ? ` — ${data.detail}` : ''}`,
+            confirmationStatus === 'confirmed' ? 'success' : confirmationStatus === 'simulated' ? 'warning' : 'error',
+            confirmationStatus === 'confirmed'
+              ? `WeTransfer confirmed send: ${leadEmail}${data.transferUrl ? ` | ${data.transferUrl}` : ''}`
+              : confirmationStatus === 'simulated'
+                ? `WeTransfer simulation only (not confirmed): ${leadEmail}${data.detail ? ` — ${data.detail}` : ''}`
+                : `WeTransfer failed: ${leadEmail}${data.detail ? ` — ${data.detail}` : ''}`,
             sender
           );
           const delayMs = Math.max(300, senderConfigsRef.current[sender].rateLimitDelay * 1000);
@@ -532,10 +650,25 @@ export default function DashboardPage() {
         addToast('Set temp-mail.io API key in Credentials', 'error');
         return;
       }
+      if (senderConfigsRef.current.wetransfer.fileSource === 'upload' && !wetransferUploadFile) {
+        appendLog('error', 'File Source is set to Upload PDF, but no file is attached.', 'wetransfer');
+        addToast('Attach a PDF/document before sending', 'error');
+        return;
+      }
+      if (!senderConfigsRef.current.wetransfer.ctaLink.trim()) {
+        appendLog('warning', 'CTA link is empty. Generated PDFs will render a missing-link warning block.', 'wetransfer');
+      }
 
       setIsPreparing(true);
       setWeTransferSession({ sessionId: null, status: 'initializing', mailbox: null, steps: [] });
       appendLog('info', 'Initialising WeTransfer session — creating temp-mail.io mailbox…', 'wetransfer');
+      appendLog(
+        'info',
+        senderConfigsRef.current.wetransfer.fileSource === 'generate'
+          ? 'Attachment strategy: generate a per-lead PDF in-app using parsed lead fields.'
+          : `Attachment strategy: reuse uploaded file "${wetransferUploadFile?.name || 'unknown'}" for each lead.`,
+        'wetransfer'
+      );
 
       const campaignId = wtCampaignId.current;
       fetch('/api/wetransfer/session', {
@@ -570,12 +703,20 @@ export default function DashboardPage() {
             mailbox: data.mailbox?.email ?? null,
             steps: (data.steps as WeTransferStep[]) ?? [],
           });
-          appendLog('success', `WeTransfer session ready | mailbox: ${data.mailbox?.email ?? 'unknown'}`, 'wetransfer');
+          appendLog(
+            'info',
+            `WeTransfer session prepared | mailbox: ${data.mailbox?.email ?? 'unknown'} (real mailbox, automation steps may still be simulated)`,
+            'wetransfer'
+          );
           addToast(`Temp mailbox: ${data.mailbox?.email ?? '?'}`, 'success');
 
           setRunState('running');
           stopRequestedRef.current = false;
-          appendLog('info', `WeTransfer send started (${pendingForSender.length} pending)`, 'wetransfer');
+          appendLog(
+            'warning',
+            `WeTransfer run started (${pendingForSender.length} pending). Browser upload/send remain simulation placeholders until automation is integrated.`,
+            'wetransfer'
+          );
           processNextLead('wetransfer');
         })
         .catch((err: Error) => {
@@ -805,21 +946,33 @@ export default function DashboardPage() {
 
                 <Panel title="File / Message / CTA">
                   <div className="grid sm:grid-cols-2 gap-3 text-sm">
-                    <Field label="File Type">
+                    <Field label="File Source">
                       <select
                         className="input"
-                        value={activeConfig.fileType}
+                        value={activeConfig.fileSource}
                         onChange={(event) =>
                           setSenderConfigs((prev) => ({
                             ...prev,
-                            wetransfer: { ...prev.wetransfer, fileType: event.target.value },
+                            wetransfer: { ...prev.wetransfer, fileSource: event.target.value as 'upload' | 'generate' },
                           }))
                         }
                       >
-                        {['PDF', 'PPTX', 'DOCX', 'ZIP'].map((option) => (
-                          <option key={option}>{option}</option>
-                        ))}
+                        <option value="upload">Upload PDF / document</option>
+                        <option value="generate">Generate PDF in app</option>
                       </select>
+                    </Field>
+                    <Field label="CTA Link (used in generated PDF)">
+                      <input
+                        className="input"
+                        placeholder="https://example.com/secure-link"
+                        value={activeConfig.ctaLink}
+                        onChange={(event) =>
+                          setSenderConfigs((prev) => ({
+                            ...prev,
+                            wetransfer: { ...prev.wetransfer, ctaLink: event.target.value },
+                          }))
+                        }
+                      />
                     </Field>
                     <Field label="PDF Orientation">
                       <select
@@ -848,7 +1001,7 @@ export default function DashboardPage() {
                         }
                       />
                     </Field>
-                    <Field label="CTA">
+                    <Field label="CTA Style">
                       <select
                         className="input"
                         value={activeConfig.cta}
@@ -863,7 +1016,104 @@ export default function DashboardPage() {
                         <option value="qr">QR code</option>
                       </select>
                     </Field>
+                    <Field label="File Type">
+                      <select
+                        className="input"
+                        value={activeConfig.fileType}
+                        onChange={(event) =>
+                          setSenderConfigs((prev) => ({
+                            ...prev,
+                            wetransfer: { ...prev.wetransfer, fileType: event.target.value },
+                          }))
+                        }
+                      >
+                        {['PDF', 'PPTX', 'DOCX', 'ZIP'].map((option) => (
+                          <option key={option}>{option}</option>
+                        ))}
+                      </select>
+                    </Field>
                   </div>
+                  {activeConfig.fileSource === 'upload' && (
+                    <div className="mt-3 space-y-2">
+                      <label className="inline-flex items-center gap-2 text-xs cursor-pointer text-[#6C63FF]">
+                        <Upload className="w-3 h-3" /> Select PDF/document
+                        <input
+                          type="file"
+                          className="hidden"
+                          accept=".pdf,.doc,.docx,.ppt,.pptx,.zip"
+                          onChange={(event) => setWetransferUploadFile(event.target.files?.[0] || null)}
+                        />
+                      </label>
+                      <div className="text-xs text-slate-600">
+                        {wetransferUploadFile
+                          ? `Attached: ${wetransferUploadFile.name} (${Math.max(1, Math.round(wetransferUploadFile.size / 1024))} KB)`
+                          : 'No file selected yet'}
+                      </div>
+                    </div>
+                  )}
+                  {activeConfig.fileSource === 'generate' && (
+                    <div className="mt-3 grid sm:grid-cols-2 gap-3 text-sm">
+                      <Field label="Generated PDF Title">
+                        <input
+                          className="input"
+                          value={activeConfig.generatedTitle}
+                          onChange={(event) =>
+                            setSenderConfigs((prev) => ({
+                              ...prev,
+                              wetransfer: { ...prev.wetransfer, generatedTitle: event.target.value },
+                            }))
+                          }
+                        />
+                      </Field>
+                      <Field label="Layout Mode">
+                        <select
+                          className="input"
+                          value={activeConfig.generatedLayout}
+                          onChange={(event) =>
+                            setSenderConfigs((prev) => ({
+                              ...prev,
+                              wetransfer: {
+                                ...prev.wetransfer,
+                                generatedLayout: event.target.value as 'classic' | 'highlight',
+                              },
+                            }))
+                          }
+                        >
+                          <option value="classic">Classic</option>
+                          <option value="highlight">Highlight</option>
+                        </select>
+                      </Field>
+                      <div className="sm:col-span-2">
+                        <Field label="Generated Subtitle">
+                          <input
+                            className="input"
+                            value={activeConfig.generatedSubtitle}
+                            onChange={(event) =>
+                              setSenderConfigs((prev) => ({
+                                ...prev,
+                                wetransfer: { ...prev.wetransfer, generatedSubtitle: event.target.value },
+                              }))
+                            }
+                          />
+                        </Field>
+                      </div>
+                      <div className="sm:col-span-2">
+                        <Field label="Generated Body Text">
+                          <textarea
+                            rows={3}
+                            className="input"
+                            value={activeConfig.generatedBodyText}
+                            onChange={(event) =>
+                              setSenderConfigs((prev) => ({
+                                ...prev,
+                                wetransfer: { ...prev.wetransfer, generatedBodyText: event.target.value },
+                              }))
+                            }
+                          />
+                        </Field>
+                      </div>
+                    </div>
+                  )}
                   <label className="mt-3 flex items-center gap-2 text-sm">
                     <input
                       type="checkbox"
@@ -877,6 +1127,9 @@ export default function DashboardPage() {
                     />
                     Custom transfer message
                   </label>
+                    <p className="mt-2 text-xs text-slate-500">
+                      Lead autograb supports plain emails and <span className="font-mono">Name &lt;email&gt;</span>. In Generate mode, PDFs are created per lead before each send attempt.
+                    </p>
                 </Panel>
               </div>
 
@@ -937,7 +1190,7 @@ export default function DashboardPage() {
                 rows={7}
                 value={leadsInput}
                 onChange={(event) => setLeadsInput(event.target.value)}
-                placeholder="Paste one lead per line"
+                placeholder={`Paste one lead per line\nalice@example.com\nAlice Smith <alice@example.com>`}
                 className="w-full border rounded px-3 py-2 font-mono"
               />
               <div className="flex items-center gap-3">

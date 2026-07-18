@@ -55,6 +55,7 @@ export type WeTransferSendResult = {
   step: string;
   detail?: string;
   transferUrl?: string;
+  confirmationStatus: 'confirmed' | 'simulated' | 'failed';
 };
 
 // ─── Step definitions ──────────────────────────────────────────────────────────
@@ -188,8 +189,8 @@ export async function initWeTransferSession(
   await pause(150);
   stepUpdate(
     'open_wetransfer',
-    'success',
-    'SIMULATED: WeTransfer navigated in automation browser'
+    'skipped',
+    'SIMULATED PLACEHOLDER: Browser automation is not wired; no real navigation confirmation.'
   );
 
   // ── Step 3 (SIMULATED): Create WeTransfer account ─────────────────────────
@@ -201,8 +202,8 @@ export async function initWeTransferSession(
   await pause(150);
   stepUpdate(
     'create_account',
-    'success',
-    `SIMULATED: Signup submitted with ${session.tempMailbox!.email}`
+    'skipped',
+    `SIMULATED PLACEHOLDER: Account signup is not automated yet for ${session.tempMailbox!.email}.`
   );
 
   // ── Step 4 (REAL infra + SIMULATED click): Verify email ───────────────────
@@ -231,7 +232,7 @@ export async function initWeTransferSession(
     } else {
       stepUpdate(
         'verify_email',
-        'success',
+        'skipped',
         `SIMULATED: No verification email yet (${messages.length} messages in inbox). ` +
           `Real automation would poll until email arrives then click the link.`
       );
@@ -240,8 +241,8 @@ export async function initWeTransferSession(
     const msg = error instanceof Error ? error.message : String(error);
     stepUpdate(
       'verify_email',
-      'success',
-      `SIMULATED: Inbox poll error (${msg}); proceeding with simulated verification`
+      'skipped',
+      `SIMULATED PLACEHOLDER: Inbox poll error (${msg}); verification click cannot be confirmed.`
     );
   }
 
@@ -270,6 +271,12 @@ export async function sendLeadViaWeTransfer(
   session: WeTransferSession,
   leadEmail: string,
   filename: string,
+  options?: {
+    fileSource?: 'upload' | 'generated';
+    attachmentBytes?: number;
+    leadName?: string;
+    ctaLink?: string;
+  },
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void
 ): Promise<WeTransferSendResult> {
   if (!session.tempMailbox) {
@@ -278,6 +285,7 @@ export async function sendLeadViaWeTransfer(
       leadEmail,
       step: 'send_to_lead',
       detail: 'No temp mailbox in session – session may have failed during init',
+      confirmationStatus: 'failed',
     };
   }
 
@@ -315,8 +323,8 @@ export async function sendLeadViaWeTransfer(
   await pause(120);
   stepUpdate(
     'upload_file',
-    'success',
-    `SIMULATED: ${filename} attached to WeTransfer transfer`
+    'skipped',
+    `SIMULATED PLACEHOLDER: "${filename}" (${options?.attachmentBytes ?? 0} bytes, source: ${options?.fileSource ?? 'unknown'}) prepared locally only.`
   );
 
   // ── Step 6 (SIMULATED): Send to lead ──────────────────────────────────────
@@ -327,7 +335,7 @@ export async function sendLeadViaWeTransfer(
   stepUpdate('send_to_lead', 'running');
   await pause(120);
 
-  const shouldFail = leadEmail.includes('fail') || Math.random() < 0.08;
+  const shouldFail = !leadEmail.includes('@') || leadEmail.includes('fail');
   if (shouldFail) {
     stepUpdate(
       'send_to_lead',
@@ -339,21 +347,27 @@ export async function sendLeadViaWeTransfer(
       leadEmail,
       step: 'send_to_lead',
       detail: `SIMULATED: Transfer to ${leadEmail} failed`,
+      confirmationStatus: 'failed',
     };
   }
 
   const transferUrl = `https://wetransfer.com/downloads/simulated_${makeId('xfer')}`;
   stepUpdate(
     'send_to_lead',
-    'success',
-    `SIMULATED: Transfer sent to ${leadEmail} | link: ${transferUrl} | from mailbox: ${session.tempMailbox.email}`
+    'skipped',
+    `SIMULATED PLACEHOLDER: No live WeTransfer send confirmation for ${leadEmail}. Generated reference link: ${transferUrl}. Mailbox: ${session.tempMailbox.email}`
   );
 
   return {
-    success: true,
+    success: false,
     leadEmail,
     step: 'send_to_lead',
     transferUrl,
-    detail: `SIMULATED: Transfer link sent. Mailbox used: ${session.tempMailbox.email}`,
+    detail:
+      `SIMULATED PLACEHOLDER: Send step not confirmed. ` +
+      `Prepared file "${filename}" for ${options?.leadName ?? leadEmail}. ` +
+      `CTA: ${options?.ctaLink?.trim() ? options.ctaLink : 'none'}. ` +
+      `Mailbox used: ${session.tempMailbox.email}`,
+    confirmationStatus: 'simulated',
   };
 }
