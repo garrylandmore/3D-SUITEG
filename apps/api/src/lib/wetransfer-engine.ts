@@ -264,6 +264,8 @@ export async function initWeTransferSession(
       stepUpdate('open_wetransfer', 'opening_browser', phaseUpdate.detail);
     } else if (phaseUpdate.phase === 'loading_wetransfer') {
       stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
+    } else if (phaseUpdate.phase === 'navigating_to_login') {
+      stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
     }
   });
 
@@ -275,10 +277,10 @@ export async function initWeTransferSession(
     return session;
   }
 
-  stepUpdate('open_wetransfer', 'success', 'WeTransfer loaded successfully in automation browser.');
+  stepUpdate('open_wetransfer', 'success', 'WeTransfer login page reached successfully. Signup/verification will happen at send time.');
 
   stepUpdate('create_account', 'success', 'Browser transport mode is active. Sender email will use temp mailbox.');
-  stepUpdate('verify_email', 'success', 'Verification mailbox is ready and will be polled if WeTransfer requests confirmation.');
+  stepUpdate('verify_email', 'success', 'Verification mailbox is ready and will be polled during signup flow.');
 
   session.status = 'ready';
   return session;
@@ -385,16 +387,30 @@ export async function sendLeadViaWeTransfer(
         stepUpdate('open_wetransfer', 'opening_browser', phaseUpdate.detail);
       } else if (phase === 'loading_wetransfer') {
         stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
+      } else if (phase === 'navigating_to_login') {
+        stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
+      } else if (phase === 'signup_clicked') {
+        stepUpdate('create_account', 'running', phaseUpdate.detail);
+      } else if (phase === 'sender_email_entered') {
+        stepUpdate('create_account', 'running', phaseUpdate.detail);
+      } else if (phase === 'verification_code_requested') {
+        stepUpdate('verify_email', 'waiting_for_verification', phaseUpdate.detail);
+      } else if (phase === 'awaiting_sender_verification') {
+        stepUpdate('verify_email', 'awaiting_sender_verification', phaseUpdate.detail);
+      } else if (phase === 'verification_received') {
+        stepUpdate('verify_email', 'verification_received', phaseUpdate.detail);
+      } else if (phase === 'verification_submitted') {
+        stepUpdate('verify_email', 'verification_received', phaseUpdate.detail);
+      } else if (phase === 'terms_accepted') {
+        stepUpdate('create_account', 'success', phaseUpdate.detail);
+      } else if (phase === 'uploader_visible') {
+        stepUpdate('open_wetransfer', 'success', phaseUpdate.detail);
       } else if (phase === 'preparing_attachment') {
         stepUpdate('upload_file', 'preparing_attachment', phaseUpdate.detail);
       } else if (phase === 'upload_started') {
         stepUpdate('upload_file', 'upload_started', `upload_started | ${phaseUpdate.detail}`);
       } else if (phase === 'upload_completed') {
         stepUpdate('upload_file', 'upload_completed', `upload_completed | ${phaseUpdate.detail}`);
-      } else if (phase === 'awaiting_sender_verification') {
-        stepUpdate('verify_email', 'awaiting_sender_verification', phaseUpdate.detail);
-      } else if (phase === 'verification_received') {
-        stepUpdate('verify_email', 'verification_received', phaseUpdate.detail);
       } else if (phase === 'send_submitted') {
         stepUpdate('send_to_lead', 'send_submitted', `send_submitted | ${phaseUpdate.detail}`);
       } else if (phase === 'send_confirmed') {

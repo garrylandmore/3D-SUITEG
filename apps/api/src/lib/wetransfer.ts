@@ -3,6 +3,7 @@ import path from 'node:path';
 import { chromium, Page } from 'playwright';
 
 const WETRANSFER_URL = (process.env.WETRANSFER_WEB_URL || 'https://wetransfer.com').trim();
+const WETRANSFER_LOGIN_URL = `${WETRANSFER_URL.replace(/\/$/, '')}/log-in`;
 
 type VerificationResolution = {
   verificationLink?: string;
@@ -14,8 +15,15 @@ type VerificationResolution = {
 export type WeTransferSendPhase =
   | 'opening_browser'
   | 'loading_wetransfer'
+  | 'navigating_to_login'
+  | 'signup_clicked'
+  | 'sender_email_entered'
+  | 'verification_code_requested'
   | 'awaiting_sender_verification'
   | 'verification_received'
+  | 'verification_submitted'
+  | 'terms_accepted'
+  | 'uploader_visible'
   | 'preparing_attachment'
   | 'upload_started'
   | 'upload_completed'
@@ -81,14 +89,6 @@ async function waitForStableDom(page: Page): Promise<void> {
   await page.waitForTimeout(600);
 }
 
-type TransferModeDiagnostics = {
-  uploaderInitiallyVisible: boolean;
-  sendEmailSelectorFound: boolean;
-  sendEmailClicked: boolean;
-  optionsTriggerClicked: boolean;
-  uploaderVisibleAfterModeSwitch: boolean;
-};
-
 async function isUploaderVisible(page: Page): Promise<boolean> {
   const selectorChecks = [
     'input[type="file"]',
@@ -113,132 +113,6 @@ async function isUploaderVisible(page: Page): Promise<boolean> {
   }
 
   return false;
-}
-
-async function trySelectSendEmail(
-  page: Page,
-  diagnostics: TransferModeDiagnostics,
-  onLog?: (msg: string) => void
-): Promise<boolean> {
-  const selectionTargets: Array<{ label: string; action: () => Promise<void> }> = [
-    {
-      label: 'label[for="transfer__type-email"]',
-      action: async () => {
-        const label = page.locator('label[for="transfer__type-email"]').first();
-        if ((await label.count()) === 0) return;
-        diagnostics.sendEmailSelectorFound = true;
-        if (await label.isVisible().catch(() => false)) {
-          await label.click({ timeout: 3000 });
-          diagnostics.sendEmailClicked = true;
-          onLog?.('selected Send email via label[for="transfer__type-email"]');
-        }
-      },
-    },
-    {
-      label: 'text=Send email',
-      action: async () => {
-        const byText = page.getByText('Send email', { exact: false }).first();
-        if ((await byText.count()) === 0) return;
-        diagnostics.sendEmailSelectorFound = true;
-        if (await byText.isVisible().catch(() => false)) {
-          await byText.click({ timeout: 3000 });
-          diagnostics.sendEmailClicked = true;
-          onLog?.('selected Send email via visible text');
-        }
-      },
-    },
-    {
-      label: '#transfer__type-email',
-      action: async () => {
-        const input = page.locator('#transfer__type-email').first();
-        if ((await input.count()) === 0) return;
-        diagnostics.sendEmailSelectorFound = true;
-        await input.check({ force: true, timeout: 3000 }).catch(() => undefined);
-        const checked = await input.isChecked().catch(() => false);
-        if (checked) {
-          diagnostics.sendEmailClicked = true;
-          onLog?.('selected Send email via #transfer__type-email');
-        }
-      },
-    },
-  ];
-
-  for (const target of selectionTargets) {
-    if (diagnostics.sendEmailClicked) break;
-    await target.action().catch(() => undefined);
-  }
-
-  return diagnostics.sendEmailClicked;
-}
-
-async function ensureEmailTransferMode(
-  page: Page,
-  onLog?: (msg: string) => void
-): Promise<TransferModeDiagnostics> {
-  const diagnostics: TransferModeDiagnostics = {
-    uploaderInitiallyVisible: false,
-    sendEmailSelectorFound: false,
-    sendEmailClicked: false,
-    optionsTriggerClicked: false,
-    uploaderVisibleAfterModeSwitch: false,
-  };
-
-  onLog?.('checking transfer mode');
-  diagnostics.uploaderInitiallyVisible = await isUploaderVisible(page);
-  if (diagnostics.uploaderInitiallyVisible) {
-    onLog?.('uploader already visible; mode switch not required');
-    diagnostics.uploaderVisibleAfterModeSwitch = true;
-    return diagnostics;
-  }
-
-  onLog?.('email mode not active; attempting mode switch');
-  await trySelectSendEmail(page, diagnostics, onLog);
-
-  if (!diagnostics.sendEmailClicked) {
-    const modeTriggerCandidates: Array<{ label: string; selector: string }> = [
-      { label: 'button[aria-haspopup="menu"]', selector: 'button[aria-haspopup="menu"]' },
-      { label: 'button[aria-expanded]', selector: 'button[aria-expanded]' },
-      {
-        label: 'button[class*="OptionButtonExpirySelector"]',
-        selector: 'button[class*="OptionButtonExpirySelector"]',
-      },
-      {
-        label: 'button:has-text("Options"), [role="button"]:has-text("Options")',
-        selector: 'button:has-text("Options"), [role="button"]:has-text("Options")',
-      },
-    ];
-
-    for (const candidate of modeTriggerCandidates) {
-      if (diagnostics.sendEmailClicked) break;
-      const trigger = page.locator(candidate.selector).first();
-      if (!(await trigger.isVisible().catch(() => false))) continue;
-      await trigger.click({ timeout: 3000 }).catch(() => undefined);
-      diagnostics.optionsTriggerClicked = true;
-      onLog?.(`clicked mode/options trigger: ${candidate.label}`);
-      await page.waitForTimeout(500);
-      await trySelectSendEmail(page, diagnostics, onLog);
-    }
-  }
-
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    if (await isUploaderVisible(page)) {
-      diagnostics.uploaderVisibleAfterModeSwitch = true;
-      break;
-    }
-    await page.waitForTimeout(500);
-  }
-
-  if (diagnostics.uploaderVisibleAfterModeSwitch) {
-    onLog?.('uploader visible after mode switch');
-  } else {
-    onLog?.(
-      `mode switch result: sendEmailSelectorFound=${diagnostics.sendEmailSelectorFound}, ` +
-        `sendEmailClicked=${diagnostics.sendEmailClicked}, ` +
-        `uploaderVisibleAfterModeSwitch=${diagnostics.uploaderVisibleAfterModeSwitch}`
-    );
-  }
-
-  return diagnostics;
 }
 
 /**
@@ -453,32 +327,85 @@ function getAntiBotHint(html: string): string | null {
   return null;
 }
 
-async function handleVerificationIfPrompted(
+/**
+ * Perform the explicit WeTransfer signup/login flow observed in live Playwright inspection:
+ *   1. Navigate to /log-in
+ *   2. Click "Sign up"
+ *   3. Fill input#email with senderEmail
+ *   4. Click "Continue"
+ *   5. Poll temp mailbox for verification code (via onVerificationRequired)
+ *   6. Fill input#verificationCode
+ *   7. Click "Verify"
+ *   8. If [data-testid="accept-terms"] appears, click "I agree"
+ *   9. Wait for the uploader UI to become visible
+ */
+async function performSignupAndVerification(
   page: Page,
+  senderEmail: string,
   options: WeTransferSendOptions,
   onPhase?: (update: WeTransferSendPhaseUpdate) => void
 ): Promise<void> {
-  const html = await page.content();
-  const verificationPromptDetected =
-    /verify your email|check your inbox|verification code|confirm your email/i.test(html);
+  // Step 1: Navigate to the login page
+  onPhase?.({ phase: 'navigating_to_login', detail: `Navigating to ${WETRANSFER_LOGIN_URL}` });
+  await page.goto(WETRANSFER_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await waitForStableDom(page);
+  await dismissConsentAndPopups(page);
+  const loginUrl = page.url();
+  onPhase?.({ phase: 'navigating_to_login', detail: `Login page loaded (final URL: ${loginUrl})` });
 
-  if (!verificationPromptDetected) {
-    return;
+  // Step 2: Click "Sign up"
+  const signUpCandidates = [
+    page.getByRole('link', { name: /sign up/i }).first(),
+    page.getByRole('button', { name: /sign up/i }).first(),
+    page.getByText('Sign up', { exact: true }).first(),
+  ];
+  let signUpClicked = false;
+  for (const candidate of signUpCandidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      await candidate.click({ timeout: 5000 });
+      signUpClicked = true;
+      break;
+    }
+  }
+  if (signUpClicked) {
+    onPhase?.({ phase: 'signup_clicked', detail: 'Clicked Sign up on WeTransfer login page' });
+    await page.waitForTimeout(1500);
+    await waitForStableDom(page);
+  } else {
+    onPhase?.({ phase: 'signup_clicked', detail: 'Sign up link not found; proceeding with email entry directly' });
   }
 
-  onPhase?.({
-    phase: 'awaiting_sender_verification',
-    detail: 'WeTransfer requested sender verification. Polling temp mailbox.',
-  });
+  // Step 3: Fill input#email with senderEmail
+  const emailInput = page.locator('input#email').first();
+  await emailInput.waitFor({ state: 'visible', timeout: 20000 });
+  await emailInput.fill(senderEmail);
+  onPhase?.({ phase: 'sender_email_entered', detail: `Sender email entered: ${senderEmail}` });
 
+  // Step 4: Click "Continue"
+  const continueBtn = page.getByRole('button', { name: /continue/i }).first();
+  if (await continueBtn.isVisible().catch(() => false)) {
+    await continueBtn.click({ timeout: 5000 });
+  } else {
+    // Fallback: press Enter on the email input
+    await emailInput.press('Enter');
+  }
+  onPhase?.({ phase: 'verification_code_requested', detail: 'Submitted email, polling temp mailbox for verification code' });
+  await page.waitForTimeout(2000);
+
+  // Step 5: Poll temp mailbox for verification code
   if (!options.onVerificationRequired) {
-    throw new Error('Sender verification is required but mailbox verification callback is unavailable.');
+    throw new Error(
+      'Signup verification required but no verification callback provided. ' +
+        'Ensure the session was initialised with a temp-mail.io mailbox.'
+    );
   }
 
   const resolution = await options.onVerificationRequired();
-  if (!resolution?.verificationLink && !resolution?.verificationCode) {
+  if (!resolution?.verificationCode && !resolution?.verificationLink) {
+    const currentUrl = page.url();
     throw new Error(
-      resolution?.detail || 'Sender verification requested but no verification link/code was found in mailbox.'
+      `${resolution?.detail || 'No verification code received in temp mailbox after signup'} ` +
+        `(last successful stage: verification_code_requested, current URL: ${currentUrl})`
     );
   }
 
@@ -486,23 +413,66 @@ async function handleVerificationIfPrompted(
     phase: 'verification_received',
     detail:
       resolution.detail ||
-      `Verification received${resolution.mailboxMessageCount !== undefined ? ` (mailbox messages: ${resolution.mailboxMessageCount})` : ''}`,
+      `Verification code received${resolution.mailboxMessageCount !== undefined ? ` (mailbox messages: ${resolution.mailboxMessageCount})` : ''}`,
   });
 
+  // Step 6 & 7: Fill input#verificationCode and click "Verify"
   if (resolution.verificationCode) {
-    const codeInput = page
+    const codeInput = page.locator('input#verificationCode').first();
+    const codeInputFallback = page
       .locator('input[name*="code" i], input[placeholder*="code" i], input[autocomplete="one-time-code"]')
       .first();
-    if (await codeInput.isVisible().catch(() => false)) {
-      await codeInput.fill(resolution.verificationCode);
+
+    const primaryVisible = await codeInput.isVisible().catch(() => false);
+    const activeCodeInput = primaryVisible ? codeInput : codeInputFallback;
+
+    await activeCodeInput.waitFor({ state: 'visible', timeout: 20000 });
+    await activeCodeInput.fill(resolution.verificationCode);
+
+    const verifyBtn = page.getByRole('button', { name: /verify/i }).first();
+    if (await verifyBtn.isVisible().catch(() => false)) {
+      await verifyBtn.click({ timeout: 5000 });
+    } else {
       await clickFirstVisibleByText(page, ['Verify', 'Confirm', 'Continue']);
     }
-  }
-
-  if (resolution.verificationLink) {
+    onPhase?.({ phase: 'verification_submitted', detail: 'Verification code submitted, waiting for session' });
+    await page.waitForTimeout(3000);
+    await waitForStableDom(page);
+  } else if (resolution.verificationLink) {
+    // If a magic link was provided instead of a code, navigate directly
     await page.goto(resolution.verificationLink, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await waitForStableDom(page);
+    onPhase?.({ phase: 'verification_submitted', detail: 'Followed verification link' });
   }
+
+  // Step 8: Accept terms if shown
+  const termsBtn = page.locator('[data-testid="accept-terms"]').first();
+  if (await termsBtn.isVisible().catch(() => false)) {
+    await termsBtn.click({ timeout: 5000 }).catch(() => undefined);
+    onPhase?.({ phase: 'terms_accepted', detail: 'Accepted WeTransfer terms and conditions' });
+    await page.waitForTimeout(1500);
+    await waitForStableDom(page);
+  }
+
+  // Step 9: Wait for the uploader UI to become visible
+  let uploaderVisible = false;
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    if (await isUploaderVisible(page)) {
+      uploaderVisible = true;
+      break;
+    }
+    await page.waitForTimeout(1000);
+  }
+
+  const postSignupUrl = page.url();
+  if (!uploaderVisible) {
+    throw new Error(
+      `Uploader UI did not appear after signup/verification ` +
+        `(last successful stage: verification_submitted, current URL: ${postSignupUrl})`
+    );
+  }
+
+  onPhase?.({ phase: 'uploader_visible', detail: `Uploader UI is visible (URL: ${postSignupUrl})` });
 }
 
 async function confirmSend(page: Page): Promise<{ transferUrl?: string }> {
@@ -554,10 +524,12 @@ export async function probeWeTransferWebsite(
     });
 
     const page = await browser.newPage();
-    onPhase?.({ phase: 'loading_wetransfer', detail: `Loading ${WETRANSFER_URL}` });
-    await page.goto(WETRANSFER_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    onPhase?.({ phase: 'loading_wetransfer', detail: `Loading ${WETRANSFER_LOGIN_URL}` });
+    await page.goto(WETRANSFER_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await waitForStableDom(page);
     await dismissConsentAndPopups(page);
+    const finalUrl = page.url();
+    onPhase?.({ phase: 'navigating_to_login', detail: `Login page reachable (final URL: ${finalUrl})` });
 
     return { success: true };
   } catch (error: unknown) {
@@ -594,6 +566,11 @@ export async function createWeTransferTransfer(
     }
 
     const senderEmail = (options.senderEmail || '').trim();
+    if (!senderEmail) {
+      throw new Error(
+        'Sender email (temp mailbox) is required for the WeTransfer signup/login flow'
+      );
+    }
 
     onPhase?.({ phase: 'opening_browser', detail: 'Launching automation browser' });
     browser = await chromium.launch({
@@ -602,13 +579,8 @@ export async function createWeTransferTransfer(
 
     const page = await browser.newPage();
 
-    onPhase?.({ phase: 'loading_wetransfer', detail: `Navigating to ${WETRANSFER_URL}` });
-    await page.goto(WETRANSFER_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await waitForStableDom(page);
-    await dismissConsentAndPopups(page);
-    const modeDiagnostics = await ensureEmailTransferMode(page, (msg) => {
-      onPhase?.({ phase: 'preparing_attachment', detail: msg });
-    });
+    // Perform signup + verification flow before touching the uploader
+    await performSignupAndVerification(page, senderEmail, options, onPhase);
 
     onPhase?.({ phase: 'preparing_attachment', detail: `Using file ${path.basename(attachmentPath)}` });
     onPhase?.({ phase: 'upload_started', detail: `Uploading "${filename}" (${fileBuffer.length} bytes)` });
@@ -621,12 +593,9 @@ export async function createWeTransferTransfer(
       });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
+      const currentUrl = page.url();
       throw new Error(
-        `${message} Mode selection diagnostics: ` +
-          `sendEmailSelectorFound=${modeDiagnostics.sendEmailSelectorFound}; ` +
-          `sendEmailClicked=${modeDiagnostics.sendEmailClicked}; ` +
-          `optionsTriggerClicked=${modeDiagnostics.optionsTriggerClicked}; ` +
-          `uploaderVisibleAfterModeSwitch=${modeDiagnostics.uploaderVisibleAfterModeSwitch}`
+        `${message} (last successful stage: uploader_visible, current URL: ${currentUrl})`
       );
     }
     await page.waitForTimeout(1000);
@@ -635,17 +604,11 @@ export async function createWeTransferTransfer(
       detail: `Upload completed for "${filename}"${uploadStrategyLog.length ? ` [${uploadStrategyLog.join(', ')}]` : ''}`,
     });
 
-    const recipientStrategyLog: string[] = [];
     const recipientFilled = await fillEmailField(page, normalizedRecipient, 'recipient', (msg) => {
-      recipientStrategyLog.push(msg);
       onPhase?.({ phase: 'send_submitted', detail: msg });
     });
     if (!recipientFilled) {
       throw new Error('Could not locate recipient email field in WeTransfer browser flow.');
-    }
-
-    if (senderEmail) {
-      await fillEmailField(page, senderEmail, 'sender');
     }
 
     if (message?.trim()) {
@@ -656,8 +619,6 @@ export async function createWeTransferTransfer(
         await messageField.fill(message.trim());
       }
     }
-
-    await clickFirstVisibleByText(page, ['I agree', 'Accept terms', 'Agree']);
 
     // Transfer button: prefer the stable data-testid attribute, fall back to text-based search
     let sendClicked = false;
@@ -678,7 +639,6 @@ export async function createWeTransferTransfer(
 
     onPhase?.({ phase: 'send_submitted', detail: `Transfer submission clicked for ${normalizedRecipient}` });
 
-    await handleVerificationIfPrompted(page, options, onPhase);
     const confirmation = await confirmSend(page);
 
     onPhase?.({ phase: 'send_confirmed', detail: `Transfer confirmed for ${normalizedRecipient}` });
