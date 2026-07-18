@@ -1,223 +1,270 @@
-const DEFAULT_WETRANSFER_API_URL = 'https://dev.wetransfer.com';
+import { stat } from 'node:fs/promises';
+import path from 'node:path';
+import { chromium, Page } from 'playwright';
+
+const WETRANSFER_URL = (process.env.WETRANSFER_WEB_URL || 'https://wetransfer.com').trim();
+
+type VerificationResolution = {
+  verificationLink?: string;
+  verificationCode?: string;
+  mailboxMessageCount?: number;
+  detail?: string;
+};
 
 export type WeTransferSendPhase =
+  | 'opening_browser'
+  | 'loading_wetransfer'
+  | 'awaiting_sender_verification'
+  | 'verification_received'
+  | 'preparing_attachment'
   | 'upload_started'
   | 'upload_completed'
   | 'send_submitted'
-  | 'send_confirmed';
+  | 'send_confirmed'
+  | 'failed';
 
 export type WeTransferSendPhaseUpdate = {
   phase: WeTransferSendPhase;
   detail: string;
 };
 
-type JsonRecord = Record<string, unknown>;
+export type WeTransferSendOptions = {
+  attachmentPath?: string;
+  senderEmail?: string;
+  onVerificationRequired?: () => Promise<VerificationResolution | null>;
+};
 
-function getWeTransferConfig() {
-  const apiKey = (process.env.WETRANSFER_API_KEY || '').trim();
-  const rawBase = (process.env.WETRANSFER_API_URL || '').trim() || DEFAULT_WETRANSFER_API_URL;
-  const baseUrl = rawBase.endsWith('/') ? rawBase.slice(0, -1) : rawBase;
+const BUTTON_HINTS = [
+  'Accept',
+  'Accept all',
+  'I agree',
+  'I accept',
+  'Continue',
+  'Got it',
+  'Agree',
+  'Understood',
+  'Allow all',
+];
 
-  if (!apiKey) {
-    throw new Error(
-      'WETRANSFER_API_KEY is not configured. Set it to enable real WeTransfer upload/send.'
-    );
+const SEND_BUTTON_HINTS = [
+  'Transfer',
+  'Send',
+  'Get a link',
+  'Continue',
+  'Proceed',
+  'Create transfer',
+];
+
+async function clickFirstVisibleByText(page: Page, hints: string[]): Promise<boolean> {
+  for (const hint of hints) {
+    const candidates = page
+      .locator('button, [role="button"], input[type="button"], input[type="submit"], a')
+      .filter({ hasText: hint });
+    const count = await candidates.count();
+    for (let i = 0; i < count; i += 1) {
+      const candidate = candidates.nth(i);
+      if (await candidate.isVisible().catch(() => false)) {
+        await candidate.click({ timeout: 2000 }).catch(() => undefined);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+async function dismissConsentAndPopups(page: Page): Promise<void> {
+  await clickFirstVisibleByText(page, BUTTON_HINTS);
+}
+
+async function waitForStableDom(page: Page): Promise<void> {
+  await page.waitForLoadState('domcontentloaded');
+  await page.waitForTimeout(600);
+}
+
+async function fillEmailField(page: Page, targetEmail: string, mode: 'recipient' | 'sender'): Promise<boolean> {
+  const normalized = targetEmail.trim();
+  if (!normalized) return false;
+
+  const selectorHints = mode === 'recipient'
+    ? [
+        'input[placeholder*="email" i][name*="recipient" i]',
+        'input[placeholder*="to" i][type="email"]',
+        'input[name*="recipient" i][type="email"]',
+      ]
+    : [
+        'input[placeholder*="your" i][type="email"]',
+        'input[placeholder*="from" i][type="email"]',
+        'input[name*="sender" i][type="email"]',
+      ];
+
+  for (const selector of selectorHints) {
+    const field = page.locator(selector).first();
+    if (await field.isVisible().catch(() => false)) {
+      await field.fill(normalized);
+      return true;
+    }
   }
 
-  return { apiKey, baseUrl };
-}
+  const emailFields = page.locator('input[type="email"]');
+  const count = await emailFields.count();
+  if (count === 0) return false;
 
-async function parseJsonSafe(response: Response): Promise<JsonRecord | null> {
-  const text = await response.text();
-  if (!text) return null;
-  try {
-    return JSON.parse(text) as JsonRecord;
-  } catch {
-    return null;
-  }
-}
-
-async function apiRequest(
-  path: string,
-  init: RequestInit,
-  config: { apiKey: string; baseUrl: string }
-): Promise<JsonRecord | null> {
-  const authHeader = 'B' + 'earer ' + config.apiKey;
-  const response = await fetch(`${config.baseUrl}${path}`, {
-    ...init,
-    headers: {
-      Authorization: authHeader,
-      ...(init.headers || {}),
-    },
-  });
-
-  const payload = await parseJsonSafe(response);
-  if (!response.ok) {
-    const detail = payload ? JSON.stringify(payload) : `${response.status} ${response.statusText}`;
-    throw new Error(`WeTransfer API ${path} failed [${response.status}]: ${detail}`);
-  }
-  return payload;
-}
-
-function toArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function asObject(value: unknown): JsonRecord | null {
-  return value && typeof value === 'object' ? (value as JsonRecord) : null;
-}
-
-function pickUploadUrl(value: JsonRecord | null): string | null {
-  if (!value) return null;
-  const direct =
-    (typeof value.upload_url === 'string' && value.upload_url) ||
-    (typeof value.uploadUrl === 'string' && value.uploadUrl) ||
-    (typeof value.url === 'string' && value.url) ||
-    (typeof value.presigned_put_url === 'string' && value.presigned_put_url);
-  if (direct) return direct;
-
-  const parts = toArray(value.parts);
-  for (const part of parts) {
-    const partObj = asObject(part);
-    if (!partObj) continue;
-    const partUrl =
-      (typeof partObj.upload_url === 'string' && partObj.upload_url) ||
-      (typeof partObj.url === 'string' && partObj.url);
-    if (partUrl) return partUrl;
+  if (mode === 'recipient') {
+    await emailFields.first().fill(normalized);
+    return true;
   }
 
+  if (count > 1) {
+    await emailFields.nth(1).fill(normalized);
+    return true;
+  }
+
+  return false;
+}
+
+function extractTransferLinkFromHtml(html: string): string | undefined {
+  const matches = html.match(/https?:\/\/[^\s"'<>]+/gi) ?? [];
+  const preferred = matches.find((value) => /wetransfer\.com\/(downloads|transfers)/i.test(value));
+  return preferred || matches[0];
+}
+
+function getAntiBotHint(html: string): string | null {
+  const text = html.toLowerCase();
+  if (text.includes('captcha') || text.includes('cloudflare') || text.includes('verify you are human')) {
+    return 'WeTransfer browser flow appears blocked by anti-bot verification (captcha/human check).';
+  }
   return null;
 }
 
-function extractTransferEnvelope(payload: JsonRecord | null): JsonRecord | null {
-  if (!payload) return null;
-  const transfer = asObject(payload.transfer);
-  return transfer || payload;
+async function uploadAttachment(page: Page, attachmentPath: string): Promise<void> {
+  const input = page.locator('input[type="file"]').first();
+  if (await input.count()) {
+    await input.setInputFiles(attachmentPath);
+    return;
+  }
+
+  const fileChooserPromise = page.waitForEvent('filechooser', { timeout: 8000 });
+  const clicked = await clickFirstVisibleByText(page, ['Add files', 'Upload files', 'Select files', 'Add your files']);
+  if (!clicked) {
+    throw new Error('Could not find file input or upload trigger on WeTransfer page');
+  }
+  const chooser = await fileChooserPromise;
+  await chooser.setFiles(attachmentPath);
 }
 
-function extractTransferId(payload: JsonRecord | null): string | null {
-  const transfer = extractTransferEnvelope(payload);
-  if (!transfer) return null;
-  return (
-    (typeof transfer.id === 'string' && transfer.id) ||
-    (typeof transfer.transfer_id === 'string' && transfer.transfer_id) ||
-    null
-  );
-}
+async function handleVerificationIfPrompted(
+  page: Page,
+  options: WeTransferSendOptions,
+  onPhase?: (update: WeTransferSendPhaseUpdate) => void
+): Promise<void> {
+  const html = await page.content();
+  const verificationPromptDetected =
+    /verify your email|check your inbox|verification code|confirm your email/i.test(html);
 
-function extractDownloadUrl(payload: JsonRecord | null): string | null {
-  const transfer = extractTransferEnvelope(payload);
-  if (!transfer) return null;
-  return (
-    (typeof transfer.download_url === 'string' && transfer.download_url) ||
-    (typeof transfer.url === 'string' && transfer.url) ||
-    null
-  );
-}
+  if (!verificationPromptDetected) {
+    return;
+  }
 
-async function createTransfer(
-  recipientEmail: string,
-  message: string,
-  config: { apiKey: string; baseUrl: string }
-): Promise<string> {
-  const variants: JsonRecord[] = [
-    { message, recipients: [recipientEmail] },
-    { message, recipients: [{ email: recipientEmail }] },
-  ];
+  onPhase?.({
+    phase: 'awaiting_sender_verification',
+    detail: 'WeTransfer requested sender verification. Polling temp mailbox.',
+  });
 
-  let lastError: Error | null = null;
-  for (const payload of variants) {
-    try {
-      const created = await apiRequest(
-        '/v2/transfers',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        },
-        config
-      );
-      const transferId = extractTransferId(created);
-      if (!transferId) throw new Error('WeTransfer API response did not include transfer id');
-      return transferId;
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
+  if (!options.onVerificationRequired) {
+    throw new Error('Sender verification is required but mailbox verification callback is unavailable.');
+  }
+
+  const resolution = await options.onVerificationRequired();
+  if (!resolution?.verificationLink && !resolution?.verificationCode) {
+    throw new Error(
+      resolution?.detail || 'Sender verification requested but no verification link/code was found in mailbox.'
+    );
+  }
+
+  onPhase?.({
+    phase: 'verification_received',
+    detail:
+      resolution.detail ||
+      `Verification received${resolution.mailboxMessageCount !== undefined ? ` (mailbox messages: ${resolution.mailboxMessageCount})` : ''}`,
+  });
+
+  if (resolution.verificationCode) {
+    const codeInput = page
+      .locator('input[name*="code" i], input[placeholder*="code" i], input[autocomplete="one-time-code"]')
+      .first();
+    if (await codeInput.isVisible().catch(() => false)) {
+      await codeInput.fill(resolution.verificationCode);
+      await clickFirstVisibleByText(page, ['Verify', 'Confirm', 'Continue']);
     }
   }
 
-  throw new Error(lastError?.message || 'Unable to create WeTransfer transfer');
+  if (resolution.verificationLink) {
+    await page.goto(resolution.verificationLink, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await waitForStableDom(page);
+  }
 }
 
-async function createTransferFile(
-  transferId: string,
-  filename: string,
-  fileBuffer: Buffer,
-  config: { apiKey: string; baseUrl: string }
-): Promise<{ fileId: string | null; uploadUrl: string }> {
-  const variants: JsonRecord[] = [
-    { filename, filesize: fileBuffer.length },
-    { name: filename, size: fileBuffer.length },
+async function confirmSend(page: Page): Promise<{ transferUrl?: string }> {
+  const successTextChecks = [
+    'Transfer sent',
+    "You've sent",
+    'Files are on their way',
+    'Your transfer is ready',
+    'Email sent',
   ];
 
-  let lastError: Error | null = null;
-  for (const payload of variants) {
-    try {
-      const created = await apiRequest(
-        `/v2/transfers/${encodeURIComponent(transferId)}/files`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        },
-        config
-      );
-      const fileObject = asObject(created?.file) || created;
-      const fileId =
-        (typeof fileObject?.id === 'string' && fileObject.id) ||
-        (typeof fileObject?.file_id === 'string' && fileObject.file_id) ||
-        null;
-      const uploadUrl = pickUploadUrl(fileObject);
-      if (!uploadUrl) throw new Error('No upload URL returned for transfer file');
-      return { fileId, uploadUrl };
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-    }
+  try {
+    await page.waitForFunction(
+      (texts) => {
+        const bodyText = document.body?.innerText || '';
+        return texts.some((text: string) => bodyText.toLowerCase().includes(text.toLowerCase()));
+      },
+      successTextChecks,
+      { timeout: 45000 }
+    );
+  } catch {
+    // Continue with HTML-based fallback below.
   }
 
-  throw new Error(lastError?.message || 'Unable to create WeTransfer transfer file');
+  const html = await page.content();
+  const antiBotHint = getAntiBotHint(html);
+  if (antiBotHint) {
+    throw new Error(antiBotHint);
+  }
+
+  const sentDetected =
+    /transfer sent|files are on their way|your transfer is ready|email sent|download link/i.test(html);
+
+  if (!sentDetected) {
+    throw new Error('WeTransfer did not show a send confirmation page after submitting transfer.');
+  }
+
+  return { transferUrl: extractTransferLinkFromHtml(html) };
 }
 
-async function completeTransferFile(
-  transferId: string,
-  fileId: string | null,
-  config: { apiKey: string; baseUrl: string }
-) {
-  if (!fileId) return;
-  await apiRequest(
-    `/v2/transfers/${encodeURIComponent(transferId)}/files/${encodeURIComponent(fileId)}/complete`,
-    { method: 'PUT' },
-    config
-  );
-}
+export async function probeWeTransferWebsite(
+  onPhase?: (update: WeTransferSendPhaseUpdate) => void
+): Promise<{ success: boolean; error?: string }> {
+  let browser;
+  try {
+    onPhase?.({ phase: 'opening_browser', detail: 'Launching automation browser' });
+    browser = await chromium.launch({
+      headless: (process.env.WETRANSFER_HEADLESS || 'true').trim().toLowerCase() !== 'false',
+    });
 
-async function finalizeTransfer(
-  transferId: string,
-  config: { apiKey: string; baseUrl: string }
-): Promise<string | null> {
-  const finalized = await apiRequest(
-    `/v2/transfers/${encodeURIComponent(transferId)}/finalize`,
-    { method: 'PUT' },
-    config
-  );
-  const urlFromFinalize = extractDownloadUrl(finalized);
-  if (urlFromFinalize) return urlFromFinalize;
+    const page = await browser.newPage();
+    onPhase?.({ phase: 'loading_wetransfer', detail: `Loading ${WETRANSFER_URL}` });
+    await page.goto(WETRANSFER_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await waitForStableDom(page);
+    await dismissConsentAndPopups(page);
 
-  const fetched = await apiRequest(
-    `/v2/transfers/${encodeURIComponent(transferId)}`,
-    { method: 'GET' },
-    config
-  );
-  return extractDownloadUrl(fetched);
+    return { success: true };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, error: message };
+  } finally {
+    await browser?.close().catch(() => undefined);
+  }
 }
 
 export async function createWeTransferTransfer(
@@ -225,62 +272,90 @@ export async function createWeTransferTransfer(
   fileBuffer: Buffer,
   recipientEmail: string,
   message?: string,
-  onPhase?: (update: WeTransferSendPhaseUpdate) => void
+  onPhase?: (update: WeTransferSendPhaseUpdate) => void,
+  options: WeTransferSendOptions = {}
 ): Promise<{ success: boolean; downloadUrl?: string; error?: string }> {
+  let browser;
   try {
-    const config = getWeTransferConfig();
-    const transferId = await createTransfer(
-      recipientEmail,
-      message || 'Your personalized document',
-      config
-    );
-    const { fileId, uploadUrl } = await createTransferFile(transferId, filename, fileBuffer, config);
-
-    onPhase?.({
-      phase: 'upload_started',
-      detail: `Uploading "${filename}" (${fileBuffer.length} bytes)`,
-    });
-
-    const uploadResponse = await fetch(uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/octet-stream' },
-      body: new Uint8Array(fileBuffer),
-    });
-    if (!uploadResponse.ok) {
-      const uploadBody = await uploadResponse.text();
-      throw new Error(`File upload failed [${uploadResponse.status}]: ${uploadBody}`);
+    const normalizedRecipient = recipientEmail.trim();
+    if (!normalizedRecipient) {
+      throw new Error('Recipient email is required for WeTransfer send');
     }
 
-    onPhase?.({
-      phase: 'upload_completed',
-      detail: `Upload complete for "${filename}"`,
-    });
-
-    await completeTransferFile(transferId, fileId, config);
-    onPhase?.({
-      phase: 'send_submitted',
-      detail: `Transfer ${transferId} finalized request submitted`,
-    });
-
-    const downloadUrl = await finalizeTransfer(transferId, config);
-    if (!downloadUrl) {
-      throw new Error('Transfer finalized but no download URL was returned');
+    const attachmentPath = options.attachmentPath?.trim();
+    if (!attachmentPath) {
+      throw new Error('Attachment path is required for browser upload');
     }
 
-    onPhase?.({
-      phase: 'send_confirmed',
-      detail: `Transfer confirmed for ${recipientEmail}`,
+    const attachmentStats = await stat(attachmentPath).catch(() => null);
+    if (!attachmentStats || !attachmentStats.isFile() || attachmentStats.size <= 0) {
+      throw new Error(`Attachment file is missing or empty: ${attachmentPath}`);
+    }
+
+    const senderEmail = (options.senderEmail || '').trim();
+
+    onPhase?.({ phase: 'opening_browser', detail: 'Launching automation browser' });
+    browser = await chromium.launch({
+      headless: (process.env.WETRANSFER_HEADLESS || 'true').trim().toLowerCase() !== 'false',
     });
+
+    const page = await browser.newPage();
+
+    onPhase?.({ phase: 'loading_wetransfer', detail: `Navigating to ${WETRANSFER_URL}` });
+    await page.goto(WETRANSFER_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await waitForStableDom(page);
+    await dismissConsentAndPopups(page);
+
+    onPhase?.({ phase: 'preparing_attachment', detail: `Using file ${path.basename(attachmentPath)}` });
+    onPhase?.({ phase: 'upload_started', detail: `Uploading "${filename}" (${fileBuffer.length} bytes)` });
+    await uploadAttachment(page, attachmentPath);
+    await page.waitForTimeout(1000);
+    onPhase?.({ phase: 'upload_completed', detail: `Upload completed for "${filename}"` });
+
+    const recipientFilled = await fillEmailField(page, normalizedRecipient, 'recipient');
+    if (!recipientFilled) {
+      throw new Error('Could not locate recipient email field in WeTransfer browser flow.');
+    }
+
+    if (senderEmail) {
+      await fillEmailField(page, senderEmail, 'sender');
+    }
+
+    if (message?.trim()) {
+      const messageField = page
+        .locator('textarea[name*="message" i], textarea[placeholder*="message" i], textarea')
+        .first();
+      if (await messageField.isVisible().catch(() => false)) {
+        await messageField.fill(message.trim());
+      }
+    }
+
+    await clickFirstVisibleByText(page, ['I agree', 'Accept terms', 'Agree']);
+
+    const sendClicked = await clickFirstVisibleByText(page, SEND_BUTTON_HINTS);
+    if (!sendClicked) {
+      throw new Error('Could not find send/transfer submit button in WeTransfer browser flow.');
+    }
+
+    onPhase?.({ phase: 'send_submitted', detail: `Transfer submission clicked for ${normalizedRecipient}` });
+
+    await handleVerificationIfPrompted(page, options, onPhase);
+    const confirmation = await confirmSend(page);
+
+    onPhase?.({ phase: 'send_confirmed', detail: `Transfer confirmed for ${normalizedRecipient}` });
 
     return {
       success: true,
-      downloadUrl,
+      downloadUrl: confirmation.transferUrl,
     };
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+    onPhase?.({ phase: 'failed', detail: message });
     return {
       success: false,
       error: message,
     };
+  } finally {
+    await browser?.close().catch(() => undefined);
   }
 }

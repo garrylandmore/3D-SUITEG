@@ -108,14 +108,19 @@ type Toast = { id: string; message: string; level: LogLevel };
 type WeTransferStepStatus =
   | 'pending'
   | 'running'
+  | 'opening_browser'
+  | 'loading_wetransfer'
+  | 'awaiting_sender_verification'
   | 'waiting_for_verification'
   | 'verification_received'
+  | 'preparing_attachment'
   | 'upload_started'
   | 'upload_completed'
   | 'send_submitted'
   | 'send_confirmed'
   | 'success'
-  | 'failed';
+  | 'failed'
+  | 'stopped';
 
 type WeTransferStep = {
   id: string;
@@ -735,6 +740,7 @@ export default function DashboardPage() {
           formData.append('leadName', leadName);
           formData.append('fileSource', 'upload');
           formData.append('ctaLink', wtConfig.ctaLink);
+          formData.append('tempMailApiKey', credentials.wetransfer.tempMailApiKey || '');
           formData.append('uploadedFileName', uploadFile.name);
           formData.append('uploadedFileMimeType', uploadFile.type || 'application/octet-stream');
           formData.append('uploadedFile', uploadFile);
@@ -749,6 +755,7 @@ export default function DashboardPage() {
             leadName,
             fileSource: 'generated' as const,
             ctaLink: wtConfig.ctaLink,
+            tempMailApiKey: credentials.wetransfer.tempMailApiKey || '',
             generatedTitle: wtConfig.generatedTitle,
             generatedSubtitle: wtConfig.generatedSubtitle,
             generatedBodyText: wtConfig.generatedBodyText,
@@ -823,7 +830,7 @@ export default function DashboardPage() {
           timerRef.current = setTimeout(() => processNextLead(sender), delayMs);
         })
         .catch((err: Error) => {
-          appendLog('error', `WeTransfer API error: ${err.message}`, 'wetransfer');
+          appendLog('error', `WeTransfer browser send error: ${err.message}`, 'wetransfer');
           setWeTransferSession((prev) => ({ ...prev, latestError: err.message }));
           updateLeads((prev) =>
             prev.map((lead) =>
@@ -1728,12 +1735,12 @@ function MockSenderPanel({
           <Field label="Sender Settings"><textarea rows={4} className="input" value={config.notes} onChange={(e) => onConfigChange({ notes: e.target.value })} /></Field>
         </div>
       </Panel>
-      <Panel title={`${senderLabel} Simulation`}>
+      <Panel title={`${senderLabel} Automation Controls`}>
         <div className="space-y-2 text-sm">
           <Field label="Rate Delay (sec)"><input type="number" className="input" value={config.rateLimitDelay} onChange={(e) => onConfigChange({ rateLimitDelay: Number(e.target.value || 1) })} /></Field>
           <Field label="Run Notes"><input className="input" value={config.tempProvider} onChange={(e) => onConfigChange({ tempProvider: e.target.value })} /></Field>
-          <button className="px-3 py-2 rounded bg-[#6C63FF] text-white" onClick={() => onLog(`${senderLabel} mock settings updated`)}>
-            Apply Mock Config
+          <button className="px-3 py-2 rounded bg-[#6C63FF] text-white" onClick={() => onLog(`${senderLabel} runtime settings updated`)}>
+            Apply Config
           </button>
         </div>
       </Panel>
@@ -1783,7 +1790,12 @@ function stepStatusColor(status: WeTransferStepStatus) {
   if (status === 'upload_completed') return '#22C55E';
   if (status === 'send_confirmed') return '#22C55E';
   if (status === 'failed') return '#EF4444';
+  if (status === 'stopped') return '#EF4444';
+  if (status === 'opening_browser') return '#60A5FA';
+  if (status === 'loading_wetransfer') return '#60A5FA';
+  if (status === 'awaiting_sender_verification') return '#60A5FA';
   if (status === 'waiting_for_verification') return '#60A5FA';
+  if (status === 'preparing_attachment') return '#60A5FA';
   if (status === 'upload_started') return '#60A5FA';
   if (status === 'send_submitted') return '#60A5FA';
   if (status === 'running') return '#60A5FA';
@@ -1796,7 +1808,12 @@ function stepStatusIcon(status: WeTransferStepStatus) {
   if (status === 'upload_completed') return '✓';
   if (status === 'send_confirmed') return '✓';
   if (status === 'failed') return '✗';
+  if (status === 'stopped') return '■';
+  if (status === 'opening_browser') return '🌐';
+  if (status === 'loading_wetransfer') return '↻';
+  if (status === 'awaiting_sender_verification') return '✉';
   if (status === 'waiting_for_verification') return '⏳';
+  if (status === 'preparing_attachment') return '📄';
   if (status === 'upload_started') return '↑';
   if (status === 'send_submitted') return '⇢';
   if (status === 'running') return '⟳';
