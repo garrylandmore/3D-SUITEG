@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { prisma, hasDatabaseUrl } from '@/lib/prisma';
+import { listCampaignLogsLocal } from '@/lib/local-store';
 
 /**
  * GET /api/campaigns/[id]/logs - Get campaign logs
@@ -8,11 +9,19 @@ export async function GET(
   request: NextRequest,
   { params }: { params: { id: string } }
 ) {
-  try {
-    const { searchParams } = new URL(request.url);
-    const limit = parseInt(searchParams.get('limit') || '100');
-    const offset = parseInt(searchParams.get('offset') || '0');
+  const { searchParams } = new URL(request.url);
+  const limit = parseInt(searchParams.get('limit') || '100');
+  const offset = parseInt(searchParams.get('offset') || '0');
 
+  if (!hasDatabaseUrl()) {
+    const logs = listCampaignLogsLocal(params.id, limit, offset);
+    return NextResponse.json(
+      { logs, total: logs.length, limit, offset },
+      { headers: { 'x-3d-suite-mode': 'local-memory' } }
+    );
+  }
+
+  try {
     const logs = await prisma.campaignLog.findMany({
       where: { campaignId: params.id },
       orderBy: { createdAt: 'desc' },
@@ -24,16 +33,12 @@ export async function GET(
       where: { campaignId: params.id },
     });
 
-    return NextResponse.json({
-      logs,
-      total,
-      limit,
-      offset,
-    });
+    return NextResponse.json({ logs, total, limit, offset });
   } catch (error: any) {
+    const logs = listCampaignLogsLocal(params.id, limit, offset);
     return NextResponse.json(
-      { error: error.message },
-      { status: 500 }
+      { logs, total: logs.length, limit, offset },
+      { headers: { 'x-3d-suite-mode': 'local-memory' } }
     );
   }
 }
