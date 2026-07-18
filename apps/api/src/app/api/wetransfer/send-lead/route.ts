@@ -12,6 +12,7 @@ import {
   setWeTransferSessionLocal,
   getBrowserProxyConfigLocal,
 } from '@/lib/local-store';
+import { getBrowserProxyDiagnostics } from '@/lib/browser-proxy';
 
 type AttachmentDebugPayload = {
   name: string;
@@ -211,11 +212,13 @@ export async function POST(request: NextRequest) {
     logs.push(`[Attachment] ON_DISK: ${attachmentPath} | bytes=${attachmentBuffer.length}`);
 
     const proxyConfig = getBrowserProxyConfigLocal();
-    if (proxyConfig?.enabled) {
-      console.log(`[wetransfer/send-lead] Browser proxy enabled: ${proxyConfig.protocol}://${proxyConfig.host}:${proxyConfig.port}`);
-    } else {
-      console.log('[wetransfer/send-lead] Browser proxy disabled');
-    }
+    console.log(
+      `[wetransfer/send-lead] ${getBrowserProxyDiagnostics(
+        proxyConfig,
+        'launchWeTransferBrowser',
+        'POST /api/wetransfer/send-lead'
+      )}`
+    );
 
     const result = await sendLeadViaWeTransfer(
       session,
