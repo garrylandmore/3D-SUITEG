@@ -3,6 +3,7 @@ import {
   sendLeadViaWeTransfer,
   WeTransferExecutionStep,
 } from '@/lib/wetransfer-engine';
+import { generateWeTransferBusinessPdf } from '@/lib/pdf';
 import {
   getWeTransferSessionLocal,
   setWeTransferSessionLocal,
@@ -29,7 +30,9 @@ export async function POST(request: NextRequest) {
 
   const campaignId = body.campaignId ? String(body.campaignId).trim() : '';
   const leadEmail = body.leadEmail ? String(body.leadEmail).trim() : '';
-  const filename = body.filename ? String(body.filename).trim() : 'document.pdf';
+  const leadName = body.leadName ? String(body.leadName).trim() : '';
+  const fileSource = body.fileSource === 'upload' ? 'upload' : 'generated';
+  const ctaLink = body.ctaLink ? String(body.ctaLink).trim() : '';
 
   if (!campaignId || !leadEmail) {
     return NextResponse.json(
@@ -59,11 +62,74 @@ export async function POST(request: NextRequest) {
 
   const logs: string[] = [];
   const stepSnapshots: WeTransferExecutionStep[] = [];
+  let attachmentBuffer: Buffer;
+  let filename = 'generated-proposal.pdf';
+
+  if (fileSource === 'upload') {
+    const uploadedBase64 = body.uploadedFileBase64
+      ? String(body.uploadedFileBase64).trim()
+      : '';
+    const uploadedName = body.uploadedFileName
+      ? String(body.uploadedFileName).trim()
+      : 'uploaded-document.pdf';
+
+    if (!uploadedBase64) {
+      return NextResponse.json(
+        { error: 'uploadedFileBase64 is required when fileSource is "upload"' },
+        { status: 400 }
+      );
+    }
+
+    try {
+      attachmentBuffer = Buffer.from(uploadedBase64, 'base64');
+    } catch {
+      return NextResponse.json(
+        { error: 'uploadedFileBase64 is not valid base64 content' },
+        { status: 400 }
+      );
+    }
+    if (!attachmentBuffer.length) {
+      return NextResponse.json(
+        { error: 'Uploaded file content is empty after base64 decode' },
+        { status: 400 }
+      );
+    }
+
+    filename = uploadedName || 'uploaded-document.pdf';
+    logs.push(`[Attachment] REAL: Uploaded file accepted (${filename}, ${attachmentBuffer.length} bytes).`);
+  } else {
+    const generatedTitle = body.generatedTitle ? String(body.generatedTitle).trim() : '';
+    const generatedSubtitle = body.generatedSubtitle ? String(body.generatedSubtitle).trim() : '';
+    const generatedBodyText = body.generatedBodyText ? String(body.generatedBodyText).trim() : '';
+    const generatedLayout =
+      body.generatedLayout === 'highlight' ? 'highlight' : 'classic';
+
+    attachmentBuffer = await generateWeTransferBusinessPdf({
+      campaignName: campaignId,
+      title: generatedTitle || undefined,
+      subtitle: generatedSubtitle || undefined,
+      bodyText: generatedBodyText || undefined,
+      ctaLink: ctaLink || undefined,
+      layoutMode: generatedLayout,
+      leadName: leadName || undefined,
+      leadEmail,
+    });
+    filename = `${leadEmail.replace(/[^a-z0-9._-]/gi, '_') || 'lead'}-proposal.pdf`;
+    logs.push(
+      '[Attachment] REAL: Generated per-lead PDF in-app (strategy: per-lead generation during send).'
+    );
+  }
 
   const result = await sendLeadViaWeTransfer(
     session,
     leadEmail,
     filename,
+    {
+      fileSource,
+      attachmentBytes: attachmentBuffer.length,
+      leadName: leadName || undefined,
+      ctaLink: ctaLink || undefined,
+    },
     (step, logLine) => {
       stepSnapshots.push({ ...step });
       logs.push(logLine);
@@ -76,13 +142,17 @@ export async function POST(request: NextRequest) {
   return NextResponse.json(
     {
       success: result.success,
+      confirmationStatus: result.confirmationStatus,
       leadEmail: result.leadEmail,
       transferUrl: result.transferUrl ?? null,
       detail: result.detail ?? null,
+      fileSource,
+      filename,
+      attachmentBytes: attachmentBuffer.length,
       steps: stepSnapshots,
       logs,
       mailboxUsed: session.tempMailbox?.email ?? null,
     },
-    { status: result.success ? 200 : 500 }
+    { status: result.confirmationStatus === 'failed' ? 500 : 200 }
   );
 }
