@@ -19,7 +19,7 @@ type AttachmentDebugPayload = {
 
 type WeTransferSendLeadResponse = {
   success?: boolean;
-  confirmationStatus?: 'confirmed' | 'simulated' | 'failed';
+  confirmationStatus?: 'confirmed' | 'failed';
   leadEmail?: string;
   transferUrl?: string | null;
   detail?: string | null;
@@ -40,9 +40,7 @@ type WeTransferSendLeadResponse = {
  *
  * Send a file to a single lead using an existing WeTransfer session.
  *
- * SIMULATED: file upload and send steps (structured placeholders for
- *             future Playwright/Puppeteer automation).
- * REAL:       Uses the temp mailbox created during session initialisation.
+ * REAL: Uploads and sends using the WeTransfer API with confirmation-based status.
  *
  * Body: { campaignId: string; leadEmail: string; filename?: string }
  */
@@ -203,6 +201,7 @@ export async function POST(request: NextRequest) {
         attachmentBytes: attachmentBuffer.length,
         leadName: leadName || undefined,
         ctaLink: ctaLink || undefined,
+        fileBuffer: attachmentBuffer,
       },
       (step, logLine) => {
         stepSnapshots.push({ ...step });
