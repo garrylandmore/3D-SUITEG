@@ -10,6 +10,7 @@ import {
   probeWeTransferWebsite,
   WeTransferSendPhase,
 } from './wetransfer';
+import type { BrowserProxyConfig } from './browser-proxy-types';
 
 export type WeTransferStepStatus =
   | 'pending'
@@ -214,7 +215,8 @@ async function pollForVerificationEmail(
 export async function initWeTransferSession(
   campaignId: string,
   tempMailApiKey: string,
-  onStep?: (step: WeTransferExecutionStep, logLine: string) => void
+  onStep?: (step: WeTransferExecutionStep, logLine: string) => void,
+  proxyConfig?: BrowserProxyConfig | null
 ): Promise<WeTransferSession> {
   const session: WeTransferSession = {
     id: makeId('wt_session'),
@@ -259,6 +261,9 @@ export async function initWeTransferSession(
   }
 
   stepUpdate('open_wetransfer', 'opening_browser');
+  if (proxyConfig?.enabled) {
+    stepUpdate('open_wetransfer', 'opening_browser', `Proxy enabled: ${proxyConfig.protocol}://${proxyConfig.host}:${proxyConfig.port}`);
+  }
   const probeResult = await probeWeTransferWebsite((phaseUpdate) => {
     if (phaseUpdate.phase === 'opening_browser') {
       stepUpdate('open_wetransfer', 'opening_browser', phaseUpdate.detail);
@@ -267,7 +272,7 @@ export async function initWeTransferSession(
     } else if (phaseUpdate.phase === 'navigating_to_login') {
       stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
     }
-  });
+  }, proxyConfig);
 
   if (!probeResult.success) {
     const detail = probeResult.error || 'Failed to open WeTransfer in browser automation mode.';
@@ -298,6 +303,7 @@ export async function sendLeadViaWeTransfer(
     fileBuffer?: Buffer;
     attachmentPath?: string;
     tempMailApiKey?: string;
+    proxyConfig?: BrowserProxyConfig | null;
   },
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void
 ): Promise<WeTransferSendResult> {
@@ -422,6 +428,7 @@ export async function sendLeadViaWeTransfer(
     {
       attachmentPath: options.attachmentPath,
       senderEmail: mailboxEmail,
+      proxyConfig: options.proxyConfig,
       onVerificationRequired:
         tempMailApiKey
           ? async () => {

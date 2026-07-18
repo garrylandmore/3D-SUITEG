@@ -6,6 +6,7 @@ import {
 import {
   getWeTransferSessionLocal,
   setWeTransferSessionLocal,
+  getBrowserProxyConfigLocal,
 } from '@/lib/local-store';
 
 type WeTransferSessionResponse = {
@@ -55,6 +56,13 @@ export async function POST(request: NextRequest) {
   const logs: string[] = [];
   const steps: WeTransferExecutionStep[] = [];
 
+  const proxyConfig = getBrowserProxyConfigLocal();
+  if (proxyConfig?.enabled) {
+    console.log(`[wetransfer/session] Browser proxy enabled: ${proxyConfig.protocol}://${proxyConfig.host}:${proxyConfig.port}`);
+  } else {
+    console.log('[wetransfer/session] Browser proxy disabled');
+  }
+
   try {
     const session = await initWeTransferSession(
       campaignId,
@@ -62,7 +70,8 @@ export async function POST(request: NextRequest) {
       (step, logLine) => {
         steps.push({ ...step });
         logs.push(logLine);
-      }
+      },
+      proxyConfig
     );
 
     setWeTransferSessionLocal(campaignId, session);
