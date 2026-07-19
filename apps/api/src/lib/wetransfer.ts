@@ -703,6 +703,19 @@ async function performSignupAndVerification(
 
   const resolution = await options.onVerificationRequired();
   page.off('response', authResponseLogger);
+
+  if (resolution && !resolution.verificationCode && resolution.detail) {
+    const detailCodeMatch = resolution.detail.match(
+      /(?:your\s+code\s+is|verification\s+code|code)\s*[:\-]?\s*\b([A-Z0-9]{6})\b/i
+    );
+    if (detailCodeMatch?.[1]) {
+      resolution.verificationCode = detailCodeMatch[1].toUpperCase();
+      console.log(
+        `WETRANSFER OTP | extracted code from verification detail: ${resolution.verificationCode}`
+      );
+    }
+  }
+
   if (!resolution?.verificationCode && !resolution?.verificationLink) {
     const currentUrl = page.url();
     throw new Error(
@@ -756,23 +769,76 @@ async function performSignupAndVerification(
     onPhase?.({ phase: 'verification_submitted', detail: 'Followed verification link' });
   }
 
-  // Step 8: Accept terms if shown
-  const termsBtn = page.locator('[data-testid="accept-terms"]').first();
-  if (await termsBtn.isVisible().catch(() => false)) {
-    await termsBtn.click({ timeout: 60000 }).catch(() => undefined);
-    onPhase?.({ phase: 'terms_accepted', detail: 'Accepted WeTransfer terms and conditions' });
-    await page.waitForTimeout(1500);
-    await waitForStableDom(page);
+  // Step 8: After verification WeTransfer may show an onboarding/terms page.
+  // Wait up to 2 minutes for the "I agree" / accept terms control.
+  onPhase?.({
+    phase: 'verification_submitted',
+    detail: 'Verification submitted. Waiting for WeTransfer terms/onboarding screen.',
+  });
+
+  const termsCandidates = [
+    page.locator('[data-testid="accept-terms"]').first(),
+    page.getByRole('button', { name: /^i agree$/i }).first(),
+    page.getByRole('button', { name: /^agree$/i }).first(),
+    page.getByRole('button', { name: /^accept$/i }).first(),
+    page.getByRole('button', { name: /^accept all$/i }).first(),
+    page.getByText('I agree', { exact: true }).first(),
+  ];
+
+  let termsAccepted = false;
+  const termsDeadline = Date.now() + 120000;
+
+  while (Date.now() < termsDeadline && !termsAccepted) {
+    if (await isUploaderVisible(page)) {
+      break;
+    }
+
+    for (const candidate of termsCandidates) {
+      try {
+        if (await candidate.isVisible({ timeout: 1000 })) {
+          console.log(`WETRANSFER TERMS | found agreement control at ${page.url()}`);
+          await candidate.click({ timeout: 60000 });
+          termsAccepted = true;
+
+          onPhase?.({
+            phase: 'terms_accepted',
+            detail: `Clicked WeTransfer "I agree" / terms control (URL: ${page.url()})`,
+          });
+
+          await page.waitForTimeout(3000);
+          await waitForStableDom(page);
+          break;
+        }
+      } catch {
+        // Try the next selector.
+      }
+    }
+
+    if (!termsAccepted) {
+      onPhase?.({
+        phase: 'verification_submitted',
+        detail: `Waiting for "I agree" or uploader UI (current URL: ${page.url()})`,
+      });
+      await page.waitForTimeout(2000);
+    }
   }
 
-  // Step 9: Wait for the uploader UI to become visible
+  // Step 9: Wait up to 2 additional minutes for the uploader UI.
   let uploaderVisible = false;
-  for (let attempt = 0; attempt < 15; attempt += 1) {
+  const uploaderDeadline = Date.now() + 120000;
+
+  while (Date.now() < uploaderDeadline) {
     if (await isUploaderVisible(page)) {
       uploaderVisible = true;
       break;
     }
-    await page.waitForTimeout(1000);
+
+    onPhase?.({
+      phase: 'verification_submitted',
+      detail: `Waiting for WeTransfer uploader UI (current URL: ${page.url()})`,
+    });
+
+    await page.waitForTimeout(2000);
   }
 
   const postSignupUrl = page.url();
