@@ -240,29 +240,22 @@ async function waitForStableDom(page: Page): Promise<void> {
 }
 
 async function isUploaderVisible(page: Page): Promise<boolean> {
-  const selectorChecks = [
-    'input[type="file"]',
-    'input#autosuggest',
-    'input[name="autosuggest"]',
-    'label[for="autosuggest"]',
-    '[data-testid="uploaderForm-transfer-button"]',
-  ];
+  const hasFileInput =
+    (await page.locator('input[type="file"]').count().catch(() => 0)) > 0;
 
-  for (const selector of selectorChecks) {
-    const visible = await page.locator(selector).first().isVisible().catch(() => false);
-    if (visible) {
-      return true;
-    }
-  }
+  const addFilesVisible = await page
+    .getByText(/add files/i)
+    .first()
+    .isVisible()
+    .catch(() => false);
 
-  if (await page.getByRole('button', { name: /add files/i }).first().isVisible().catch(() => false)) {
-    return true;
-  }
-  if (await page.getByText(/add files/i).first().isVisible().catch(() => false)) {
-    return true;
-  }
+  const recipientVisible = await page
+    .locator('input#autosuggest[name="autosuggest"]')
+    .first()
+    .isVisible()
+    .catch(() => false);
 
-  return false;
+  return hasFileInput || addFilesVisible || recipientVisible;
 }
 
 /**
@@ -372,19 +365,14 @@ async function waitForWeTransferUploadReady(
   const timeoutMs = Number(
     process.env.WETRANSFER_UPLOAD_WAIT_MS || 180000
   );
-  const minimumWaitMs = Number(
-    process.env.WETRANSFER_UPLOAD_MIN_WAIT_MS || 5000
-  );
 
   const startedAt = Date.now();
   let attempt = 0;
-  let stableReadyChecks = 0;
-  let sawProgressState = false;
+  let stableFilenameChecks = 0;
 
   while (Date.now() - startedAt < timeoutMs) {
     attempt += 1;
 
-    // Confirm that the browser file input actually contains the expected file.
     const inputHasExpectedFile = await page
       .locator('input[type="file"]')
       .evaluateAll((inputs, expectedName) => {
@@ -398,82 +386,61 @@ async function waitForWeTransferUploadReady(
       }, filename)
       .catch(() => false);
 
-    // Confirm that WeTransfer's visible UI has registered the filename.
-    const filenameVisible = await page
-      .getByText(filename, { exact: false })
-      .first()
+    const fileTitle = page
+      .locator('h6.file-system-entry__title')
+      .filter({ hasText: filename })
+      .first();
+
+    const filenameVisible = await fileTitle
       .isVisible()
       .catch(() => false);
 
-    // Look for common upload/progress indicators.
-    const progressIndicatorVisible =
+    const visibleTitleText = filenameVisible
+      ? ((await fileTitle.textContent().catch(() => '')) || '').trim()
+      : '';
+
+    const progressVisible =
       (await page
         .locator(
-          [
-            '[role="progressbar"]',
-            'progress',
-            '[aria-busy="true"]',
-            '[data-testid*="progress" i]',
-            '[data-testid*="upload-progress" i]',
-            '[class*="progress" i]',
-          ].join(', ')
+          '[role="progressbar"], progress, [aria-busy="true"], [data-testid*="progress" i], [data-testid*="upload-progress" i]'
         )
         .count()
         .catch(() => 0)) > 0;
 
     const uploadingTextVisible = await page
-      .getByText(
-        /uploading|upload in progress|preparing files|processing files|calculating|almost there/i
-      )
+      .getByText(/uploading|preparing files|processing files|calculating/i)
       .first()
       .isVisible()
       .catch(() => false);
 
-    if (progressIndicatorVisible || uploadingTextVisible) {
-      sawProgressState = true;
-    }
-
-    const elapsedMs = Date.now() - startedAt;
-
-    // Transfer button is intentionally NOT used as the primary readiness signal:
-    // WeTransfer may enable it before a file has finished uploading.
-    const ready =
-      elapsedMs >= minimumWaitMs &&
-      inputHasExpectedFile &&
-      filenameVisible &&
-      !progressIndicatorVisible &&
-      !uploadingTextVisible;
-
     onLog?.(
-      `upload wait | attempt=${attempt} | elapsed=${Math.round(elapsedMs / 1000)}s | inputHasFile=${inputHasExpectedFile} | filenameVisible=${filenameVisible} | progressVisible=${progressIndicatorVisible} | uploadingTextVisible=${uploadingTextVisible} | sawProgress=${sawProgressState}`
+      `upload wait | attempt=${attempt} | inputHasFile=${inputHasExpectedFile} | filenameVisible=${filenameVisible} | title="${visibleTitleText}" | progressVisible=${progressVisible} | uploadingTextVisible=${uploadingTextVisible}`
     );
 
-    if (ready) {
-      stableReadyChecks += 1;
+    if (
+      inputHasExpectedFile &&
+      filenameVisible &&
+      visibleTitleText.includes(filename) &&
+      !progressVisible &&
+      !uploadingTextVisible
+    ) {
+      stableFilenameChecks += 1;
 
-      // Require the ready state to remain unchanged for 3 consecutive checks.
-      if (stableReadyChecks >= 3) {
-        // Give background XHR/fetch uploads one final chance to settle.
-        try {
-          await page.waitForLoadState('networkidle', { timeout: 10000 });
-        } catch {
-          // Some WeTransfer pages keep background connections open.
-        }
-
+      if (stableFilenameChecks >= 2) {
         onLog?.(
-          `upload ready | filename="${filename}" is present in the file input and visible in WeTransfer UI with no active upload indicators`
+          `upload ready | confirmed WeTransfer file entry: ${visibleTitleText}`
         );
         return;
       }
     } else {
-      stableReadyChecks = 0;
+      stableFilenameChecks = 0;
     }
 
     await page.waitForTimeout(2000);
   }
 
   throw new Error(
-    `Timed out after ${Math.round(timeoutMs / 1000)} seconds waiting for WeTransfer to finish uploading "${filename}"`
+    `Timed out after ${Math.round(timeoutMs / 1000)} seconds waiting for WeTransfer file entry "${filename}"`
   );
 }
 
@@ -1117,7 +1084,15 @@ async function ensureUploaderReadyAfterRedirect(
       const currentUrl = page.url();
       const onCallbackUrl = currentUrl.includes('/account/callback');
 
-      if (!onCallbackUrl && (await isUploaderVisible(page))) {
+      const uploaderVisible =
+        !onCallbackUrl && (await isUploaderVisible(page));
+
+      onPhase?.({
+        phase: 'uploader_visible',
+        detail: `Uploader check | visible=${uploaderVisible} | callback=${onCallbackUrl} | URL=${currentUrl}`,
+      });
+
+      if (uploaderVisible) {
         onPhase?.({
           phase: 'uploader_visible',
           detail: `Uploader UI detected after authentication redirect completed (URL: ${currentUrl})`,
@@ -1281,7 +1256,6 @@ export async function createWeTransferTransfer(
           detail: `Transfer attempt ${transferAttempt}/2 | preparing uploader at ${page.url()}`,
         });
 
-        await waitForWeTransferAuthCallbackToFinish(page, onPhase);
         await ensureUploaderReadyAfterRedirect(page, onPhase);
 
         onPhase?.({
