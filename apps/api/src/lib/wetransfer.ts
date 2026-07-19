@@ -478,14 +478,22 @@ async function performSignupAndVerification(
   await page.waitForTimeout(1500);
   await waitForStableDom(page);
 
-  // Log the WeTransfer authentication/signup network flow so we can see whether
-  // the OTP-send request is accepted, rate-limited, challenged, or rejected.
+  // Log only the auth requests that matter for OTP debugging.
+  // Avoid flooding the console with CSS, JS, images, fonts, and hCaptcha assets.
   const authResponseLogger = async (response: any) => {
     const url = response.url();
-    if (!/(auth|signup|verify|verification|otp|challenge|captcha)/i.test(url)) return;
-
     const status = response.status();
     const method = response.request().method();
+
+    const isPasswordlessSignup =
+      method === 'POST' && url.includes('/api/v1/signup/passwordless');
+    const isPasswordlessVerify =
+      method === 'POST' && /passwordless.*verify|verify.*passwordless/i.test(url);
+    const isRelevantAuthError =
+      method === 'POST' && /auth\.wetransfer\.com/i.test(url) && status >= 400;
+
+    if (!isPasswordlessSignup && !isPasswordlessVerify && !isRelevantAuthError) return;
+
     let bodyPreview = '';
     try {
       const contentType = response.headers()['content-type'] || '';
@@ -507,37 +515,80 @@ async function performSignupAndVerification(
   const emailInput = page.locator('input#email').first();
   await emailInput.waitFor({ state: 'visible', timeout: 60000 });
   await emailInput.fill(senderEmail);
+  console.log(`WETRANSFER EMAIL ENTERED | ${senderEmail}`);
   onPhase?.({ phase: 'sender_email_entered', detail: `Sender email entered: ${senderEmail}` });
+
+  // Prepare both signals BEFORE submitting the email so we cannot miss the HTTP 201.
+  const verificationCodeInput = page.locator(
+    'input#verificationCode, input[name="verificationCode"]'
+  ).first();
+  const captchaWaitMs = Number.parseInt(
+    process.env.WETRANSFER_CAPTCHA_WAIT_MS || '600000',
+    10
+  );
+
+  const passwordless201Promise = page
+    .waitForResponse(
+      (response) =>
+        response.request().method() === 'POST' &&
+        response.url().includes('/api/v1/signup/passwordless') &&
+        response.status() === 201,
+      { timeout: captchaWaitMs }
+    )
+    .then(() => 'http_201' as const)
+    .catch(() => null);
+
+  const otpFieldPromise = verificationCodeInput
+    .waitFor({ state: 'visible', timeout: captchaWaitMs })
+    .then(() => 'otp_field' as const)
+    .catch(() => null);
 
   // Step 4: Click "Continue"
   const continueBtn = page.getByRole('button', { name: /continue/i }).first();
   if (await continueBtn.isVisible().catch(() => false)) {
     await continueBtn.click({ timeout: 60000 });
   } else {
-    // Fallback: press Enter on the email input
     await emailInput.press('Enter');
   }
+
+  console.log(
+    `EMAIL SUBMITTED | ${senderEmail} | waiting for CAPTCHA completion / passwordless HTTP 201 / OTP field`
+  );
   onPhase?.({
     phase: 'verification_code_requested',
-    detail: 'Submitted email. Waiting for the WeTransfer verification-code page (complete any CAPTCHA manually if shown)',
+    detail:
+      'Submitted email. Waiting for successful passwordless signup or OTP field (complete any CAPTCHA manually if shown)',
   });
-
-  // CAPTCHA can appear after submitting the email. Do not start the mailbox poll yet,
-  // otherwise the poll may expire while the user is still completing the CAPTCHA.
-  // Wait until WeTransfer actually reaches the OTP page before polling temp-mail.io.
-  const verificationCodeInput = page.locator('input#verificationCode, input[name="verificationCode"]').first();
-  const captchaWaitMs = Number.parseInt(process.env.WETRANSFER_CAPTCHA_WAIT_MS || '600000', 10);
 
   onPhase?.({
     phase: 'awaiting_sender_verification',
-    detail: `Waiting up to ${Math.round(captchaWaitMs / 1000)} seconds for the verification-code field. Complete any CAPTCHA manually in the open browser.`,
+    detail: `Waiting up to ${Math.round(
+      captchaWaitMs / 1000
+    )} seconds for WeTransfer to accept signup. Complete any CAPTCHA manually in the open browser.`,
   });
 
-  await verificationCodeInput.waitFor({ state: 'visible', timeout: captchaWaitMs });
+  // Start polling as soon as EITHER:
+  //   A) WeTransfer confirms POST /api/v1/signup/passwordless with HTTP 201, OR
+  //   B) the OTP input becomes visible.
+  // This prevents the mailbox polling callback from being skipped after CAPTCHA.
+  const trigger = await Promise.race([passwordless201Promise, otpFieldPromise]);
 
+  if (!trigger) {
+    page.off('response', authResponseLogger);
+    throw new Error(
+      `Timed out waiting for WeTransfer passwordless signup HTTP 201 or OTP field. Current URL: ${page.url()}`
+    );
+  }
+
+  const triggerDetail =
+    trigger === 'http_201'
+      ? 'WeTransfer passwordless signup returned HTTP 201'
+      : 'WeTransfer verification-code field detected';
+
+  console.log(`OTP POLLING STARTED | trigger=${trigger} | mailbox=${senderEmail}`);
   onPhase?.({
     phase: 'verification_code_requested',
-    detail: `Verification-code field is visible for sender ${senderEmail}. Starting temp-mail.io polling now.`,
+    detail: `${triggerDetail}. OTP POLLING STARTED for ${senderEmail}`,
   });
 
   // Step 5: Poll temp mailbox for verification code
