@@ -1,10 +1,10 @@
 import {
-  createMailTmMailbox,
-  getMailTmMessage,
-  listMailTmMessages,
-  MailTmMailbox,
-  MailTmMessage,
-} from './mail-tm';
+  createMailSlurpMailbox,
+  getMailSlurpMessage,
+  listMailSlurpMessages,
+  MailSlurpMailbox,
+  MailSlurpMessage,
+} from './mailslurp';
 import {
   createWeTransferTransfer,
   probeWeTransferWebsite,
@@ -41,7 +41,7 @@ export type WeTransferExecutionStep = {
 export type WeTransferSession = {
   id: string;
   campaignId: string;
-  tempMailbox: MailTmMailbox | null;
+  tempMailbox: MailSlurpMailbox | null;
   mailboxMessageCount: number | null;
   latestError: string | null;
   steps: WeTransferExecutionStep[];
@@ -69,7 +69,7 @@ export type WeTransferSendResult = {
 const SETUP_STEP_DEFS: Array<{ id: string; label: string }> = [
   {
     id: 'create_mailbox',
-    label: 'Create temp mailbox (Mail.tm)',
+    label: 'Create temp mailbox (MailSlurp)',
   },
   {
     id: 'open_wetransfer',
@@ -135,7 +135,7 @@ function extractVerificationCode(messageText: string): string | null {
   return standaloneCode?.[1]?.toUpperCase() ?? null;
 }
 
-function messageMayBeWeTransferVerification(message: MailTmMessage): boolean {
+function messageMayBeWeTransferVerification(message: MailSlurpMessage): boolean {
   const subject = (message.subject || '').toLowerCase();
   const from = (message.from || '').toLowerCase();
   const body = `${message.body_text || ''}\n${message.body_html || ''}`.toLowerCase();
@@ -149,22 +149,22 @@ function messageMayBeWeTransferVerification(message: MailTmMessage): boolean {
 }
 
 async function enrichMessageIfNeeded(
-  mailbox: MailTmMailbox,
-  message: MailTmMessage
-): Promise<MailTmMessage> {
+  mailbox: MailSlurpMailbox,
+  message: MailSlurpMessage
+): Promise<MailSlurpMessage> {
   if ((message.body_text || message.body_html || '').trim()) {
     return message;
   }
 
   try {
-    return await getMailTmMessage(mailbox, message.id);
+    return await getMailSlurpMessage(mailbox, message.id);
   } catch {
     return message;
   }
 }
 
 async function pollForVerificationEmail(
-  mailbox: MailTmMailbox,
+  mailbox: MailSlurpMailbox,
   onProgress: (
     attempt: number,
     messageCount: number,
@@ -187,7 +187,7 @@ async function pollForVerificationEmail(
   let attempt = 0;
   while (maxAttempts <= 0 || attempt < maxAttempts) {
     attempt += 1;
-    const messages = await listMailTmMessages(mailbox);
+    const messages = await listMailSlurpMessages(mailbox);
     latestCount = messages.length;
     onProgress(attempt, latestCount, delayMs);
 
@@ -219,7 +219,7 @@ async function pollForVerificationEmail(
 
 export async function initWeTransferSession(
   campaignId: string,
-  _tempMailApiKey?: string,
+  tempMailApiKey?: string,
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void,
   proxyConfig?: BrowserProxyConfig | null
 ): Promise<WeTransferSession> {
@@ -249,10 +249,11 @@ export async function initWeTransferSession(
 
   stepUpdate('create_mailbox', 'running');
   try {
-    const mailbox = await createMailTmMailbox();
+    const mailSlurpApiKey = (tempMailApiKey || process.env.MAILSLURP_API_KEY || '').trim();
+    const mailbox = await createMailSlurpMailbox(mailSlurpApiKey);
     session.tempMailbox = mailbox;
     session.latestError = null;
-    stepUpdate('create_mailbox', 'success', `Mailbox: ${mailbox.email} | provider=mail.tm`);
+    stepUpdate('create_mailbox', 'success', `Mailbox: ${mailbox.email} | provider=mailslurp`);
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
     stepUpdate('create_mailbox', 'failed', msg);
@@ -285,7 +286,7 @@ export async function initWeTransferSession(
 
   stepUpdate('open_wetransfer', 'success', 'WeTransfer login page reached successfully. Signup/verification will happen at send time.');
 
-  stepUpdate('create_account', 'success', 'Browser transport mode is active. Sender email will use Mail.tm mailbox.');
+  stepUpdate('create_account', 'success', 'Browser transport mode is active. Sender email will use MailSlurp inbox.');
   stepUpdate('verify_email', 'success', 'Verification mailbox is ready and will be polled during signup flow.');
 
   session.status = 'ready';
@@ -441,7 +442,7 @@ export async function sendLeadViaWeTransfer(
                 session.tempMailbox!,
                 (attempt, messageCount, delayMs) => {
                   session.mailboxMessageCount = messageCount;
-                  const pollLine = `polling_for_code | provider=mail.tm | attempt ${attempt} | mailbox=${mailboxEmail} | ${messageCount} message(s) | checking again in ${Math.round(delayMs / 1000)}s`;
+                  const pollLine = `polling_for_code | provider=mailslurp | attempt ${attempt} | mailbox=${mailboxEmail} | ${messageCount} message(s) | checking again in ${Math.round(delayMs / 1000)}s`;
                   console.log(pollLine);
                   stepUpdate(
                     'verify_email',
