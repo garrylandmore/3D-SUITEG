@@ -492,8 +492,28 @@ async function performSignupAndVerification(
     // Fallback: press Enter on the email input
     await emailInput.press('Enter');
   }
-  onPhase?.({ phase: 'verification_code_requested', detail: 'Submitted email, polling temp mailbox for verification code' });
-  await page.waitForTimeout(2000);
+  onPhase?.({
+    phase: 'verification_code_requested',
+    detail: 'Submitted email. Waiting for the WeTransfer verification-code page (complete any CAPTCHA manually if shown)',
+  });
+
+  // CAPTCHA can appear after submitting the email. Do not start the mailbox poll yet,
+  // otherwise the poll may expire while the user is still completing the CAPTCHA.
+  // Wait until WeTransfer actually reaches the OTP page before polling temp-mail.io.
+  const verificationCodeInput = page.locator('input#verificationCode, input[name="verificationCode"]').first();
+  const captchaWaitMs = Number.parseInt(process.env.WETRANSFER_CAPTCHA_WAIT_MS || '600000', 10);
+
+  onPhase?.({
+    phase: 'awaiting_sender_verification',
+    detail: `Waiting up to ${Math.round(captchaWaitMs / 1000)} seconds for the verification-code field. Complete any CAPTCHA manually in the open browser.`,
+  });
+
+  await verificationCodeInput.waitFor({ state: 'visible', timeout: captchaWaitMs });
+
+  onPhase?.({
+    phase: 'verification_code_requested',
+    detail: 'Verification-code field is visible. Polling temp mailbox for the WeTransfer OTP now.',
+  });
 
   // Step 5: Poll temp mailbox for verification code
   if (!options.onVerificationRequired) {
@@ -521,22 +541,31 @@ async function performSignupAndVerification(
 
   // Step 6 & 7: Fill input#verificationCode and click "Verify"
   if (resolution.verificationCode) {
-    const codeInput = page.locator('input#verificationCode').first();
+    const codeInput = page.locator('input#verificationCode, input[name="verificationCode"]').first();
     const codeInputFallback = page
       .locator('input[name*="code" i], input[placeholder*="code" i], input[autocomplete="one-time-code"]')
       .first();
 
-    const primaryVisible = await codeInput.isVisible().catch(() => false);
-    const activeCodeInput = primaryVisible ? codeInput : codeInputFallback;
+    let activeCodeInput = codeInput;
+    try {
+      await codeInput.waitFor({ state: 'visible', timeout: 60000 });
+    } catch {
+      activeCodeInput = codeInputFallback;
+      await activeCodeInput.waitFor({ state: 'visible', timeout: 60000 });
+    }
 
-    await activeCodeInput.waitFor({ state: 'visible', timeout: 60000 });
+    await activeCodeInput.fill('');
     await activeCodeInput.fill(resolution.verificationCode);
 
-    const verifyBtn = page.getByRole('button', { name: /verify/i }).first();
-    if (await verifyBtn.isVisible().catch(() => false)) {
+    const verifyBtn = page.getByRole('button', { name: /^verify$/i }).first();
+    try {
+      await verifyBtn.waitFor({ state: 'visible', timeout: 60000 });
       await verifyBtn.click({ timeout: 60000 });
-    } else {
-      await clickFirstVisibleByText(page, ['Verify', 'Confirm', 'Continue']);
+    } catch {
+      const clicked = await clickFirstVisibleByText(page, ['Verify', 'Confirm', 'Continue']);
+      if (!clicked) {
+        throw new Error(`Verification code was filled but the Verify button could not be found. Current URL: ${page.url()}`);
+      }
     }
     onPhase?.({ phase: 'verification_submitted', detail: 'Verification code submitted, waiting for session' });
     await page.waitForTimeout(3000);
