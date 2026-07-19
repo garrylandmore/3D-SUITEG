@@ -11,6 +11,7 @@ import {
   WeTransferSendPhase,
 } from './wetransfer';
 import type { BrowserProxyConfig } from './browser-proxy-types';
+import { isDolphinEnabled } from './dolphin-browser';
 
 export type WeTransferStepStatus =
   | 'pending'
@@ -263,28 +264,52 @@ export async function initWeTransferSession(
   }
 
   stepUpdate('open_wetransfer', 'opening_browser');
-  if (proxyConfig?.enabled) {
-    stepUpdate('open_wetransfer', 'opening_browser', `Proxy enabled: ${proxyConfig.protocol}://${proxyConfig.host}:${proxyConfig.port}`);
-  }
-  const probeResult = await probeWeTransferWebsite((phaseUpdate) => {
-    if (phaseUpdate.phase === 'opening_browser') {
-      stepUpdate('open_wetransfer', 'opening_browser', phaseUpdate.detail);
-    } else if (phaseUpdate.phase === 'loading_wetransfer') {
-      stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
-    } else if (phaseUpdate.phase === 'navigating_to_login') {
-      stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
+
+  if (isDolphinEnabled()) {
+    // Important: do NOT start the Dolphin profile during session initialization.
+    // Next.js may execute the session and send routes in separate module contexts,
+    // so an in-memory cached browser connection is not reliable across routes.
+    // Start Dolphin exactly once when the real send-transfer flow begins.
+    stepUpdate(
+      'open_wetransfer',
+      'success',
+      'Dolphin mode enabled. Browser launch probe skipped; the Dolphin profile will start once at send time.'
+    );
+  } else {
+    if (proxyConfig?.enabled) {
+      stepUpdate(
+        'open_wetransfer',
+        'opening_browser',
+        `Proxy enabled: ${proxyConfig.protocol}://${proxyConfig.host}:${proxyConfig.port}`
+      );
     }
-  }, proxyConfig);
 
-  if (!probeResult.success) {
-    const detail = probeResult.error || 'Failed to open WeTransfer in browser automation mode.';
-    stepUpdate('open_wetransfer', 'failed', detail);
-    session.latestError = detail;
-    session.status = 'failed';
-    return session;
+    const probeResult = await probeWeTransferWebsite((phaseUpdate) => {
+      if (phaseUpdate.phase === 'opening_browser') {
+        stepUpdate('open_wetransfer', 'opening_browser', phaseUpdate.detail);
+      } else if (phaseUpdate.phase === 'loading_wetransfer') {
+        stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
+      } else if (phaseUpdate.phase === 'navigating_to_login') {
+        stepUpdate('open_wetransfer', 'loading_wetransfer', phaseUpdate.detail);
+      }
+    }, proxyConfig);
+
+    if (!probeResult.success) {
+      const detail =
+        probeResult.error ||
+        'Failed to open WeTransfer in browser automation mode.';
+      stepUpdate('open_wetransfer', 'failed', detail);
+      session.latestError = detail;
+      session.status = 'failed';
+      return session;
+    }
+
+    stepUpdate(
+      'open_wetransfer',
+      'success',
+      'WeTransfer login page reached successfully. Signup/verification will happen at send time.'
+    );
   }
-
-  stepUpdate('open_wetransfer', 'success', 'WeTransfer login page reached successfully. Signup/verification will happen at send time.');
 
   stepUpdate('create_account', 'success', 'Browser transport mode is active. Sender email will use MailSlurp inbox.');
   stepUpdate('verify_email', 'success', 'Verification mailbox is ready and will be polled during signup flow.');
