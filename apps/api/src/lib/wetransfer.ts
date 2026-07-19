@@ -111,6 +111,24 @@ async function openWeTransferLoginPage(
         phase: 'loading_wetransfer',
         detail: `Loading ${WETRANSFER_LOGIN_URL} | helper=launchWeTransferBrowser | path=${launchPath} | attempt=${attempt}/${maxAttempts}`,
       });
+      console.log('========================================');
+      console.log('PLAYWRIGHT NETWORK DIAGNOSTICS');
+      console.log('========================================');
+      console.log('Checking Playwright public exit IP...');
+      try {
+        await page.goto('https://api.ipify.org?format=json', {
+          waitUntil: 'domcontentloaded',
+          timeout: 60000,
+        });
+        const ipResponse = await page.textContent('body');
+        console.log(`PLAYWRIGHT EXIT IP | ${ipResponse ?? 'unknown'}`);
+      } catch (error) {
+        console.error(
+          'PLAYWRIGHT EXIT IP CHECK FAILED |',
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+      console.log('Opening WeTransfer...');
       await page.goto(WETRANSFER_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await waitForStableDom(page);
       await dismissConsentAndPopups(page);
