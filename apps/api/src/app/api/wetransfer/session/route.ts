@@ -27,7 +27,7 @@ type WeTransferSessionResponse = {
  *
  * Initialise a WeTransfer engine session for a campaign.
  *
- * REAL: Creates a Mail.tm mailbox and verifies WeTransfer browser automation
+ * REAL: Creates a MailSlurp inbox and verifies WeTransfer browser automation
  * can open the live website.
  *
  * Body: { campaignId: string; filename?: string }
@@ -41,8 +41,19 @@ export async function POST(request: NextRequest) {
   }
 
   const campaignId = body.campaignId ? String(body.campaignId).trim() : '';
+  const mailSlurpApiKey = body.tempMailApiKey
+    ? String(body.tempMailApiKey).trim()
+    : body.mailSlurpApiKey
+      ? String(body.mailSlurpApiKey).trim()
+      : (process.env.MAILSLURP_API_KEY || '').trim();
   if (!campaignId) {
     return NextResponse.json({ error: 'campaignId is required' }, { status: 400 });
+  }
+  if (!mailSlurpApiKey) {
+    return NextResponse.json(
+      { error: 'MailSlurp API key is required. Enter it in the API key field or set MAILSLURP_API_KEY.' },
+      { status: 400 }
+    );
   }
 
   const logs: string[] = [];
@@ -60,7 +71,7 @@ export async function POST(request: NextRequest) {
   try {
     const session = await initWeTransferSession(
       campaignId,
-      undefined,
+      mailSlurpApiKey,
       (step, logLine) => {
         steps.push({ ...step });
         logs.push(logLine);
@@ -74,7 +85,7 @@ export async function POST(request: NextRequest) {
       sessionId: session.id,
       campaignId,
       status: session.status,
-      mailbox: session.tempMailbox,
+      mailbox: session.tempMailbox ? { email: session.tempMailbox.email } : null,
       mailboxMessageCount: session.mailboxMessageCount,
       latestError: session.latestError,
       steps: session.steps,
@@ -109,7 +120,7 @@ export async function GET(request: NextRequest) {
     sessionId: session.id,
     campaignId: session.campaignId,
     status: session.status,
-    mailbox: session.tempMailbox,
+    mailbox: session.tempMailbox ? { email: session.tempMailbox.email } : null,
     mailboxMessageCount: session.mailboxMessageCount,
     latestError: session.latestError,
     steps: session.steps,
