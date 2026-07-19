@@ -454,6 +454,13 @@ export async function sendLeadViaWeTransfer(
       onVerificationRequired:
         tempMailApiKey
           ? async () => {
+              console.log(`OTP POLLING CALLBACK ENTERED | mailbox=${mailboxEmail}`);
+              stepUpdate(
+                'verify_email',
+                'waiting_for_verification',
+                `OTP POLLING STARTED | mailbox=${mailboxEmail} | interval=5s`
+              );
+
               const verificationResult = await pollForVerificationEmail(
                 mailboxEmail,
                 tempMailApiKey,
@@ -462,10 +469,12 @@ export async function sendLeadViaWeTransfer(
                   const quota = rateLimit?.remaining
                     ? ` | API remaining ${rateLimit.remaining}${rateLimit.limit ? `/${rateLimit.limit}` : ''}`
                     : '';
+                  const pollLine = `polling_for_code | attempt ${attempt} | mailbox=${mailboxEmail} | ${messageCount} message(s)${quota} | checking again in ${Math.round(delayMs / 1000)}s`;
+                  console.log(pollLine);
                   stepUpdate(
                     'verify_email',
                     'waiting_for_verification',
-                    `polling_for_code | attempt ${attempt} | mailbox=${mailboxEmail} | ${messageCount} message(s)${quota} | checking again in ${Math.round(delayMs / 1000)}s`
+                    pollLine
                   );
                 }
               );
