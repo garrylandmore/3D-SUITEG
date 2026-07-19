@@ -478,6 +478,31 @@ async function performSignupAndVerification(
   await page.waitForTimeout(1500);
   await waitForStableDom(page);
 
+  // Log the WeTransfer authentication/signup network flow so we can see whether
+  // the OTP-send request is accepted, rate-limited, challenged, or rejected.
+  const authResponseLogger = async (response: any) => {
+    const url = response.url();
+    if (!/(auth|signup|verify|verification|otp|challenge|captcha)/i.test(url)) return;
+
+    const status = response.status();
+    const method = response.request().method();
+    let bodyPreview = '';
+    try {
+      const contentType = response.headers()['content-type'] || '';
+      if (/json|text/i.test(contentType)) {
+        bodyPreview = (await response.text()).replace(/\s+/g, ' ').slice(0, 500);
+      }
+    } catch {
+      // Some responses cannot be read; status + URL are still useful.
+    }
+
+    const detail = `WeTransfer HTTP | ${status} ${method} ${url}${bodyPreview ? ` | ${bodyPreview}` : ''}`;
+    console.log(detail);
+    onPhase?.({ phase: 'verification_code_requested', detail });
+  };
+
+  page.on('response', authResponseLogger);
+
   // Step 3: Fill input#email with senderEmail
   const emailInput = page.locator('input#email').first();
   await emailInput.waitFor({ state: 'visible', timeout: 60000 });
@@ -512,7 +537,7 @@ async function performSignupAndVerification(
 
   onPhase?.({
     phase: 'verification_code_requested',
-    detail: 'Verification-code field is visible. Polling temp mailbox for the WeTransfer OTP now.',
+    detail: `Verification-code field is visible for sender ${senderEmail}. Starting temp-mail.io polling now.`,
   });
 
   // Step 5: Poll temp mailbox for verification code
@@ -524,6 +549,7 @@ async function performSignupAndVerification(
   }
 
   const resolution = await options.onVerificationRequired();
+  page.off('response', authResponseLogger);
   if (!resolution?.verificationCode && !resolution?.verificationLink) {
     const currentUrl = page.url();
     throw new Error(
