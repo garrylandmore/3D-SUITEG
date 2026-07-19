@@ -967,6 +967,81 @@ async function performSignupAndVerification(
   onPhase?.({ phase: 'uploader_visible', detail: `Uploader UI is visible (URL: ${postSignupUrl})` });
 }
 
+
+
+function isWeTransferRootRedirect(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.replace(/^www\./, '');
+    const path = parsed.pathname.replace(/\/+$/, '') || '/';
+
+    return (
+      host === 'wetransfer.com' &&
+      path === '/' &&
+      !parsed.pathname.includes('/downloads/') &&
+      !parsed.pathname.includes('/transfers/')
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function ensureUploaderReadyAfterRedirect(
+  page: Page,
+  onPhase?: (update: WeTransferSendPhaseUpdate) => void
+): Promise<void> {
+  const timeoutMs = Number(
+    process.env.WETRANSFER_POST_VERIFY_UPLOADER_WAIT_MS || 180000
+  );
+
+  const rootUrl = `${WETRANSFER_URL.replace(/\/$/, '')}/`;
+
+  for (let recoveryAttempt = 1; recoveryAttempt <= 2; recoveryAttempt += 1) {
+    const deadline = Date.now() + timeoutMs;
+
+    onPhase?.({
+      phase: 'uploader_visible',
+      detail:
+        `Post-verification uploader recovery attempt ${recoveryAttempt}/2 | current URL: ${page.url()}`,
+    });
+
+    while (Date.now() < deadline) {
+      if (await isUploaderVisible(page)) {
+        onPhase?.({
+          phase: 'uploader_visible',
+          detail: `Uploader UI detected after verification redirect (URL: ${page.url()})`,
+        });
+        return;
+      }
+
+      // WeTransfer often redirects verified accounts to the homepage first.
+      // Let the SPA finish rendering before forcing a navigation.
+      await page.waitForTimeout(2000);
+    }
+
+    if (recoveryAttempt === 1) {
+      onPhase?.({
+        phase: 'loading_wetransfer',
+        detail:
+          `Uploader did not appear after redirect. Reloading WeTransfer homepage and retrying uploader detection: ${rootUrl}`,
+      });
+
+      await page.goto(rootUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60000,
+      });
+
+      await page.waitForTimeout(3000);
+      await dismissConsentAndPopups(page).catch(() => undefined);
+    }
+  }
+
+  throw new Error(
+    `Uploader UI did not appear after verification redirect recovery ` +
+      `(current URL: ${page.url()})`
+  );
+}
+
 async function confirmSend(page: Page): Promise<{ transferUrl?: string }> {
   const successTextChecks = [
     'Transfer sent',
@@ -1062,111 +1137,185 @@ export async function createWeTransferTransfer(
 
     const page = await createFreshWeTransferPage(browser);
 
-    // Perform signup + verification flow before touching the uploader
+    // Perform signup + verification flow before touching the uploader.
     await performSignupAndVerification(page, senderEmail, options, onPhase);
+
+    // WeTransfer may redirect a newly verified account to https://wetransfer.com/
+    // before the uploader is mounted. Recover there and wait for the uploader.
+    await ensureUploaderReadyAfterRedirect(page, onPhase);
 
     onPhase?.({ phase: 'preparing_attachment', detail: `Using file ${path.basename(attachmentPath)}` });
     onPhase?.({ phase: 'upload_started', detail: `Uploading "${filename}" (${fileBuffer.length} bytes)` });
 
     const uploadStrategyLog: string[] = [];
-    try {
-      await uploadAttachment(page, attachmentPath, (msg) => {
-        uploadStrategyLog.push(msg);
-        onPhase?.({ phase: 'upload_started', detail: msg });
-      });
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      const currentUrl = page.url();
-      throw new Error(
-        `${message} (last successful stage: uploader_visible, current URL: ${currentUrl})`
-      );
-    }
-    onPhase?.({
-      phase: 'upload_started',
-      detail: `File selected. Waiting for WeTransfer to finish uploading "${filename}" before sending.`,
-    });
+    let confirmation: { transferUrl?: string } | null = null;
+    let transferAttemptError = '';
 
-    await waitForWeTransferUploadReady(page, filename, (msg) => {
-      onPhase?.({ phase: 'upload_started', detail: msg });
-    });
+    for (let transferAttempt = 1; transferAttempt <= 2 && !confirmation; transferAttempt += 1) {
+      try {
+        onPhase?.({
+          phase: 'upload_started',
+          detail: `Transfer attempt ${transferAttempt}/2 | preparing uploader at ${page.url()}`,
+        });
 
-    onPhase?.({
-      phase: 'upload_completed',
-      detail: `Upload fully ready for "${filename}"${uploadStrategyLog.length ? ` [${uploadStrategyLog.join(', ')}]` : ''}`,
-    });
+        await ensureUploaderReadyAfterRedirect(page, onPhase);
 
-    // Use WeTransfer's exact recipient input.
-    const recipientInput = page
-      .locator('input#autosuggest[name="autosuggest"]')
-      .first();
+        onPhase?.({
+          phase: 'upload_started',
+          detail: `Transfer attempt ${transferAttempt}/2 | attaching "${filename}"`,
+        });
 
-    await recipientInput.waitFor({
-      state: 'visible',
-      timeout: 60000,
-    });
+        await uploadAttachment(page, attachmentPath, (msg) => {
+          uploadStrategyLog.push(`attempt ${transferAttempt}: ${msg}`);
+          onPhase?.({ phase: 'upload_started', detail: msg });
+        });
 
-    await recipientInput.click({ timeout: 60000 });
-    await recipientInput.fill('');
-    await recipientInput.fill(normalizedRecipient);
+        onPhase?.({
+          phase: 'upload_started',
+          detail: `File selected. Waiting for WeTransfer to finish uploading "${filename}" before sending.`,
+        });
 
-    const recipientActual = await recipientInput.inputValue();
+        await waitForWeTransferUploadReady(page, filename, (msg) => {
+          onPhase?.({ phase: 'upload_started', detail: msg });
+        });
 
-    onPhase?.({
-      phase: 'send_submitted',
-      detail: `recipient field detection: input#autosuggest | expected=${normalizedRecipient} | actual=${recipientActual}`,
-    });
+        onPhase?.({
+          phase: 'upload_completed',
+          detail: `Upload fully ready for "${filename}" [transfer attempt ${transferAttempt}/2]`,
+        });
 
-    if (recipientActual !== normalizedRecipient) {
-      throw new Error(
-        `Recipient email field mismatch: expected ${normalizedRecipient}, got ${recipientActual}`
-      );
-    }
+        // If WeTransfer bounced us back to the root page after the upload step,
+        // do not continue with recipient entry on this attempt. Re-open the
+        // uploader and repeat upload + recipient + Transfer from the beginning.
+        if (isWeTransferRootRedirect(page.url())) {
+          throw new Error(
+            `WeTransfer redirected to homepage after upload attempt ${transferAttempt}`
+          );
+        }
 
-    // Commit the autosuggest recipient.
-    await recipientInput.press('Enter');
-    await page.waitForTimeout(1500);
+        const recipientInput = page
+          .locator('input#autosuggest[name="autosuggest"]')
+          .first();
 
-    if (message?.trim()) {
-      const messageField = page
-        .locator('textarea[name*="message" i], textarea[placeholder*="message" i], textarea')
-        .first();
-      if (await messageField.isVisible().catch(() => false)) {
-        await messageField.fill(message.trim());
+        await recipientInput.waitFor({
+          state: 'visible',
+          timeout: 60000,
+        });
+
+        await recipientInput.click({ timeout: 60000 });
+        await recipientInput.fill('');
+        await recipientInput.fill(normalizedRecipient);
+
+        const recipientActual = await recipientInput.inputValue();
+
+        onPhase?.({
+          phase: 'send_submitted',
+          detail: `recipient field detection: input#autosuggest | expected=${normalizedRecipient} | actual=${recipientActual}`,
+        });
+
+        if (recipientActual !== normalizedRecipient) {
+          throw new Error(
+            `Recipient email field mismatch: expected ${normalizedRecipient}, got ${recipientActual}`
+          );
+        }
+
+        await recipientInput.press('Enter');
+        await page.waitForTimeout(1500);
+
+        // WeTransfer can redirect after the recipient is committed as well.
+        if (isWeTransferRootRedirect(page.url())) {
+          throw new Error(
+            `WeTransfer redirected to homepage after recipient entry on attempt ${transferAttempt}`
+          );
+        }
+
+        if (message?.trim()) {
+          const messageField = page
+            .locator('textarea[name*="message" i], textarea[placeholder*="message" i], textarea')
+            .first();
+
+          if (await messageField.isVisible().catch(() => false)) {
+            await messageField.fill(message.trim());
+          }
+        }
+
+        const transferByTestId = page
+          .locator('button[data-testid="uploaderForm-transfer-button"]')
+          .first();
+
+        await transferByTestId.waitFor({
+          state: 'visible',
+          timeout: 60000,
+        });
+
+        const transferEnabled = await transferByTestId
+          .isEnabled()
+          .catch(() => false);
+
+        onPhase?.({
+          phase: 'send_submitted',
+          detail: `transfer button detection: button[data-testid="uploaderForm-transfer-button"] | enabled=${transferEnabled}`,
+        });
+
+        if (!transferEnabled) {
+          throw new Error(
+            'WeTransfer Transfer button is visible but disabled after recipient entry'
+          );
+        }
+
+        await transferByTestId.click({ timeout: 60000 });
+
+        onPhase?.({
+          phase: 'send_submitted',
+          detail: `Transfer submission clicked for ${normalizedRecipient} [attempt ${transferAttempt}/2]`,
+        });
+
+        // If the click or UI transition sends us back to the homepage instead
+        // of confirming the transfer, retry the whole upload/send flow once.
+        await page.waitForTimeout(3000);
+
+        if (isWeTransferRootRedirect(page.url())) {
+          throw new Error(
+            `WeTransfer redirected to homepage after Transfer click on attempt ${transferAttempt}`
+          );
+        }
+
+        confirmation = await confirmSend(page);
+      } catch (error: unknown) {
+        transferAttemptError =
+          error instanceof Error ? error.message : String(error);
+
+        onPhase?.({
+          phase: 'send_submitted',
+          detail: `Transfer attempt ${transferAttempt}/2 failed: ${transferAttemptError}`,
+        });
+
+        if (transferAttempt < 2) {
+          const rootUrl = `${WETRANSFER_URL.replace(/\/$/, '')}/`;
+
+          onPhase?.({
+            phase: 'loading_wetransfer',
+            detail:
+              `Retrying complete upload/send flow after redirect/failure. Reloading ${rootUrl}`,
+          });
+
+          await page.goto(rootUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000,
+          });
+
+          await page.waitForTimeout(3000);
+          await dismissConsentAndPopups(page).catch(() => undefined);
+          await ensureUploaderReadyAfterRedirect(page, onPhase);
+        }
       }
     }
 
-    // Click WeTransfer's exact Transfer button.
-    const transferByTestId = page
-      .locator('button[data-testid="uploaderForm-transfer-button"]')
-      .first();
-
-    await transferByTestId.waitFor({
-      state: 'visible',
-      timeout: 60000,
-    });
-
-    const transferEnabled = await transferByTestId
-      .isEnabled()
-      .catch(() => false);
-
-    onPhase?.({
-      phase: 'send_submitted',
-      detail: `transfer button detection: button[data-testid="uploaderForm-transfer-button"] | enabled=${transferEnabled}`,
-    });
-
-    if (!transferEnabled) {
+    if (!confirmation) {
       throw new Error(
-        'WeTransfer Transfer button is visible but disabled after recipient entry'
+        `Transfer failed after retry: ${transferAttemptError || 'unknown error'}`
       );
     }
-
-    await transferByTestId.click({ timeout: 60000 });
-    const sendClicked = true;
-
-    onPhase?.({ phase: 'send_submitted', detail: `Transfer submission clicked for ${normalizedRecipient}` });
-
-    const confirmation = await confirmSend(page);
-
     onPhase?.({ phase: 'send_confirmed', detail: `Transfer confirmed for ${normalizedRecipient}` });
 
     return {
