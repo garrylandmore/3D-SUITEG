@@ -363,6 +363,121 @@ async function uploadAttachment(
   );
 }
 
+
+async function waitForWeTransferUploadReady(
+  page: Page,
+  filename: string,
+  onLog?: (msg: string) => void
+): Promise<void> {
+  const timeoutMs = Number(
+    process.env.WETRANSFER_UPLOAD_WAIT_MS || 180000
+  );
+  const minimumWaitMs = Number(
+    process.env.WETRANSFER_UPLOAD_MIN_WAIT_MS || 5000
+  );
+
+  const startedAt = Date.now();
+  let attempt = 0;
+  let stableReadyChecks = 0;
+  let sawProgressState = false;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    attempt += 1;
+
+    // Confirm that the browser file input actually contains the expected file.
+    const inputHasExpectedFile = await page
+      .locator('input[type="file"]')
+      .evaluateAll((inputs, expectedName) => {
+        return inputs.some((input) => {
+          const files = (input as HTMLInputElement).files;
+          return Boolean(
+            files &&
+            Array.from(files).some((file) => file.name === expectedName)
+          );
+        });
+      }, filename)
+      .catch(() => false);
+
+    // Confirm that WeTransfer's visible UI has registered the filename.
+    const filenameVisible = await page
+      .getByText(filename, { exact: false })
+      .first()
+      .isVisible()
+      .catch(() => false);
+
+    // Look for common upload/progress indicators.
+    const progressIndicatorVisible =
+      (await page
+        .locator(
+          [
+            '[role="progressbar"]',
+            'progress',
+            '[aria-busy="true"]',
+            '[data-testid*="progress" i]',
+            '[data-testid*="upload-progress" i]',
+            '[class*="progress" i]',
+          ].join(', ')
+        )
+        .count()
+        .catch(() => 0)) > 0;
+
+    const uploadingTextVisible = await page
+      .getByText(
+        /uploading|upload in progress|preparing files|processing files|calculating|almost there/i
+      )
+      .first()
+      .isVisible()
+      .catch(() => false);
+
+    if (progressIndicatorVisible || uploadingTextVisible) {
+      sawProgressState = true;
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+
+    // Transfer button is intentionally NOT used as the primary readiness signal:
+    // WeTransfer may enable it before a file has finished uploading.
+    const ready =
+      elapsedMs >= minimumWaitMs &&
+      inputHasExpectedFile &&
+      filenameVisible &&
+      !progressIndicatorVisible &&
+      !uploadingTextVisible;
+
+    onLog?.(
+      `upload wait | attempt=${attempt} | elapsed=${Math.round(elapsedMs / 1000)}s | inputHasFile=${inputHasExpectedFile} | filenameVisible=${filenameVisible} | progressVisible=${progressIndicatorVisible} | uploadingTextVisible=${uploadingTextVisible} | sawProgress=${sawProgressState}`
+    );
+
+    if (ready) {
+      stableReadyChecks += 1;
+
+      // Require the ready state to remain unchanged for 3 consecutive checks.
+      if (stableReadyChecks >= 3) {
+        // Give background XHR/fetch uploads one final chance to settle.
+        try {
+          await page.waitForLoadState('networkidle', { timeout: 10000 });
+        } catch {
+          // Some WeTransfer pages keep background connections open.
+        }
+
+        onLog?.(
+          `upload ready | filename="${filename}" is present in the file input and visible in WeTransfer UI with no active upload indicators`
+        );
+        return;
+      }
+    } else {
+      stableReadyChecks = 0;
+    }
+
+    await page.waitForTimeout(2000);
+  }
+
+  throw new Error(
+    `Timed out after ${Math.round(timeoutMs / 1000)} seconds waiting for WeTransfer to finish uploading "${filename}"`
+  );
+}
+
+
 /**
  * Fill an email field on the WeTransfer page.
  *
@@ -966,10 +1081,18 @@ export async function createWeTransferTransfer(
         `${message} (last successful stage: uploader_visible, current URL: ${currentUrl})`
       );
     }
-    await page.waitForTimeout(1000);
+    onPhase?.({
+      phase: 'upload_started',
+      detail: `File selected. Waiting for WeTransfer to finish uploading "${filename}" before sending.`,
+    });
+
+    await waitForWeTransferUploadReady(page, filename, (msg) => {
+      onPhase?.({ phase: 'upload_started', detail: msg });
+    });
+
     onPhase?.({
       phase: 'upload_completed',
-      detail: `Upload completed for "${filename}"${uploadStrategyLog.length ? ` [${uploadStrategyLog.join(', ')}]` : ''}`,
+      detail: `Upload fully ready for "${filename}"${uploadStrategyLog.length ? ` [${uploadStrategyLog.join(', ')}]` : ''}`,
     });
 
     const recipientFilled = await fillEmailField(page, normalizedRecipient, 'recipient', (msg) => {
@@ -991,8 +1114,14 @@ export async function createWeTransferTransfer(
     // Transfer button: prefer the stable data-testid attribute, fall back to text-based search
     let sendClicked = false;
     const transferByTestId = page.locator('[data-testid="uploaderForm-transfer-button"]');
-    if (await transferByTestId.isVisible().catch(() => false)) {
-      onPhase?.({ phase: 'send_submitted', detail: 'transfer button detection: data-testid="uploaderForm-transfer-button"' });
+    if (
+      (await transferByTestId.isVisible().catch(() => false)) &&
+      (await transferByTestId.isEnabled().catch(() => false))
+    ) {
+      onPhase?.({
+        phase: 'send_submitted',
+        detail: 'transfer button detection: data-testid="uploaderForm-transfer-button" | enabled=true',
+      });
       await transferByTestId.click({ timeout: 60000 });
       sendClicked = true;
     } else {
