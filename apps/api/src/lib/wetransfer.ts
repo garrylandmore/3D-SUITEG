@@ -1095,12 +1095,36 @@ export async function createWeTransferTransfer(
       detail: `Upload fully ready for "${filename}"${uploadStrategyLog.length ? ` [${uploadStrategyLog.join(', ')}]` : ''}`,
     });
 
-    const recipientFilled = await fillEmailField(page, normalizedRecipient, 'recipient', (msg) => {
-      onPhase?.({ phase: 'send_submitted', detail: msg });
+    // Use WeTransfer's exact recipient input.
+    const recipientInput = page
+      .locator('input#autosuggest[name="autosuggest"]')
+      .first();
+
+    await recipientInput.waitFor({
+      state: 'visible',
+      timeout: 60000,
     });
-    if (!recipientFilled) {
-      throw new Error('Could not locate recipient email field in WeTransfer browser flow.');
+
+    await recipientInput.click({ timeout: 60000 });
+    await recipientInput.fill('');
+    await recipientInput.fill(normalizedRecipient);
+
+    const recipientActual = await recipientInput.inputValue();
+
+    onPhase?.({
+      phase: 'send_submitted',
+      detail: `recipient field detection: input#autosuggest | expected=${normalizedRecipient} | actual=${recipientActual}`,
+    });
+
+    if (recipientActual !== normalizedRecipient) {
+      throw new Error(
+        `Recipient email field mismatch: expected ${normalizedRecipient}, got ${recipientActual}`
+      );
     }
+
+    // Commit the autosuggest recipient.
+    await recipientInput.press('Enter');
+    await page.waitForTimeout(1500);
 
     if (message?.trim()) {
       const messageField = page
@@ -1111,28 +1135,33 @@ export async function createWeTransferTransfer(
       }
     }
 
-    // Transfer button: prefer the stable data-testid attribute, fall back to text-based search
-    let sendClicked = false;
-    const transferByTestId = page.locator('[data-testid="uploaderForm-transfer-button"]');
-    if (
-      (await transferByTestId.isVisible().catch(() => false)) &&
-      (await transferByTestId.isEnabled().catch(() => false))
-    ) {
-      onPhase?.({
-        phase: 'send_submitted',
-        detail: 'transfer button detection: data-testid="uploaderForm-transfer-button" | enabled=true',
-      });
-      await transferByTestId.click({ timeout: 60000 });
-      sendClicked = true;
-    } else {
-      sendClicked = await clickFirstVisibleByText(page, SEND_BUTTON_HINTS);
-      if (sendClicked) {
-        onPhase?.({ phase: 'send_submitted', detail: 'transfer button detection: text-based selector (Transfer/Send/etc.)' });
-      }
+    // Click WeTransfer's exact Transfer button.
+    const transferByTestId = page
+      .locator('button[data-testid="uploaderForm-transfer-button"]')
+      .first();
+
+    await transferByTestId.waitFor({
+      state: 'visible',
+      timeout: 60000,
+    });
+
+    const transferEnabled = await transferByTestId
+      .isEnabled()
+      .catch(() => false);
+
+    onPhase?.({
+      phase: 'send_submitted',
+      detail: `transfer button detection: button[data-testid="uploaderForm-transfer-button"] | enabled=${transferEnabled}`,
+    });
+
+    if (!transferEnabled) {
+      throw new Error(
+        'WeTransfer Transfer button is visible but disabled after recipient entry'
+      );
     }
-    if (!sendClicked) {
-      throw new Error('Could not find send/transfer submit button in WeTransfer browser flow.');
-    }
+
+    await transferByTestId.click({ timeout: 60000 });
+    const sendClicked = true;
 
     onPhase?.({ phase: 'send_submitted', detail: `Transfer submission clicked for ${normalizedRecipient}` });
 
