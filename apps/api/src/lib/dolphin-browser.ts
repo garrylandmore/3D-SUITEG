@@ -24,21 +24,42 @@ function getProfileId(): number {
 }
 
 function extractEndpoint(payload: any): string | null {
-  const candidates = [
+  const port =
+    payload?.automation?.port ??
+    payload?.automationPort ??
+    payload?.port;
+
+  const rawCandidates = [
     payload?.automation?.wsEndpoint,
     payload?.automation?.ws_endpoint,
     payload?.automation?.endpoint,
     payload?.wsEndpoint,
     payload?.ws_endpoint,
     payload?.endpoint,
-  ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
 
-  if (candidates.length > 0) return candidates[0];
+  for (const raw of rawCandidates) {
+    const value = raw.trim();
 
-  const port =
-    payload?.automation?.port ??
-    payload?.automationPort ??
-    payload?.port;
+    if (
+      value.startsWith('ws://') ||
+      value.startsWith('wss://') ||
+      value.startsWith('http://') ||
+      value.startsWith('https://')
+    ) {
+      return value;
+    }
+
+    if (value.startsWith('/devtools/')) {
+      if (typeof port === 'number' || (typeof port === 'string' && port.trim())) {
+        return `ws://127.0.0.1:${port}${value}`;
+      }
+    }
+
+    if (/^\d+$/.test(value)) {
+      return `http://127.0.0.1:${value}`;
+    }
+  }
 
   if (typeof port === 'number' || (typeof port === 'string' && port.trim())) {
     return `http://127.0.0.1:${port}`;
@@ -77,6 +98,10 @@ export async function launchDolphinBrowser(): Promise<DolphinLaunchResult> {
       `Dolphin profile start failed: HTTP ${response.status} ${raw || response.statusText}`
     );
   }
+
+  console.log(
+    `DOLPHIN | raw automation response=${JSON.stringify(payload?.automation ?? payload)}`
+  );
 
   const endpoint = extractEndpoint(payload);
   if (!endpoint) {
