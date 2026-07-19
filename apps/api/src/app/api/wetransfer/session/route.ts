@@ -27,10 +27,10 @@ type WeTransferSessionResponse = {
  *
  * Initialise a WeTransfer engine session for a campaign.
  *
- * REAL: Creates a temp-mail.io mailbox and verifies WeTransfer browser automation
+ * REAL: Creates a Mail.tm mailbox and verifies WeTransfer browser automation
  * can open the live website.
  *
- * Body: { campaignId: string; tempMailApiKey: string; filename?: string }
+ * Body: { campaignId: string; filename?: string }
  */
 export async function POST(request: NextRequest) {
   let body: Record<string, unknown>;
@@ -41,15 +41,6 @@ export async function POST(request: NextRequest) {
   }
 
   const campaignId = body.campaignId ? String(body.campaignId).trim() : '';
-  const tempMailApiKey = body.tempMailApiKey ? String(body.tempMailApiKey).trim() : '';
-
-  if (!tempMailApiKey) {
-    return NextResponse.json(
-      { error: 'tempMailApiKey is required to create a temp-mail.io mailbox' },
-      { status: 400 }
-    );
-  }
-
   if (!campaignId) {
     return NextResponse.json({ error: 'campaignId is required' }, { status: 400 });
   }
@@ -69,7 +60,7 @@ export async function POST(request: NextRequest) {
   try {
     const session = await initWeTransferSession(
       campaignId,
-      tempMailApiKey,
+      undefined,
       (step, logLine) => {
         steps.push({ ...step });
         logs.push(logLine);
