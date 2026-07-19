@@ -1,10 +1,10 @@
 import {
-  createTempMailboxIO,
-  getMailboxMessage,
-  listMailboxMessages,
-  TempMailIOMailbox,
-  TempMailIOMessage,
-} from './temp-mail-io';
+  createMailTmMailbox,
+  getMailTmMessage,
+  listMailTmMessages,
+  MailTmMailbox,
+  MailTmMessage,
+} from './mail-tm';
 import {
   createWeTransferTransfer,
   probeWeTransferWebsite,
@@ -41,7 +41,7 @@ export type WeTransferExecutionStep = {
 export type WeTransferSession = {
   id: string;
   campaignId: string;
-  tempMailbox: TempMailIOMailbox | null;
+  tempMailbox: MailTmMailbox | null;
   mailboxMessageCount: number | null;
   latestError: string | null;
   steps: WeTransferExecutionStep[];
@@ -69,7 +69,7 @@ export type WeTransferSendResult = {
 const SETUP_STEP_DEFS: Array<{ id: string; label: string }> = [
   {
     id: 'create_mailbox',
-    label: 'Create temp mailbox (temp-mail.io)',
+    label: 'Create temp mailbox (Mail.tm)',
   },
   {
     id: 'open_wetransfer',
@@ -135,7 +135,7 @@ function extractVerificationCode(messageText: string): string | null {
   return standaloneCode?.[1]?.toUpperCase() ?? null;
 }
 
-function messageMayBeWeTransferVerification(message: TempMailIOMessage): boolean {
+function messageMayBeWeTransferVerification(message: MailTmMessage): boolean {
   const subject = (message.subject || '').toLowerCase();
   const from = (message.from || '').toLowerCase();
   const body = `${message.body_text || ''}\n${message.body_html || ''}`.toLowerCase();
@@ -149,35 +149,26 @@ function messageMayBeWeTransferVerification(message: TempMailIOMessage): boolean
 }
 
 async function enrichMessageIfNeeded(
-  message: TempMailIOMessage,
-  tempMailApiKey: string
-): Promise<TempMailIOMessage> {
+  mailbox: MailTmMailbox,
+  message: MailTmMessage
+): Promise<MailTmMessage> {
   if ((message.body_text || message.body_html || '').trim()) {
     return message;
   }
 
   try {
-    const { message: detailedMessage } = await getMailboxMessage(message.id, tempMailApiKey);
-    return {
-      ...message,
-      body_text: detailedMessage.body_text || message.body_text,
-      body_html: detailedMessage.body_html || message.body_html,
-      subject: detailedMessage.subject || message.subject,
-      from: detailedMessage.from || message.from,
-    };
+    return await getMailTmMessage(mailbox, message.id);
   } catch {
     return message;
   }
 }
 
 async function pollForVerificationEmail(
-  mailboxEmail: string,
-  tempMailApiKey: string,
+  mailbox: MailTmMailbox,
   onProgress: (
     attempt: number,
     messageCount: number,
     delayMs: number,
-    rateLimit?: { limit?: string; remaining?: string; reset?: string }
   ) => void
 ): Promise<{
   found: boolean;
@@ -196,24 +187,16 @@ async function pollForVerificationEmail(
   let attempt = 0;
   while (maxAttempts <= 0 || attempt < maxAttempts) {
     attempt += 1;
-    const { messages, rateLimit } = await listMailboxMessages(mailboxEmail, tempMailApiKey);
+    const messages = await listMailTmMessages(mailbox);
     latestCount = messages.length;
-    onProgress(attempt, latestCount, delayMs, rateLimit);
-
-    // Stop before burning the final API requests. A fresh request can be retried after reset.
-    const remaining = Number.parseInt(rateLimit.remaining || '', 10);
-    if (Number.isFinite(remaining) && remaining <= 1) {
-      throw new Error(
-        `temp-mail.io rate limit nearly exhausted (remaining=${rateLimit.remaining}, reset=${rateLimit.reset || 'unknown'})`
-      );
-    }
+    onProgress(attempt, latestCount, delayMs);
 
     const candidates = messages
       .filter(messageMayBeWeTransferVerification)
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
     for (const candidate of candidates) {
-      const detailed = await enrichMessageIfNeeded(candidate, tempMailApiKey);
+      const detailed = await enrichMessageIfNeeded(mailbox, candidate);
       const content = `${detailed.body_text || ''}\n${detailed.body_html || ''}`;
       const verificationLink = extractFirstLink(content) || undefined;
       const verificationCode = extractVerificationCode(content) || undefined;
@@ -236,7 +219,7 @@ async function pollForVerificationEmail(
 
 export async function initWeTransferSession(
   campaignId: string,
-  tempMailApiKey: string,
+  _tempMailApiKey?: string,
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void,
   proxyConfig?: BrowserProxyConfig | null
 ): Promise<WeTransferSession> {
@@ -266,14 +249,10 @@ export async function initWeTransferSession(
 
   stepUpdate('create_mailbox', 'running');
   try {
-    const { mailbox, rateLimit } = await createTempMailboxIO(tempMailApiKey);
+    const mailbox = await createMailTmMailbox();
     session.tempMailbox = mailbox;
     session.latestError = null;
-    stepUpdate(
-      'create_mailbox',
-      'success',
-      `Mailbox: ${mailbox.email} | rate-limit remaining: ${rateLimit.remaining ?? 'unknown'}`
-    );
+    stepUpdate('create_mailbox', 'success', `Mailbox: ${mailbox.email} | provider=mail.tm`);
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
     stepUpdate('create_mailbox', 'failed', msg);
@@ -306,7 +285,7 @@ export async function initWeTransferSession(
 
   stepUpdate('open_wetransfer', 'success', 'WeTransfer login page reached successfully. Signup/verification will happen at send time.');
 
-  stepUpdate('create_account', 'success', 'Browser transport mode is active. Sender email will use temp mailbox.');
+  stepUpdate('create_account', 'success', 'Browser transport mode is active. Sender email will use Mail.tm mailbox.');
   stepUpdate('verify_email', 'success', 'Verification mailbox is ready and will be polled during signup flow.');
 
   session.status = 'ready';
@@ -324,7 +303,6 @@ export async function sendLeadViaWeTransfer(
     ctaLink?: string;
     fileBuffer?: Buffer;
     attachmentPath?: string;
-    tempMailApiKey?: string;
     proxyConfig?: BrowserProxyConfig | null;
   },
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void
@@ -399,7 +377,6 @@ export async function sendLeadViaWeTransfer(
   stepUpdate('send_to_lead', 'running', `Preparing browser send for ${leadEmail}`);
 
   let transferUrl: string | undefined;
-  const tempMailApiKey = options.tempMailApiKey;
   const mailboxEmail = session.tempMailbox.email;
 
   const result = await createWeTransferTransfer(
@@ -452,8 +429,7 @@ export async function sendLeadViaWeTransfer(
       senderEmail: mailboxEmail,
       proxyConfig: options.proxyConfig,
       onVerificationRequired:
-        tempMailApiKey
-          ? async () => {
+          async () => {
               console.log(`OTP POLLING CALLBACK ENTERED | mailbox=${mailboxEmail}`);
               stepUpdate(
                 'verify_email',
@@ -462,14 +438,10 @@ export async function sendLeadViaWeTransfer(
               );
 
               const verificationResult = await pollForVerificationEmail(
-                mailboxEmail,
-                tempMailApiKey,
-                (attempt, messageCount, delayMs, rateLimit) => {
+                session.tempMailbox!,
+                (attempt, messageCount, delayMs) => {
                   session.mailboxMessageCount = messageCount;
-                  const quota = rateLimit?.remaining
-                    ? ` | API remaining ${rateLimit.remaining}${rateLimit.limit ? `/${rateLimit.limit}` : ''}`
-                    : '';
-                  const pollLine = `polling_for_code | attempt ${attempt} | mailbox=${mailboxEmail} | ${messageCount} message(s)${quota} | checking again in ${Math.round(delayMs / 1000)}s`;
+                  const pollLine = `polling_for_code | provider=mail.tm | attempt ${attempt} | mailbox=${mailboxEmail} | ${messageCount} message(s) | checking again in ${Math.round(delayMs / 1000)}s`;
                   console.log(pollLine);
                   stepUpdate(
                     'verify_email',
@@ -493,8 +465,7 @@ export async function sendLeadViaWeTransfer(
                 mailboxMessageCount: verificationResult.messageCount,
                 detail: `verification_received | ${verificationResult.subject || 'WeTransfer verification message detected'}`,
               };
-            }
-          : undefined,
+            },
     }
   );
 
