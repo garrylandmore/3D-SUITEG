@@ -986,6 +986,64 @@ function isWeTransferRootRedirect(url: string): boolean {
   }
 }
 
+
+async function waitForWeTransferAuthCallbackToFinish(
+  page: Page,
+  onPhase?: (update: WeTransferSendPhaseUpdate) => void
+): Promise<void> {
+  const timeoutMs = Number(
+    process.env.WETRANSFER_AUTH_CALLBACK_WAIT_MS || 180000
+  );
+  const startedAt = Date.now();
+
+  onPhase?.({
+    phase: 'verification_submitted',
+    detail: `Waiting for WeTransfer account callback redirect to finish (current URL: ${page.url()})`,
+  });
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const currentUrl = page.url();
+
+    let isCallback = false;
+    try {
+      const parsed = new URL(currentUrl);
+      isCallback =
+        parsed.hostname.replace(/^www\./, '') === 'wetransfer.com' &&
+        parsed.pathname.startsWith('/account/callback');
+    } catch {
+      isCallback = currentUrl.includes('/account/callback');
+    }
+
+    if (!isCallback) {
+      onPhase?.({
+        phase: 'verification_submitted',
+        detail: `WeTransfer account callback finished (current URL: ${currentUrl})`,
+      });
+
+      // Give the destination page a moment to mount the authenticated app.
+      try {
+        await page.waitForLoadState('domcontentloaded', { timeout: 60000 });
+      } catch {
+        // SPA transition may not trigger a full document navigation.
+      }
+
+      await page.waitForTimeout(3000);
+      return;
+    }
+
+    onPhase?.({
+      phase: 'verification_submitted',
+      detail: `Still on temporary WeTransfer callback URL; waiting before upload (current URL: ${currentUrl})`,
+    });
+
+    await page.waitForTimeout(2000);
+  }
+
+  throw new Error(
+    `Timed out waiting for WeTransfer account callback redirect to finish (current URL: ${page.url()})`
+  );
+}
+
 async function ensureUploaderReadyAfterRedirect(
   page: Page,
   onPhase?: (update: WeTransferSendPhaseUpdate) => void
@@ -1006,12 +1064,22 @@ async function ensureUploaderReadyAfterRedirect(
     });
 
     while (Date.now() < deadline) {
-      if (await isUploaderVisible(page)) {
+      const currentUrl = page.url();
+      const onCallbackUrl = currentUrl.includes('/account/callback');
+
+      if (!onCallbackUrl && (await isUploaderVisible(page))) {
         onPhase?.({
           phase: 'uploader_visible',
-          detail: `Uploader UI detected after verification redirect (URL: ${page.url()})`,
+          detail: `Uploader UI detected after authentication redirect completed (URL: ${currentUrl})`,
         });
         return;
+      }
+
+      if (onCallbackUrl) {
+        onPhase?.({
+          phase: 'verification_submitted',
+          detail: `Uploader check paused because browser is still on temporary callback URL: ${currentUrl}`,
+        });
       }
 
       // WeTransfer often redirects verified accounts to the homepage first.
@@ -1140,8 +1208,13 @@ export async function createWeTransferTransfer(
     // Perform signup + verification flow before touching the uploader.
     await performSignupAndVerification(page, senderEmail, options, onPhase);
 
-    // WeTransfer may redirect a newly verified account to https://wetransfer.com/
-    // before the uploader is mounted. Recover there and wait for the uploader.
+    // IMPORTANT: OTP verification may first land on a temporary OAuth callback:
+    // https://wetransfer.com/account/callback?...code=...&state=...
+    // Never upload on that transient page. Wait until WeTransfer finishes the
+    // authentication redirect and lands on the authenticated application first.
+    await waitForWeTransferAuthCallbackToFinish(page, onPhase);
+
+    // Now wait for the authenticated homepage/uploader to mount.
     await ensureUploaderReadyAfterRedirect(page, onPhase);
 
     onPhase?.({ phase: 'preparing_attachment', detail: `Using file ${path.basename(attachmentPath)}` });
@@ -1158,6 +1231,7 @@ export async function createWeTransferTransfer(
           detail: `Transfer attempt ${transferAttempt}/2 | preparing uploader at ${page.url()}`,
         });
 
+        await waitForWeTransferAuthCallbackToFinish(page, onPhase);
         await ensureUploaderReadyAfterRedirect(page, onPhase);
 
         onPhase?.({
