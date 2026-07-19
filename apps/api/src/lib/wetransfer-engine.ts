@@ -167,7 +167,7 @@ async function enrichMessageIfNeeded(
 async function pollForVerificationEmail(
   mailboxEmail: string,
   tempMailApiKey: string,
-  onProgress: (messageCount: number) => void
+  onProgress: (attempt: number, messageCount: number, delayMs: number) => void
 ): Promise<{
   found: boolean;
   messageCount: number;
@@ -175,14 +175,19 @@ async function pollForVerificationEmail(
   verificationLink?: string;
   verificationCode?: string;
 }> {
-  const maxAttempts = Number.parseInt(process.env.WETRANSFER_VERIFICATION_POLL_ATTEMPTS || '60', 10);
+  // Default: poll every 5 seconds until the OTP is found.
+  // Set WETRANSFER_VERIFICATION_POLL_ATTEMPTS to a positive number to impose a limit;
+  // leave it unset or set it to 0 for unlimited polling.
+  const maxAttempts = Number.parseInt(process.env.WETRANSFER_VERIFICATION_POLL_ATTEMPTS || '0', 10);
   const delayMs = Number.parseInt(process.env.WETRANSFER_VERIFICATION_POLL_DELAY_MS || '5000', 10);
 
   let latestCount = 0;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  let attempt = 0;
+  while (maxAttempts <= 0 || attempt < maxAttempts) {
+    attempt += 1;
     const { messages } = await listMailboxMessages(mailboxEmail, tempMailApiKey);
     latestCount = messages.length;
-    onProgress(latestCount);
+    onProgress(attempt, latestCount, delayMs);
 
     const candidates = messages
       .filter(messageMayBeWeTransferVerification)
@@ -204,9 +209,7 @@ async function pollForVerificationEmail(
       }
     }
 
-    if (attempt < maxAttempts) {
-      await pause(delayMs);
-    }
+    await pause(delayMs);
   }
 
   return { found: false, messageCount: latestCount };
@@ -435,8 +438,13 @@ export async function sendLeadViaWeTransfer(
               const verificationResult = await pollForVerificationEmail(
                 mailboxEmail,
                 tempMailApiKey,
-                (messageCount) => {
+                (attempt, messageCount, delayMs) => {
                   session.mailboxMessageCount = messageCount;
+                  stepUpdate(
+                    'verify_email',
+                    'waiting_for_verification',
+                    `polling_for_code | attempt ${attempt} | ${messageCount} message(s) in temp mailbox | checking again in ${Math.round(delayMs / 1000)}s`
+                  );
                 }
               );
               session.mailboxMessageCount = verificationResult.messageCount;
