@@ -175,8 +175,8 @@ async function pollForVerificationEmail(
   verificationLink?: string;
   verificationCode?: string;
 }> {
-  const maxAttempts = Number.parseInt(process.env.WETRANSFER_VERIFICATION_POLL_ATTEMPTS || '10', 10);
-  const delayMs = Number.parseInt(process.env.WETRANSFER_VERIFICATION_POLL_DELAY_MS || '6000', 10);
+  const maxAttempts = Number.parseInt(process.env.WETRANSFER_VERIFICATION_POLL_ATTEMPTS || '60', 10);
+  const delayMs = Number.parseInt(process.env.WETRANSFER_VERIFICATION_POLL_DELAY_MS || '5000', 10);
 
   let latestCount = 0;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
