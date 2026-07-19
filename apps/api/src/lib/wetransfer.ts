@@ -848,35 +848,83 @@ async function performSignupAndVerification(
 
   // Step 6 & 7: Fill input#verificationCode and click "Verify"
   if (resolution.verificationCode) {
-    const codeInput = page.locator('input#verificationCode, input[name="verificationCode"]').first();
-    const codeInputFallback = page
-      .locator('input[name*="code" i], input[placeholder*="code" i], input[autocomplete="one-time-code"]')
+    const verificationCode = resolution.verificationCode.trim().toUpperCase();
+
+    console.log(`WETRANSFER OTP SUBMIT | code=${verificationCode}`);
+    onPhase?.({
+      phase: 'verification_received',
+      detail: `OTP received. Filling #verificationCode with ${verificationCode}`,
+    });
+
+    const verificationCodeInput = page
+      .locator('input#verificationCode[name="verificationCode"]')
       .first();
 
-    let activeCodeInput = codeInput;
-    try {
-      await codeInput.waitFor({ state: 'visible', timeout: 60000 });
-    } catch {
-      activeCodeInput = codeInputFallback;
-      await activeCodeInput.waitFor({ state: 'visible', timeout: 60000 });
+    await verificationCodeInput.waitFor({
+      state: 'visible',
+      timeout: 60000,
+    });
+
+    await verificationCodeInput.click({ timeout: 60000 });
+    await verificationCodeInput.fill('');
+    await verificationCodeInput.fill(verificationCode);
+
+    const actualCode = await verificationCodeInput.inputValue();
+
+    console.log(
+      `WETRANSFER OTP INPUT CHECK | expected=${verificationCode} | actual=${actualCode}`
+    );
+
+    if (actualCode !== verificationCode) {
+      throw new Error(
+        `Verification code field mismatch: expected ${verificationCode}, got ${actualCode}`
+      );
     }
 
-    await activeCodeInput.fill('');
-    await activeCodeInput.fill(resolution.verificationCode);
+    const verifyButtonCandidates = [
+      page.getByRole('button', { name: /^verify$/i }).first(),
+      page.locator('button[type="submit"]').filter({ hasText: /verify/i }).first(),
+      page.locator('button:has-text("Verify")').first(),
+    ];
 
-    const verifyBtn = page.getByRole('button', { name: /^verify$/i }).first();
-    try {
-      await verifyBtn.waitFor({ state: 'visible', timeout: 60000 });
-      await verifyBtn.click({ timeout: 60000 });
-    } catch {
-      const clicked = await clickFirstVisibleByText(page, ['Verify', 'Confirm', 'Continue']);
-      if (!clicked) {
-        throw new Error(`Verification code was filled but the Verify button could not be found. Current URL: ${page.url()}`);
+    let verifyClicked = false;
+
+    for (const candidate of verifyButtonCandidates) {
+      try {
+        await candidate.waitFor({ state: 'visible', timeout: 60000 });
+        if (await candidate.isEnabled().catch(() => false)) {
+          await candidate.click({ timeout: 60000 });
+          verifyClicked = true;
+          break;
+        }
+      } catch {
+        // Try next candidate.
       }
     }
-    onPhase?.({ phase: 'verification_submitted', detail: 'Verification code submitted, waiting for session' });
-    await page.waitForTimeout(3000);
-    await waitForStableDom(page);
+
+    if (!verifyClicked) {
+      throw new Error('Could not find or click WeTransfer Verify button');
+    }
+
+    console.log(`WETRANSFER VERIFY CLICKED | currentURL=${page.url()}`);
+    onPhase?.({
+      phase: 'verification_submitted',
+      detail: `Verification code submitted. Waiting for WeTransfer callback redirect. Current URL: ${page.url()}`,
+    });
+
+    // Wait for the auth flow to leave the OTP page or enter callback.
+    try {
+      await page.waitForURL(
+        (url) =>
+          url.pathname.startsWith('/account/callback') ||
+          !url.hostname.includes('auth.wetransfer.com'),
+        { timeout: 120000 }
+      );
+    } catch {
+      // Continue to callback handling below even if this navigation event is missed.
+    }
+
+    console.log(`WETRANSFER POST-VERIFY URL | ${page.url()}`);
   } else if (resolution.verificationLink) {
     // If a magic link was provided instead of a code, navigate directly
     await page.goto(resolution.verificationLink, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -992,10 +1040,11 @@ async function waitForWeTransferAuthCallbackToFinish(
   onPhase?: (update: WeTransferSendPhaseUpdate) => void
 ): Promise<void> {
   const timeoutMs = Number(
-    process.env.WETRANSFER_AUTH_CALLBACK_WAIT_MS || 180000
+    process.env.WETRANSFER_AUTH_CALLBACK_WAIT_MS || 300000
   );
   const startedAt = Date.now();
 
+  console.log(`WETRANSFER CALLBACK WAIT START | ${page.url()}`);
   onPhase?.({
     phase: 'verification_submitted',
     detail: `Waiting for WeTransfer account callback redirect to finish (current URL: ${page.url()})`,
@@ -1015,6 +1064,7 @@ async function waitForWeTransferAuthCallbackToFinish(
     }
 
     if (!isCallback) {
+      console.log(`WETRANSFER CALLBACK FINISHED | ${currentUrl}`);
       onPhase?.({
         phase: 'verification_submitted',
         detail: `WeTransfer account callback finished (current URL: ${currentUrl})`,
@@ -1267,6 +1317,12 @@ export async function createWeTransferTransfer(
           );
         }
 
+        console.log(`RECIPIENT STAGE START | lead=${normalizedRecipient} | url=${page.url()}`);
+        onPhase?.({
+          phase: 'send_submitted',
+          detail: `Recipient stage started for ${normalizedRecipient}. Waiting for input#autosuggest`,
+        });
+
         const recipientInput = page
           .locator('input#autosuggest[name="autosuggest"]')
           .first();
@@ -1293,8 +1349,10 @@ export async function createWeTransferTransfer(
           );
         }
 
+        console.log(`RECIPIENT FILLED | ${recipientActual}`);
         await recipientInput.press('Enter');
-        await page.waitForTimeout(1500);
+        console.log(`RECIPIENT COMMIT ENTER PRESSED | ${normalizedRecipient}`);
+        await page.waitForTimeout(2000);
 
         // WeTransfer can redirect after the recipient is committed as well.
         if (isWeTransferRootRedirect(page.url())) {
@@ -1337,7 +1395,9 @@ export async function createWeTransferTransfer(
           );
         }
 
+        console.log(`TRANSFER CLICK START | recipient=${normalizedRecipient}`);
         await transferByTestId.click({ timeout: 60000 });
+        console.log(`TRANSFER CLICKED | recipient=${normalizedRecipient} | url=${page.url()}`);
 
         onPhase?.({
           phase: 'send_submitted',
