@@ -6,6 +6,10 @@ export type DolphinLaunchResult = {
   endpoint: string;
 };
 
+let cachedBrowser: Browser | null = null;
+let cachedProfileId: number | null = null;
+let cachedEndpoint: string | null = null;
+
 function getLocalApiBase(): string {
   return (process.env.DOLPHIN_LOCAL_API || 'http://localhost:3001').replace(/\/$/, '');
 }
@@ -68,8 +72,47 @@ function extractEndpoint(payload: any): string | null {
   return null;
 }
 
+async function connectToEndpoint(
+  profileId: number,
+  endpoint: string
+): Promise<DolphinLaunchResult> {
+  const browser = await chromium.connectOverCDP(endpoint, { timeout: 60000 });
+
+  cachedBrowser = browser;
+  cachedProfileId = profileId;
+  cachedEndpoint = endpoint;
+
+  browser.on('disconnected', () => {
+    console.log(`DOLPHIN | disconnected from profile ${profileId}`);
+    cachedBrowser = null;
+    cachedProfileId = null;
+    cachedEndpoint = null;
+  });
+
+  console.log(`DOLPHIN | Playwright connected to profile ${profileId}`);
+
+  return { browser, profileId, endpoint };
+}
+
 export async function launchDolphinBrowser(): Promise<DolphinLaunchResult> {
   const profileId = getProfileId();
+
+  if (
+    cachedBrowser &&
+    cachedProfileId === profileId &&
+    cachedBrowser.isConnected()
+  ) {
+    console.log(
+      `DOLPHIN | reusing existing connected profile ${profileId} | endpoint=${cachedEndpoint}`
+    );
+
+    return {
+      browser: cachedBrowser,
+      profileId,
+      endpoint: cachedEndpoint || '',
+    };
+  }
+
   const base = getLocalApiBase();
   const url = `${base}/v1.0/browser_profiles/${profileId}/start`;
 
@@ -93,15 +136,34 @@ export async function launchDolphinBrowser(): Promise<DolphinLaunchResult> {
     payload = { raw };
   }
 
+  console.log(
+    `DOLPHIN | raw automation response=${JSON.stringify(payload?.automation ?? payload)}`
+  );
+
   if (!response.ok) {
+    const alreadyRunning =
+      response.status === 500 &&
+      (
+        raw.includes('E_BROWSER_RUN_DUPLICATE') ||
+        raw.toLowerCase().includes('already running')
+      );
+
+    if (alreadyRunning && cachedBrowser && cachedBrowser.isConnected()) {
+      console.log(
+        `DOLPHIN | profile ${profileId} is already running; reusing cached connection`
+      );
+
+      return {
+        browser: cachedBrowser,
+        profileId,
+        endpoint: cachedEndpoint || '',
+      };
+    }
+
     throw new Error(
       `Dolphin profile start failed: HTTP ${response.status} ${raw || response.statusText}`
     );
   }
-
-  console.log(
-    `DOLPHIN | raw automation response=${JSON.stringify(payload?.automation ?? payload)}`
-  );
 
   const endpoint = extractEndpoint(payload);
   if (!endpoint) {
@@ -112,10 +174,7 @@ export async function launchDolphinBrowser(): Promise<DolphinLaunchResult> {
 
   console.log(`DOLPHIN | automation endpoint=${endpoint}`);
 
-  const browser = await chromium.connectOverCDP(endpoint, { timeout: 60000 });
-  console.log(`DOLPHIN | Playwright connected to profile ${profileId}`);
-
-  return { browser, profileId, endpoint };
+  return connectToEndpoint(profileId, endpoint);
 }
 
 export async function stopDolphinProfile(profileId: number): Promise<void> {
@@ -131,5 +190,9 @@ export async function stopDolphinProfile(profileId: number): Promise<void> {
       `DOLPHIN | failed to stop profile ${profileId} |`,
       error instanceof Error ? error.message : String(error)
     );
+  } finally {
+    cachedBrowser = null;
+    cachedProfileId = null;
+    cachedEndpoint = null;
   }
 }
