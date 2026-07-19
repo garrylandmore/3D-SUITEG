@@ -10,14 +10,6 @@ import {
 const WETRANSFER_URL = (process.env.WETRANSFER_WEB_URL || 'https://wetransfer.com').trim();
 const WETRANSFER_LOGIN_URL = `${WETRANSFER_URL.replace(/\/$/, '')}/log-in`;
 
-// Timeouts (increased for slow proxy connections) - ALL configurable via environment
-const ELEMENT_TIMEOUT = parseInt(process.env.ELEMENT_TIMEOUT || '180000', 10); // 180s default (3 minutes)
-const CLICK_TIMEOUT = parseInt(process.env.CLICK_TIMEOUT || '60000', 10); // 60s default
-const WAIT_TIMEOUT = parseInt(process.env.WAIT_TIMEOUT || '10000', 10); // 10s default
-const PAGE_GOTO_TIMEOUT = parseInt(process.env.PAGE_GOTO_TIMEOUT || '120000', 10); // 120s
-const FILE_CHOOSER_TIMEOUT = parseInt(process.env.FILE_CHOOSER_TIMEOUT || '30000', 10); // 30s
-const CONFIRM_SEND_TIMEOUT = parseInt(process.env.CONFIRM_SEND_TIMEOUT || '90000', 10); // 90s
-
 type VerificationResolution = {
   verificationLink?: string;
   verificationCode?: string;
@@ -91,7 +83,7 @@ async function openWeTransferLoginPage(
         phase: 'loading_wetransfer',
         detail: `Loading ${WETRANSFER_LOGIN_URL} | helper=launchWeTransferBrowser | path=${launchPath} | attempt=${attempt}/${maxAttempts}`,
       });
-      await page.goto(WETRANSFER_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_GOTO_TIMEOUT });
+      await page.goto(WETRANSFER_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await waitForStableDom(page);
       await dismissConsentAndPopups(page);
       const finalUrl = page.url();
@@ -115,7 +107,7 @@ async function openWeTransferLoginPage(
         phase: 'loading_wetransfer',
         detail: `Proxy tunnel failed while loading WeTransfer (attempt ${attempt}/${maxAttempts}); retrying once`,
       });
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1200);
     }
   }
 }
@@ -150,7 +142,7 @@ async function clickFirstVisibleByText(page: Page, hints: string[]): Promise<boo
     for (let i = 0; i < count; i += 1) {
       const candidate = candidates.nth(i);
       if (await candidate.isVisible().catch(() => false)) {
-        await candidate.click({ timeout: CLICK_TIMEOUT }).catch(() => undefined);
+        await candidate.click({ timeout: 2000 }).catch(() => undefined);
         return true;
       }
     }
@@ -164,7 +156,7 @@ async function dismissConsentAndPopups(page: Page): Promise<void> {
 
 async function waitForStableDom(page: Page): Promise<void> {
   await page.waitForLoadState('domcontentloaded');
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(600);
 }
 
 async function isUploaderVisible(page: Page): Promise<boolean> {
@@ -273,8 +265,8 @@ async function uploadAttachment(
 
     try {
       const [fileChooser] = await Promise.all([
-        page.waitForEvent('filechooser', { timeout: FILE_CHOOSER_TIMEOUT }),
-        el.click({ timeout: CLICK_TIMEOUT }),
+        page.waitForEvent('filechooser', { timeout: 8000 }),
+        el.click({ timeout: 3000 }),
       ]);
       onLog?.(`file chooser path: succeeded via ${label}`);
       await fileChooser.setFiles(attachmentPath);
@@ -325,7 +317,7 @@ async function fillEmailField(
         await field.fill(normalized);
         // Confirm the autosuggest entry so WeTransfer registers the recipient
         await field.press('Enter').catch(() => undefined);
-        await page.waitForTimeout(1000);
+        await page.waitForTimeout(300);
         return true;
       }
     }
@@ -336,7 +328,7 @@ async function fillEmailField(
       onLog?.('recipient field detection: getByLabel("Email to")');
       await byLabel.fill(normalized);
       await byLabel.press('Enter').catch(() => undefined);
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(300);
       return true;
     }
 
@@ -426,45 +418,71 @@ async function performSignupAndVerification(
   // Step 1: Navigate to the login page
   await openWeTransferLoginPage(page, options.proxyConfig, onPhase, 'send-signup');
 
-  // Step 2: Click "Sign up"
-  const signUpCandidates = [
-    page.getByRole('link', { name: /sign up/i }).first(),
-    page.getByRole('button', { name: /sign up/i }).first(),
-    page.getByText('Sign up', { exact: true }).first(),
-  ];
+  // Step 2: Click "Sign up". WeTransfer currently renders this as an <a href="/signup?..."> link.
+  // Prefer the stable href over generated CSS module class names.
   let signUpClicked = false;
-  for (const candidate of signUpCandidates) {
-    if (await candidate.isVisible().catch(() => false)) {
-      await candidate.click({ timeout: CLICK_TIMEOUT });
+
+  const signUpHrefLink = page.locator('a[href^="/signup"], a[href*="/signup?"]').first();
+  if (await signUpHrefLink.isVisible().catch(() => false)) {
+    try {
+      await signUpHrefLink.click({ timeout: 10000 });
       signUpClicked = true;
-      break;
+    } catch {
+      // If a cookie banner/overlay intercepts the click, navigate to the link directly.
+      const href = await signUpHrefLink.getAttribute('href').catch(() => null);
+      if (href) {
+        await page.goto(new URL(href, page.url()).toString(), {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000,
+        });
+        signUpClicked = true;
+      }
     }
   }
-  if (signUpClicked) {
-    onPhase?.({ phase: 'signup_clicked', detail: 'Clicked Sign up on WeTransfer login page' });
-    await page.waitForTimeout(3000);
-    await waitForStableDom(page);
-  } else {
-    onPhase?.({ phase: 'signup_clicked', detail: 'Sign up link not found; proceeding with email entry directly' });
+
+  // Accessibility/text fallbacks in case WeTransfer changes the signup URL structure.
+  if (!signUpClicked) {
+    const signUpCandidates = [
+      page.getByRole('link', { name: /^sign up$/i }).first(),
+      page.getByRole('button', { name: /^sign up$/i }).first(),
+      page.getByText('Sign up', { exact: true }).first(),
+    ];
+
+    for (const candidate of signUpCandidates) {
+      if (await candidate.isVisible().catch(() => false)) {
+        await candidate.click({ timeout: 10000 });
+        signUpClicked = true;
+        break;
+      }
+    }
   }
+
+  if (!signUpClicked) {
+    throw new Error(
+      `Could not find or open the WeTransfer Sign up link. Current URL: ${page.url()}`
+    );
+  }
+
+  onPhase?.({ phase: 'signup_clicked', detail: 'Opened WeTransfer Sign up page' });
+  await page.waitForTimeout(1500);
+  await waitForStableDom(page);
 
   // Step 3: Fill input#email with senderEmail
   const emailInput = page.locator('input#email').first();
-  await emailInput.waitFor({ state: 'visible', timeout: ELEMENT_TIMEOUT });
+  await emailInput.waitFor({ state: 'visible', timeout: 20000 });
   await emailInput.fill(senderEmail);
-  await page.waitForTimeout(WAIT_TIMEOUT);
   onPhase?.({ phase: 'sender_email_entered', detail: `Sender email entered: ${senderEmail}` });
 
   // Step 4: Click "Continue"
   const continueBtn = page.getByRole('button', { name: /continue/i }).first();
   if (await continueBtn.isVisible().catch(() => false)) {
-    await continueBtn.click({ timeout: CLICK_TIMEOUT });
+    await continueBtn.click({ timeout: 5000 });
   } else {
     // Fallback: press Enter on the email input
     await emailInput.press('Enter');
   }
   onPhase?.({ phase: 'verification_code_requested', detail: 'Submitted email, polling temp mailbox for verification code' });
-  await page.waitForTimeout(5000);
+  await page.waitForTimeout(2000);
 
   // Step 5: Poll temp mailbox for verification code
   if (!options.onVerificationRequired) {
@@ -500,22 +518,21 @@ async function performSignupAndVerification(
     const primaryVisible = await codeInput.isVisible().catch(() => false);
     const activeCodeInput = primaryVisible ? codeInput : codeInputFallback;
 
-    await activeCodeInput.waitFor({ state: 'visible', timeout: ELEMENT_TIMEOUT });
+    await activeCodeInput.waitFor({ state: 'visible', timeout: 20000 });
     await activeCodeInput.fill(resolution.verificationCode);
-    await page.waitForTimeout(WAIT_TIMEOUT);
 
     const verifyBtn = page.getByRole('button', { name: /verify/i }).first();
     if (await verifyBtn.isVisible().catch(() => false)) {
-      await verifyBtn.click({ timeout: CLICK_TIMEOUT });
+      await verifyBtn.click({ timeout: 5000 });
     } else {
       await clickFirstVisibleByText(page, ['Verify', 'Confirm', 'Continue']);
     }
     onPhase?.({ phase: 'verification_submitted', detail: 'Verification code submitted, waiting for session' });
-    await page.waitForTimeout(8000);
+    await page.waitForTimeout(3000);
     await waitForStableDom(page);
   } else if (resolution.verificationLink) {
     // If a magic link was provided instead of a code, navigate directly
-    await page.goto(resolution.verificationLink, { waitUntil: 'domcontentloaded', timeout: PAGE_GOTO_TIMEOUT });
+    await page.goto(resolution.verificationLink, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await waitForStableDom(page);
     onPhase?.({ phase: 'verification_submitted', detail: 'Followed verification link' });
   }
@@ -523,15 +540,15 @@ async function performSignupAndVerification(
   // Step 8: Accept terms if shown
   const termsBtn = page.locator('[data-testid="accept-terms"]').first();
   if (await termsBtn.isVisible().catch(() => false)) {
-    await termsBtn.click({ timeout: CLICK_TIMEOUT }).catch(() => undefined);
+    await termsBtn.click({ timeout: 5000 }).catch(() => undefined);
     onPhase?.({ phase: 'terms_accepted', detail: 'Accepted WeTransfer terms and conditions' });
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(1500);
     await waitForStableDom(page);
   }
 
   // Step 9: Wait for the uploader UI to become visible
   let uploaderVisible = false;
-  for (let attempt = 0; attempt < 60; attempt += 1) {
+  for (let attempt = 0; attempt < 15; attempt += 1) {
     if (await isUploaderVisible(page)) {
       uploaderVisible = true;
       break;
@@ -566,7 +583,7 @@ async function confirmSend(page: Page): Promise<{ transferUrl?: string }> {
         return texts.some((text: string) => bodyText.toLowerCase().includes(text.toLowerCase()));
       },
       successTextChecks,
-      { timeout: CONFIRM_SEND_TIMEOUT }
+      { timeout: 45000 }
     );
   } catch {
     // Continue with HTML-based fallback below.
@@ -664,7 +681,7 @@ export async function createWeTransferTransfer(
         `${message} (last successful stage: uploader_visible, current URL: ${currentUrl})`
       );
     }
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(1000);
     onPhase?.({
       phase: 'upload_completed',
       detail: `Upload completed for "${filename}"${uploadStrategyLog.length ? ` [${uploadStrategyLog.join(', ')}]` : ''}`,
@@ -691,7 +708,7 @@ export async function createWeTransferTransfer(
     const transferByTestId = page.locator('[data-testid="uploaderForm-transfer-button"]');
     if (await transferByTestId.isVisible().catch(() => false)) {
       onPhase?.({ phase: 'send_submitted', detail: 'transfer button detection: data-testid="uploaderForm-transfer-button"' });
-      await transferByTestId.click({ timeout: CLICK_TIMEOUT });
+      await transferByTestId.click({ timeout: 5000 });
       sendClicked = true;
     } else {
       sendClicked = await clickFirstVisibleByText(page, SEND_BUTTON_HINTS);
