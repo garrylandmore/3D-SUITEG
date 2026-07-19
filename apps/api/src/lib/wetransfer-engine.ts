@@ -123,10 +123,16 @@ function extractFirstLink(messageText: string): string | null {
 }
 
 function extractVerificationCode(messageText: string): string | null {
-  const explicitCode = messageText.match(/(?:code|otp|verification)[^\d]{0,20}(\d{4,8})/i);
-  if (explicitCode?.[1]) return explicitCode[1];
-  const anyCode = messageText.match(/\b\d{6}\b/);
-  return anyCode?.[0] ?? null;
+  // WeTransfer currently sends six-character alphanumeric codes such as KDRMSP,
+  // not only numeric OTPs. Prefer explicit phrases first to avoid matching random words.
+  const explicitCode = messageText.match(
+    /(?:verification\s*code|your\s*code\s*is|code|otp)\s*[:\-]?\s*([A-Z0-9]{6})\b/i
+  );
+  if (explicitCode?.[1]) return explicitCode[1].toUpperCase();
+
+  // Fallback for email bodies that put the code on its own line after explanatory text.
+  const standaloneCode = messageText.match(/(?:^|\n)\s*([A-Z0-9]{6})\s*(?:\n|$)/im);
+  return standaloneCode?.[1]?.toUpperCase() ?? null;
 }
 
 function messageMayBeWeTransferVerification(message: TempMailIOMessage): boolean {
@@ -167,7 +173,12 @@ async function enrichMessageIfNeeded(
 async function pollForVerificationEmail(
   mailboxEmail: string,
   tempMailApiKey: string,
-  onProgress: (attempt: number, messageCount: number, delayMs: number) => void
+  onProgress: (
+    attempt: number,
+    messageCount: number,
+    delayMs: number,
+    rateLimit?: { limit?: string; remaining?: string; reset?: string }
+  ) => void
 ): Promise<{
   found: boolean;
   messageCount: number;
@@ -185,9 +196,17 @@ async function pollForVerificationEmail(
   let attempt = 0;
   while (maxAttempts <= 0 || attempt < maxAttempts) {
     attempt += 1;
-    const { messages } = await listMailboxMessages(mailboxEmail, tempMailApiKey);
+    const { messages, rateLimit } = await listMailboxMessages(mailboxEmail, tempMailApiKey);
     latestCount = messages.length;
-    onProgress(attempt, latestCount, delayMs);
+    onProgress(attempt, latestCount, delayMs, rateLimit);
+
+    // Stop before burning the final API requests. A fresh request can be retried after reset.
+    const remaining = Number.parseInt(rateLimit.remaining || '', 10);
+    if (Number.isFinite(remaining) && remaining <= 1) {
+      throw new Error(
+        `temp-mail.io rate limit nearly exhausted (remaining=${rateLimit.remaining}, reset=${rateLimit.reset || 'unknown'})`
+      );
+    }
 
     const candidates = messages
       .filter(messageMayBeWeTransferVerification)
@@ -438,12 +457,15 @@ export async function sendLeadViaWeTransfer(
               const verificationResult = await pollForVerificationEmail(
                 mailboxEmail,
                 tempMailApiKey,
-                (attempt, messageCount, delayMs) => {
+                (attempt, messageCount, delayMs, rateLimit) => {
                   session.mailboxMessageCount = messageCount;
+                  const quota = rateLimit?.remaining
+                    ? ` | API remaining ${rateLimit.remaining}${rateLimit.limit ? `/${rateLimit.limit}` : ''}`
+                    : '';
                   stepUpdate(
                     'verify_email',
                     'waiting_for_verification',
-                    `polling_for_code | attempt ${attempt} | ${messageCount} message(s) in temp mailbox | checking again in ${Math.round(delayMs / 1000)}s`
+                    `polling_for_code | attempt ${attempt} | mailbox=${mailboxEmail} | ${messageCount} message(s)${quota} | checking again in ${Math.round(delayMs / 1000)}s`
                   );
                 }
               );
