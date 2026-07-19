@@ -366,81 +366,39 @@ async function waitForWeTransferUploadReady(
     process.env.WETRANSFER_UPLOAD_WAIT_MS || 180000
   );
 
-  const startedAt = Date.now();
-  let attempt = 0;
-  let stableFilenameChecks = 0;
+  const itemsCount = page
+    .locator('span.uploader__add-more--desktop__items-count--text')
+    .first();
 
-  while (Date.now() - startedAt < timeoutMs) {
-    attempt += 1;
+  await itemsCount.waitFor({
+    state: 'visible',
+    timeout: timeoutMs,
+  });
 
-    const inputHasExpectedFile = await page
-      .locator('input[type="file"]')
-      .evaluateAll((inputs, expectedName) => {
-        return inputs.some((input) => {
-          const files = (input as HTMLInputElement).files;
-          return Boolean(
-            files &&
-            Array.from(files).some((file) => file.name === expectedName)
-          );
-        });
-      }, filename)
-      .catch(() => false);
+  const deadline = Date.now() + timeoutMs;
 
-    const fileTitle = page
-      .locator('h6.file-system-entry__title')
-      .filter({ hasText: filename })
-      .first();
-
-    const filenameVisible = await fileTitle
-      .isVisible()
-      .catch(() => false);
-
-    const visibleTitleText = filenameVisible
-      ? ((await fileTitle.textContent().catch(() => '')) || '').trim()
-      : '';
-
-    const progressVisible =
-      (await page
-        .locator(
-          '[role="progressbar"], progress, [aria-busy="true"], [data-testid*="progress" i], [data-testid*="upload-progress" i]'
-        )
-        .count()
-        .catch(() => 0)) > 0;
-
-    const uploadingTextVisible = await page
-      .getByText(/uploading|preparing files|processing files|calculating/i)
-      .first()
-      .isVisible()
-      .catch(() => false);
+  while (Date.now() < deadline) {
+    const text = ((await itemsCount.textContent().catch(() => '')) || '').trim();
 
     onLog?.(
-      `upload wait | attempt=${attempt} | inputHasFile=${inputHasExpectedFile} | filenameVisible=${filenameVisible} | title="${visibleTitleText}" | progressVisible=${progressVisible} | uploadingTextVisible=${uploadingTextVisible}`
+      `upload wait | filename="${filename}" | itemsCount="${text}"`
     );
 
-    if (
-      inputHasExpectedFile &&
-      filenameVisible &&
-      visibleTitleText.includes(filename) &&
-      !progressVisible &&
-      !uploadingTextVisible
-    ) {
-      stableFilenameChecks += 1;
+    if (/^1\s+item$/i.test(text) || /^1\s+items$/i.test(text)) {
+      onLog?.(
+        `upload ready | WeTransfer shows "${text}" for "${filename}"`
+      );
 
-      if (stableFilenameChecks >= 2) {
-        onLog?.(
-          `upload ready | confirmed WeTransfer file entry: ${visibleTitleText}`
-        );
-        return;
-      }
-    } else {
-      stableFilenameChecks = 0;
+      // Small settle delay before recipient entry.
+      await page.waitForTimeout(2000);
+      return;
     }
 
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1000);
   }
 
   throw new Error(
-    `Timed out after ${Math.round(timeoutMs / 1000)} seconds waiting for WeTransfer file entry "${filename}"`
+    `Timed out waiting for WeTransfer to show "1 item" after uploading "${filename}"`
   );
 }
 
@@ -1294,27 +1252,65 @@ export async function createWeTransferTransfer(
         console.log(`RECIPIENT STAGE START | lead=${normalizedRecipient} | url=${page.url()}`);
         onPhase?.({
           phase: 'send_submitted',
-          detail: `Recipient stage started for ${normalizedRecipient}. Waiting for input#autosuggest`,
+          detail: `Recipient stage started for ${normalizedRecipient}. Waiting for Email to field.`,
         });
 
-        const recipientInput = page
+        let recipientInput = page
           .locator('input#autosuggest[name="autosuggest"]')
           .first();
+
+        // Primary selector: exact WeTransfer recipient input.
+        // Fallback: locate the input associated with the visible "Email to" label.
+        if (!(await recipientInput.isVisible().catch(() => false))) {
+          const emailToLabel = page
+            .getByText(/^Email to$/i, { exact: true })
+            .first();
+
+          if (await emailToLabel.isVisible().catch(() => false)) {
+            const forAttr = await emailToLabel.getAttribute('for').catch(() => null);
+
+            if (forAttr) {
+              recipientInput = page.locator(`#${forAttr}`).first();
+            } else {
+              recipientInput = emailToLabel
+                .locator('xpath=following::input[@type="email"][1]')
+                .first();
+            }
+
+            onPhase?.({
+              phase: 'send_submitted',
+              detail: 'Recipient field located using visible "Email to" label',
+            });
+
+            console.log('RECIPIENT FIELD FOUND VIA LABEL | Email to');
+          }
+        }
 
         await recipientInput.waitFor({
           state: 'visible',
           timeout: 60000,
         });
 
+        // Click the Email to field and type the lead email character-by-character.
         await recipientInput.click({ timeout: 60000 });
         await recipientInput.fill('');
-        await recipientInput.fill(normalizedRecipient);
+        await page.waitForTimeout(300);
+
+        console.log(`RECIPIENT TYPING START | ${normalizedRecipient}`);
+
+        await recipientInput.pressSequentially(normalizedRecipient, {
+          delay: 100,
+        });
 
         const recipientActual = await recipientInput.inputValue();
 
+        console.log(
+          `RECIPIENT INPUT CHECK | expected=${normalizedRecipient} | actual=${recipientActual}`
+        );
+
         onPhase?.({
           phase: 'send_submitted',
-          detail: `recipient field detection: input#autosuggest | expected=${normalizedRecipient} | actual=${recipientActual}`,
+          detail: `Email to field typed | expected=${normalizedRecipient} | actual=${recipientActual}`,
         });
 
         if (recipientActual !== normalizedRecipient) {
@@ -1323,27 +1319,11 @@ export async function createWeTransferTransfer(
           );
         }
 
-        console.log(`RECIPIENT FILLED | ${recipientActual}`);
+        // Commit the autosuggest email.
         await recipientInput.press('Enter');
-        console.log(`RECIPIENT COMMIT ENTER PRESSED | ${normalizedRecipient}`);
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(1500);
 
-        // WeTransfer can redirect after the recipient is committed as well.
-        if (isWeTransferRootRedirect(page.url())) {
-          throw new Error(
-            `WeTransfer redirected to homepage after recipient entry on attempt ${transferAttempt}`
-          );
-        }
-
-        if (message?.trim()) {
-          const messageField = page
-            .locator('textarea[name*="message" i], textarea[placeholder*="message" i], textarea')
-            .first();
-
-          if (await messageField.isVisible().catch(() => false)) {
-            await messageField.fill(message.trim());
-          }
-        }
+        console.log(`RECIPIENT COMMITTED | ${normalizedRecipient}`);
 
         const transferByTestId = page
           .locator('button[data-testid="uploaderForm-transfer-button"]')
@@ -1354,24 +1334,11 @@ export async function createWeTransferTransfer(
           timeout: 60000,
         });
 
-        const transferEnabled = await transferByTestId
-          .isEnabled()
-          .catch(() => false);
-
-        onPhase?.({
-          phase: 'send_submitted',
-          detail: `transfer button detection: button[data-testid="uploaderForm-transfer-button"] | enabled=${transferEnabled}`,
-        });
-
-        if (!transferEnabled) {
-          throw new Error(
-            'WeTransfer Transfer button is visible but disabled after recipient entry'
-          );
-        }
-
-        console.log(`TRANSFER CLICK START | recipient=${normalizedRecipient}`);
         await transferByTestId.click({ timeout: 60000 });
-        console.log(`TRANSFER CLICKED | recipient=${normalizedRecipient} | url=${page.url()}`);
+
+        console.log(
+          `TRANSFER CLICKED | recipient=${normalizedRecipient} | url=${page.url()}`
+        );
 
         onPhase?.({
           phase: 'send_submitted',
