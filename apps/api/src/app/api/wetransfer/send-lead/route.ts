@@ -51,7 +51,6 @@ type WeTransferSendLeadResponse = {
  *   campaignId: string;
  *   leadEmail: string;
  *   fileSource: 'upload' | 'generated';
- *   tempMailApiKey?: string;
  * }
  */
 export async function POST(request: NextRequest) {
@@ -79,7 +78,6 @@ export async function POST(request: NextRequest) {
   const leadName = body.leadName ? String(body.leadName).trim() : '';
   const fileSource = body.fileSource === 'upload' ? 'upload' : 'generated';
   const ctaLink = body.ctaLink ? String(body.ctaLink).trim() : '';
-  const tempMailApiKey = body.tempMailApiKey ? String(body.tempMailApiKey).trim() : '';
 
   if (!campaignId || !leadEmail) {
     return NextResponse.json(
@@ -231,7 +229,6 @@ export async function POST(request: NextRequest) {
         ctaLink: ctaLink || undefined,
         fileBuffer: attachmentBuffer,
         attachmentPath,
-        tempMailApiKey: tempMailApiKey || undefined,
         proxyConfig,
       },
       (step, logLine) => {
