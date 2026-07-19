@@ -2,6 +2,7 @@ import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, Page } from 'playwright';
 import type { BrowserProxyConfig } from './browser-proxy-types';
+import { isDolphinEnabled, launchDolphinBrowser } from './dolphin-browser';
 import {
   buildPlaywrightProxyLaunchOptions,
   getBrowserProxyDiagnostics,
@@ -62,6 +63,26 @@ function getWeTransferUserAgent(): string {
 }
 
 async function createFreshWeTransferPage(browser: any): Promise<Page> {
+  if (isDolphinEnabled()) {
+    const contexts = browser.contexts();
+    const context = contexts[0];
+    if (!context) {
+      throw new Error('Dolphin browser connected but no browser context was available');
+    }
+
+    const existingPages = context.pages();
+    const page = existingPages[0] ?? (await context.newPage());
+
+    page.setDefaultTimeout(60000);
+    page.setDefaultNavigationTimeout(60000);
+
+    console.log(
+      `DOLPHIN BROWSER SESSION | contexts=${contexts.length} | pages=${context.pages().length}`
+    );
+
+    return page;
+  }
+
   const context = await browser.newContext({
     userAgent: getWeTransferUserAgent(),
     viewport: { width: 1366, height: 768 },
@@ -85,6 +106,19 @@ async function launchWeTransferBrowser(
   onPhase: ((update: WeTransferSendPhaseUpdate) => void) | undefined,
   launchPath: string
 ) {
+  if (isDolphinEnabled()) {
+    onPhase?.({
+      phase: 'opening_browser',
+      detail: `Launching Dolphin{anty} browser profile | path=${launchPath}`,
+    });
+
+    const { browser, profileId, endpoint } = await launchDolphinBrowser();
+    console.log(
+      `DOLPHIN ACTIVE | profileId=${profileId} | endpoint=${endpoint} | path=${launchPath}`
+    );
+    return browser;
+  }
+
   onPhase?.({
     phase: 'opening_browser',
     detail: getBrowserProxyDiagnostics(proxyConfig, 'launchWeTransferBrowser', launchPath),
