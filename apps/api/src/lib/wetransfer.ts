@@ -1240,14 +1240,9 @@ export async function createWeTransferTransfer(
           detail: `Upload fully ready for "${filename}" [transfer attempt ${transferAttempt}/2]`,
         });
 
-        // If WeTransfer bounced us back to the root page after the upload step,
-        // do not continue with recipient entry on this attempt. Re-open the
-        // uploader and repeat upload + recipient + Transfer from the beginning.
-        if (isWeTransferRootRedirect(page.url())) {
-          throw new Error(
-            `WeTransfer redirected to homepage after upload attempt ${transferAttempt}`
-          );
-        }
+        console.log(
+          `UPLOAD READY -> MOVING TO EMAIL TO | filename=${filename} | url=${page.url()}`
+        );
 
         console.log(`RECIPIENT STAGE START | lead=${normalizedRecipient} | url=${page.url()}`);
         onPhase?.({
@@ -1345,15 +1340,9 @@ export async function createWeTransferTransfer(
           detail: `Transfer submission clicked for ${normalizedRecipient} [attempt ${transferAttempt}/2]`,
         });
 
-        // If the click or UI transition sends us back to the homepage instead
-        // of confirming the transfer, retry the whole upload/send flow once.
+        // Give WeTransfer time to process the send, then let confirmation
+        // detection determine whether the transfer actually succeeded.
         await page.waitForTimeout(3000);
-
-        if (isWeTransferRootRedirect(page.url())) {
-          throw new Error(
-            `WeTransfer redirected to homepage after Transfer click on attempt ${transferAttempt}`
-          );
-        }
 
         confirmation = await confirmSend(page);
       } catch (error: unknown) {
