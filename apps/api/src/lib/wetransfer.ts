@@ -52,6 +52,34 @@ function isHeadlessEnabled(): boolean {
   return (process.env.WETRANSFER_HEADLESS || 'true').trim().toLowerCase() !== 'false';
 }
 
+function getWeTransferUserAgent(): string {
+  return (
+    process.env.WETRANSFER_USER_AGENT ||
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+      'Chrome/150.0.0.0 Safari/537.36'
+  ).trim();
+}
+
+async function createFreshWeTransferPage(browser: any): Promise<Page> {
+  const context = await browser.newContext({
+    userAgent: getWeTransferUserAgent(),
+    viewport: { width: 1366, height: 768 },
+    locale: 'en-US',
+    storageState: { cookies: [], origins: [] },
+  });
+
+  const cookies = await context.cookies();
+  console.log(
+    `FRESH BROWSER SESSION | cookies=${cookies.length} | userAgent=${getWeTransferUserAgent()}`
+  );
+
+  const page = await context.newPage();
+  page.setDefaultTimeout(60000);
+  page.setDefaultNavigationTimeout(60000);
+  return page;
+}
+
 async function launchWeTransferBrowser(
   proxyConfig: BrowserProxyConfig | null | undefined,
   onPhase: ((update: WeTransferSendPhaseUpdate) => void) | undefined,
@@ -511,12 +539,34 @@ async function performSignupAndVerification(
 
   page.on('response', authResponseLogger);
 
-  // Step 3: Fill input#email with senderEmail
+  // Step 3: Enter the sender email using normal keyboard events instead of setting the value instantly.
   const emailInput = page.locator('input#email').first();
   await emailInput.waitFor({ state: 'visible', timeout: 60000 });
-  await emailInput.fill(senderEmail);
+  await emailInput.click({ timeout: 60000 });
+  await emailInput.fill('');
+
+  const typingDelayMs = Number.parseInt(
+    process.env.WETRANSFER_EMAIL_TYPING_DELAY_MS || '100',
+    10
+  );
+  await emailInput.pressSequentially(senderEmail, {
+    delay: Number.isFinite(typingDelayMs) ? Math.max(0, typingDelayMs) : 100,
+  });
+
+  const enteredEmail = await emailInput.inputValue();
+  console.log(`EMAIL INPUT CHECK | expected=${senderEmail} | actual=${enteredEmail}`);
+
+  if (enteredEmail !== senderEmail) {
+    throw new Error(
+      `Email field mismatch before submission: expected ${senderEmail}, got ${enteredEmail}`
+    );
+  }
+
   console.log(`WETRANSFER EMAIL ENTERED | ${senderEmail}`);
-  onPhase?.({ phase: 'sender_email_entered', detail: `Sender email entered: ${senderEmail}` });
+  onPhase?.({
+    phase: 'sender_email_entered',
+    detail: `Sender email entered and verified in field: ${senderEmail}`,
+  });
 
   // Prepare both signals BEFORE submitting the email so we cannot miss the HTTP 201.
   const verificationCodeInput = page.locator(
@@ -731,7 +781,7 @@ export async function probeWeTransferWebsite(
   try {
     browser = await launchWeTransferBrowser(proxyConfig, onPhase, launchPath);
 
-    const page = await browser.newPage();
+    const page = await createFreshWeTransferPage(browser);
     await openWeTransferLoginPage(page, proxyConfig, onPhase, launchPath);
 
     return { success: true };
@@ -777,7 +827,7 @@ export async function createWeTransferTransfer(
 
     browser = await launchWeTransferBrowser(options.proxyConfig, onPhase, 'send-transfer');
 
-    const page = await browser.newPage();
+    const page = await createFreshWeTransferPage(browser);
 
     // Perform signup + verification flow before touching the uploader
     await performSignupAndVerification(page, senderEmail, options, onPhase);
