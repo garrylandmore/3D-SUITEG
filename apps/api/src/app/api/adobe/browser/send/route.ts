@@ -554,6 +554,48 @@ async function submitShare(page: any): Promise<void> {
   }
 }
 
+function getAdobeErrorCode(message: string): string {
+  const value = message.toLowerCase();
+
+  if (
+    value.includes('limit exceeded') ||
+    value.includes('limit of free file sends') ||
+    value.includes('upgrade to send more files')
+  ) {
+    return 'ADOBE_LIMIT_EXCEEDED';
+  }
+
+  if (value.includes('upload') && value.includes('time')) {
+    return 'UPLOAD_TIMEOUT';
+  }
+
+  if (value.includes('upload control')) {
+    return 'UPLOAD_CONTROL_NOT_FOUND';
+  }
+
+  if (value.includes('share button')) {
+    return 'SHARE_BUTTON_NOT_FOUND';
+  }
+
+  if (value.includes('invite email field')) {
+    return 'INVITE_FIELD_NOT_FOUND';
+  }
+
+  if (value.includes('invite button')) {
+    return 'INVITE_BUTTON_NOT_FOUND';
+  }
+
+  if (value.includes('recipient')) {
+    return 'RECIPIENT_ERROR';
+  }
+
+  if (value.includes('timeout')) {
+    return 'TIMEOUT';
+  }
+
+  return 'ADOBE_SHARE_FAILED';
+}
+
 export async function POST(request: NextRequest) {
   const store = getAdobeBrowserStore();
   const session = store.session;
@@ -617,9 +659,13 @@ export async function POST(request: NextRequest) {
     const page = session.page;
 
     const results: Array<{
+      index: number;
+      total: number;
       recipient: string;
       filename: string;
       success: boolean;
+      message: string;
+      errorCode?: string;
       error?: string;
     }> = [];
 
@@ -669,9 +715,12 @@ export async function POST(request: NextRequest) {
         await submitShare(page);
 
         results.push({
+          index: index + 1,
+          total: recipients.length,
           recipient,
           filename: resolvedFilename,
           success: true,
+          message: `Shared successfully with ${recipient}`,
         });
 
         console.log(
@@ -685,10 +734,16 @@ export async function POST(request: NextRequest) {
         const message =
           error instanceof Error ? error.message : String(error);
 
+        const errorCode = getAdobeErrorCode(message);
+
         results.push({
+          index: index + 1,
+          total: recipients.length,
           recipient,
           filename: resolvedFilename,
           success: false,
+          message: `Failed to share with ${recipient}`,
+          errorCode,
           error: message,
         });
 
@@ -722,6 +777,8 @@ export async function POST(request: NextRequest) {
         failed.length === 0
           ? `Adobe shared ${successful.length} uniquely named document(s).`
           : `Adobe completed ${successful.length} and failed ${failed.length} recipient(s).`,
+      totalCount: recipients.length,
+      processedCount: results.length,
       sentCount: successful.length,
       failedCount: failed.length,
       results,
