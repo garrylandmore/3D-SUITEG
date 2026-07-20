@@ -1162,7 +1162,7 @@ export async function probeWeTransferWebsite(
 export async function createWeTransferTransfer(
   filename: string,
   fileBuffer: Buffer,
-  recipientEmail: string,
+  recipientEmails: string[],
   message?: string,
   onPhase?: (update: WeTransferSendPhaseUpdate) => void,
   options: WeTransferSendOptions = {}
@@ -1170,9 +1170,12 @@ export async function createWeTransferTransfer(
   let browser;
   let activeDolphinProfileId: number | null = null;
   try {
-    const normalizedRecipient = recipientEmail.trim();
-    if (!normalizedRecipient) {
-      throw new Error('Recipient email is required for WeTransfer send');
+    const normalizedRecipients = Array.from(
+      new Set(recipientEmails.map((email) => email.trim()).filter(Boolean))
+    ).slice(0, 10);
+
+    if (!normalizedRecipients.length) {
+      throw new Error('At least one recipient email is required for WeTransfer send');
     }
 
     const attachmentPath = options.attachmentPath?.trim();
@@ -1269,81 +1272,83 @@ export async function createWeTransferTransfer(
           `UPLOAD READY -> MOVING TO EMAIL TO | filename=${filename} | url=${page.url()}`
         );
 
-        console.log(`RECIPIENT STAGE START | lead=${normalizedRecipient} | url=${page.url()}`);
-        onPhase?.({
-          phase: 'send_submitted',
-          detail: `Recipient stage started for ${normalizedRecipient}. Waiting for Email to field.`,
-        });
-
-        let recipientInput = page
-          .locator('input#autosuggest[name="autosuggest"]')
-          .first();
-
-        // Primary selector: exact WeTransfer recipient input.
-        // Fallback: locate the input associated with the visible "Email to" label.
-        if (!(await recipientInput.isVisible().catch(() => false))) {
-          const emailToLabel = page
-            .getByText(/^Email to$/i, { exact: true })
-            .first();
-
-          if (await emailToLabel.isVisible().catch(() => false)) {
-            const forAttr = await emailToLabel.getAttribute('for').catch(() => null);
-
-            if (forAttr) {
-              recipientInput = page.locator(`#${forAttr}`).first();
-            } else {
-              recipientInput = emailToLabel
-                .locator('xpath=following::input[@type="email"][1]')
-                .first();
-            }
-
-            onPhase?.({
-              phase: 'send_submitted',
-              detail: 'Recipient field located using visible "Email to" label',
-            });
-
-            console.log('RECIPIENT FIELD FOUND VIA LABEL | Email to');
-          }
-        }
-
-        await recipientInput.waitFor({
-          state: 'visible',
-          timeout: 60000,
-        });
-
-        // Click the Email to field and type the lead email character-by-character.
-        await recipientInput.click({ timeout: 60000 });
-        await recipientInput.fill('');
-        await page.waitForTimeout(300);
-
-        console.log(`RECIPIENT TYPING START | ${normalizedRecipient}`);
-
-        await recipientInput.pressSequentially(normalizedRecipient, {
-          delay: 100,
-        });
-
-        const recipientActual = await recipientInput.inputValue();
-
         console.log(
-          `RECIPIENT INPUT CHECK | expected=${normalizedRecipient} | actual=${recipientActual}`
+          `RECIPIENT BATCH STAGE START | count=${normalizedRecipients.length} | recipients=${normalizedRecipients.join(', ')} | url=${page.url()}`
         );
 
         onPhase?.({
           phase: 'send_submitted',
-          detail: `Email to field typed | expected=${normalizedRecipient} | actual=${recipientActual}`,
+          detail: `Recipient batch started (${normalizedRecipients.length}/10): ${normalizedRecipients.join(', ')}`,
         });
 
-        if (recipientActual !== normalizedRecipient) {
-          throw new Error(
-            `Recipient email field mismatch: expected ${normalizedRecipient}, got ${recipientActual}`
+        for (
+          let recipientIndex = 0;
+          recipientIndex < normalizedRecipients.length;
+          recipientIndex += 1
+        ) {
+          const normalizedRecipient = normalizedRecipients[recipientIndex];
+
+          let recipientInput = page
+            .locator('input#autosuggest[name="autosuggest"]')
+            .first();
+
+          if (!(await recipientInput.isVisible().catch(() => false))) {
+            const emailToLabel = page
+              .getByText(/^Email to$/i, { exact: true })
+              .first();
+
+            if (await emailToLabel.isVisible().catch(() => false)) {
+              const forAttr = await emailToLabel
+                .getAttribute('for')
+                .catch(() => null);
+
+              if (forAttr) {
+                recipientInput = page.locator(`#${forAttr}`).first();
+              }
+            }
+          }
+
+          await recipientInput.waitFor({
+            state: 'visible',
+            timeout: 60000,
+          });
+
+          await recipientInput.click({ timeout: 60000 });
+          await recipientInput.fill('');
+          await page.waitForTimeout(250);
+
+          console.log(
+            `RECIPIENT TYPING | ${recipientIndex + 1}/${normalizedRecipients.length} | ${normalizedRecipient}`
           );
+
+          await recipientInput.pressSequentially(normalizedRecipient, {
+            delay: 80,
+          });
+
+          const recipientActual = await recipientInput.inputValue();
+
+          if (recipientActual !== normalizedRecipient) {
+            throw new Error(
+              `Recipient email field mismatch: expected ${normalizedRecipient}, got ${recipientActual}`
+            );
+          }
+
+          await recipientInput.press('Enter');
+          await page.waitForTimeout(800);
+
+          console.log(
+            `RECIPIENT COMMITTED | ${recipientIndex + 1}/${normalizedRecipients.length} | ${normalizedRecipient}`
+          );
+
+          onPhase?.({
+            phase: 'send_submitted',
+            detail: `Recipient committed ${recipientIndex + 1}/${normalizedRecipients.length}: ${normalizedRecipient}`,
+          });
         }
 
-        // Commit the autosuggest email.
-        await recipientInput.press('Enter');
-        await page.waitForTimeout(1500);
-
-        console.log(`RECIPIENT COMMITTED | ${normalizedRecipient}`);
+        console.log(
+          `ALL RECIPIENTS COMMITTED | count=${normalizedRecipients.length} | ${normalizedRecipients.join(', ')}`
+        );
 
         const transferByTestId = page
           .locator('button[data-testid="uploaderForm-transfer-button"]')
@@ -1358,12 +1363,12 @@ export async function createWeTransferTransfer(
         transferClickedThisAttempt = true;
 
         console.log(
-          `TRANSFER CLICKED | recipient=${normalizedRecipient} | url=${page.url()}`
+          `TRANSFER CLICKED | recipients=${normalizedRecipients.join(', ')} | url=${page.url()}`
         );
 
         onPhase?.({
           phase: 'send_submitted',
-          detail: `Transfer submission clicked for ${normalizedRecipient} [attempt ${transferAttempt}/2]`,
+          detail: `Transfer submission clicked for ${normalizedRecipients.length} recipient(s) [attempt ${transferAttempt}/2]`,
         });
 
         // Give WeTransfer time to process the send, then let confirmation
@@ -1389,7 +1394,7 @@ export async function createWeTransferTransfer(
             });
 
             console.log(
-              `TRANSFER CLICKED BUT UNCONFIRMED | no retry | recipient=${normalizedRecipient} | detail=${confirmationMessage}`
+              `TRANSFER CLICKED BUT UNCONFIRMED | no retry | recipients=${normalizedRecipients.join(', ')} | detail=${confirmationMessage}`
             );
 
             // Treat as submitted but unconfirmed; return a placeholder confirmation
@@ -1438,13 +1443,13 @@ export async function createWeTransferTransfer(
     if (confirmation.transferUrl) {
       onPhase?.({
         phase: 'send_confirmed',
-        detail: `Transfer confirmed for ${normalizedRecipient}`,
+        detail: `Transfer confirmed for ${normalizedRecipients.length} recipient(s)`,
       });
     } else {
       onPhase?.({
         phase: 'send_submitted',
         detail:
-          `Transfer submitted once for ${normalizedRecipient}. Confirmation was not detected; no retry was performed to avoid duplicate delivery.`,
+          `Transfer submitted once for ${normalizedRecipients.length} recipient(s). Confirmation was not detected; no retry was performed to avoid duplicate delivery.`,
       });
     }
 
