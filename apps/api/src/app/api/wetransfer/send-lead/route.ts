@@ -6,6 +6,7 @@ import { chromium } from 'playwright';
 import { PDFDocument, PDFTextField } from 'pdf-lib';
 import {
   sendLeadViaWeTransfer,
+  sendSequentialLeadBatchViaWeTransfer,
   WeTransferExecutionStep,
 } from '@/lib/wetransfer-engine';
 import {
@@ -722,16 +723,123 @@ export async function POST(request: NextRequest) {
     }
 
     logs.push(
-      `[Batch] ${batchValues.BatchId} | ${batchValues.Reference} | ${batchValues.DateTime} | recipients=${leadEmails.length}`
+      `[Batch] ${batchValues.BatchId} | ${batchValues.Reference} | ${batchValues.DateTime} | ` +
+        `${leadEmails.length} sequential one-recipient transfer(s)`
     );
 
-    const safeFilename = filename || 'attachment';
-    attachmentDir = await fs.mkdtemp(path.join(os.tmpdir(), '3d-suite-wetransfer-'));
-    attachmentPath = path.join(attachmentDir, safeFilename);
-    await fs.writeFile(attachmentPath, attachmentBuffer);
-    logs.push(`[Attachment] ON_DISK: ${attachmentPath} | bytes=${attachmentBuffer.length}`);
+    attachmentDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), '3d-suite-wetransfer-')
+    );
+
+    const sequentialJobs: Array<{
+      recipientEmail: string;
+      filename: string;
+      fileBuffer: Buffer;
+      attachmentPath: string;
+      leadName?: string;
+      ctaLink?: string;
+    }> = [];
+
+    // Build one attachment filename/file entry per recipient.
+    // The content buffer is reused for ordinary uploaded PDFs/documents,
+    // while the filename placeholders are resolved separately per lead.
+    for (
+      let recipientIndex = 0;
+      recipientIndex < leadEmails.length;
+      recipientIndex += 1
+    ) {
+      const recipientEmail = leadEmails[recipientIndex];
+
+      let recipientFilename = filename;
+      let recipientBuffer = attachmentBuffer;
+
+      if (fileSource === 'upload') {
+        const originalFilename =
+          uploadedFile?.name ||
+          (body.uploadedFileName
+            ? String(body.uploadedFileName).trim()
+            : filename);
+
+        const isHtml =
+          uploadedFile?.type === 'text/html' ||
+          /\.html?$/i.test(originalFilename);
+
+        if (convertHtmlToPdf && isHtml) {
+          const sourceHtml = uploadedFile
+            ? Buffer.from(
+                await uploadedFile.arrayBuffer()
+              ).toString('utf8')
+            : Buffer.from(
+                String(body.uploadedFileBase64 || ''),
+                'base64'
+              ).toString('utf8');
+
+          recipientBuffer = await htmlToPdfBuffer(
+            sourceHtml,
+            recipientEmail,
+            leadName,
+            ctaLink,
+            batchValues
+          );
+
+          const originalParts =
+            splitOriginalFilename(originalFilename);
+          const pdfOriginal =
+            `${originalParts.originalName}.pdf`;
+          const pdfTemplate = attachmentNameTemplate
+            .replace(/\{Ext\}/gi, 'pdf')
+            .replace(/\{OriginalFile\}/gi, pdfOriginal);
+
+          recipientFilename =
+            resolveAttachmentNameTemplate(
+              pdfTemplate,
+              pdfOriginal,
+              recipientEmail,
+              leadName,
+              batchValues
+            );
+        } else {
+          recipientFilename =
+            resolveAttachmentNameTemplate(
+              attachmentNameTemplate,
+              originalFilename,
+              recipientEmail,
+              leadName,
+              batchValues
+            );
+        }
+      }
+
+      const safeRecipientFilename =
+        recipientFilename || `attachment-${recipientIndex + 1}`;
+
+      const recipientPath = path.join(
+        attachmentDir,
+        `${recipientIndex + 1}-${safeRecipientFilename}`
+      );
+
+      await fs.writeFile(
+        recipientPath,
+        recipientBuffer
+      );
+
+      logs.push(
+        `[Attachment] SEQUENTIAL_READY ${recipientIndex + 1}/${leadEmails.length} | ` +
+          `${recipientEmail} | ${safeRecipientFilename} | ${recipientBuffer.length} bytes`
+      );
+
+      sequentialJobs.push({
+        recipientEmail,
+        filename: safeRecipientFilename,
+        fileBuffer: recipientBuffer,
+        attachmentPath: recipientPath,
+        leadName: leadName || undefined,
+        ctaLink: ctaLink || undefined,
+      });
+    }
 
     const proxyConfig = getBrowserProxyConfigLocal();
+
     console.log(
       `[wetransfer/send-lead] ${getBrowserProxyDiagnostics(
         proxyConfig,
@@ -740,52 +848,88 @@ export async function POST(request: NextRequest) {
       )}`
     );
 
-    const result = await sendLeadViaWeTransfer(
-      session,
-      leadEmails,
-      filename,
-      {
-        fileSource,
-        attachmentBytes: attachmentBuffer.length,
-        leadName: leadName || undefined,
-        ctaLink: ctaLink || undefined,
-        fileBuffer: attachmentBuffer,
-        attachmentPath,
-        proxyConfig,
-        dolphinProfileId: dolphinProfileId || undefined,
-      },
-      (step, logLine) => {
-        stepSnapshots.push({ ...step });
-        logs.push(logLine);
-      }
-    );
+    const result =
+      await sendSequentialLeadBatchViaWeTransfer(
+        session,
+        sequentialJobs,
+        {
+          fileSource,
+          proxyConfig,
+          dolphinProfileId:
+            dolphinProfileId || undefined,
+        },
+        (step, logLine) => {
+          stepSnapshots.push({ ...step });
+          logs.push(logLine);
+        }
+      );
 
     setWeTransferSessionLocal(campaignId, session);
 
-    const response: WeTransferSendLeadResponse = {
-      success: result.success,
-      confirmationStatus: result.confirmationStatus,
-      leadEmail: result.leadEmail,
-      transferUrl: result.transferUrl ?? null,
-      detail: result.detail ?? null,
-      fileSource,
-      filename,
-      attachmentBytes: attachmentBuffer.length,
-      attachment: attachmentDebug,
-      steps: stepSnapshots,
-      logs,
-      mailboxUsed: session.tempMailbox?.email ?? null,
-      mailboxMessageCount: session.mailboxMessageCount,
-      latestError: session.latestError,
-      error:
-        result.confirmationStatus === 'failed'
-          ? result.detail ?? 'WeTransfer send failed'
-          : undefined,
-    };
+    const successfulResults = result.results.filter(
+      (item) => item.success
+    );
+    const failedResults = result.results.filter(
+      (item) => !item.success
+    );
 
-    return NextResponse.json(response, {
-      status: result.confirmationStatus === 'failed' ? 500 : 200,
-    });
+    for (let index = 0; index < result.results.length; index += 1) {
+      const item = result.results[index];
+
+      logs.push(
+        item.success
+          ? `[Sequential] ${index + 1}/${leadEmails.length} SENT | ${item.recipientEmail} | ${item.filename}`
+          : `[Sequential] ${index + 1}/${leadEmails.length} FAILED | ${item.recipientEmail} | ${item.filename} | ${item.error || 'unknown error'}`
+      );
+    }
+
+    return NextResponse.json(
+      {
+        success:
+          successfulResults.length === leadEmails.length,
+        confirmationStatus:
+          failedResults.length === 0
+            ? 'confirmed'
+            : successfulResults.length > 0
+              ? 'submitted'
+              : 'failed',
+        leadEmail: leadEmails[0],
+        leadEmails,
+        transferUrl:
+          successfulResults[0]?.transferUrl ?? null,
+        detail:
+          `${successfulResults.length}/${leadEmails.length} sequential one-recipient transfer(s) completed`,
+        fileSource,
+        filename:
+          sequentialJobs[0]?.filename || filename,
+        attachmentBytes:
+          sequentialJobs[0]?.fileBuffer.length ||
+          attachmentBuffer.length,
+        attachment: attachmentDebug,
+        steps: stepSnapshots,
+        logs,
+        mailboxUsed:
+          session.tempMailbox?.email ?? null,
+        mailboxMessageCount:
+          session.mailboxMessageCount,
+        latestError:
+          session.latestError,
+        sequentialResults: result.results,
+        sentCount:
+          successfulResults.length,
+        failedCount:
+          failedResults.length,
+        error:
+          failedResults.length > 0
+            ? result.detail ||
+              `${failedResults.length} sequential transfer(s) failed`
+            : undefined,
+      },
+      {
+        status:
+          successfulResults.length > 0 ? 200 : 500,
+      }
+    );
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'WeTransfer send failed unexpectedly';
     session.latestError = message;
