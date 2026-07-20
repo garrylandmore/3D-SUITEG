@@ -255,6 +255,27 @@ export async function POST(request: NextRequest) {
   const campaignId = body.campaignId ? String(body.campaignId).trim() : '';
   const leadEmail = body.leadEmail ? String(body.leadEmail).trim() : '';
   const leadName = body.leadName ? String(body.leadName).trim() : '';
+
+  let leadEmails: string[] = [];
+
+  try {
+    if (body.leadEmails) {
+      const parsed = Array.isArray(body.leadEmails)
+        ? body.leadEmails
+        : JSON.parse(String(body.leadEmails));
+      if (Array.isArray(parsed)) {
+        leadEmails = parsed.map((value) => String(value).trim()).filter(Boolean);
+      }
+    }
+  } catch {
+    leadEmails = [];
+  }
+
+  if (!leadEmails.length && leadEmail) {
+    leadEmails = [leadEmail];
+  }
+
+  leadEmails = Array.from(new Set(leadEmails)).slice(0, 10);
   const fileSource = body.fileSource === 'upload' ? 'upload' : 'generated';
   const ctaLink = body.ctaLink ? String(body.ctaLink).trim() : '';
   const attachmentNameTemplate = body.attachmentNameTemplate
@@ -266,9 +287,9 @@ export async function POST(request: NextRequest) {
     ? String(body.dolphinProfileId).trim()
     : '';
 
-  if (!campaignId || !leadEmail) {
+  if (!campaignId || !leadEmails.length) {
     return NextResponse.json(
-      { error: 'campaignId and leadEmail are required' },
+      { error: 'campaignId and at least one lead email are required' },
       { status: 400 }
     );
   }
@@ -508,7 +529,7 @@ export async function POST(request: NextRequest) {
 
     const result = await sendLeadViaWeTransfer(
       session,
-      leadEmail,
+      leadEmails,
       filename,
       {
         fileSource,
