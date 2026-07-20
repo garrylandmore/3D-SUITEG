@@ -3647,6 +3647,9 @@ function AdobeSenderPanel({
   onToast: (message: string, level?: LogLevel) => void;
 }) {
   const [uploadFile, setUploadFile] = React.useState<File | null>(null);
+  const [attachmentNameTemplate, setAttachmentNameTemplate] = React.useState(
+    '{OriginalName}-{EmailUser}-{Random6}.{Ext}'
+  );
   const [recipientsText, setRecipientsText] = React.useState('');
   const [sending, setSending] = React.useState(false);
   const [lastResult, setLastResult] = React.useState<string | null>(null);
@@ -3693,6 +3696,7 @@ function AdobeSenderPanel({
       const formData = new FormData();
       formData.append('file', uploadFile);
       formData.append('recipients', JSON.stringify(parsedRecipients));
+      formData.append('attachmentNameTemplate', attachmentNameTemplate);
 
       onLog(
         'info',
@@ -3805,6 +3809,32 @@ function AdobeSenderPanel({
             />
           </Field>
 
+
+          <Field label="Attachment name template">
+            <input
+              className="input"
+              value={attachmentNameTemplate}
+              onChange={(event) => setAttachmentNameTemplate(event.target.value)}
+              placeholder="{OriginalName}-{EmailUser}-{Random6}.{Ext}"
+            />
+          </Field>
+
+          <div className="text-xs text-slate-500 leading-5">
+            Each recipient gets a separate Adobe upload with a unique filename.
+            Supported placeholders:
+            {' '}<code>{'{Email}'}</code>,
+            {' '}<code>{'{EmailUser}'}</code>,
+            {' '}<code>{'{Domain}'}</code>,
+            {' '}<code>{'{DomainName}'}</code>,
+            {' '}<code>{'{OriginalName}'}</code>,
+            {' '}<code>{'{Ext}'}</code>,
+            {' '}<code>{'{Date}'}</code>,
+            {' '}<code>{'{Time}'}</code>,
+            {' '}<code>{'{Random6}'}</code>,
+            {' '}<code>{'{Random8}'}</code>,
+            {' '}<code>{'{UUID}'}</code>.
+          </div>
+
           <Field label={`Recipients (${parsedRecipients.length})`}>
             <textarea
               className="input min-h-40"
@@ -3815,8 +3845,8 @@ function AdobeSenderPanel({
           </Field>
 
           <div className="text-xs text-slate-500">
-            Imported lead emails are prefilled automatically. Adobe remains open in the same normal browser session
-            and the sender uses Acrobat's normal browser upload/share interface.
+            Imported lead emails are prefilled automatically. Adobe remains open in the same normal browser session.
+            The PDF is uploaded separately for each recipient using the resolved attachment filename, then shared to that recipient.
           </div>
 
           <button
