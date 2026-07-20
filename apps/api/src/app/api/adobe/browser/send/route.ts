@@ -244,7 +244,7 @@ async function addRecipients(page: any, recipients: string[]): Promise<void> {
   }
 
   async function commitRecipient(email: string): Promise<string> {
-    const escapedEmail = email.replace(/[.*+?^${}()|[\]\]/g, '\$&');
+    const escapedEmail = email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
     // Adobe's autocomplete suggestions can be rendered as role=option,
     // listbox items, menu items, or plain text rows. Prefer clicking the
