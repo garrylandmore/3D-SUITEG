@@ -245,7 +245,7 @@ export async function initWeTransferSession(
     step.detail = detail;
     step.timestamp = nowIso();
     session.updatedAt = nowIso();
-    if (onStep) {
+    if (typeof onStep === 'function') {
       onStep(step, `[${step.label}] ${status}${detail ? ': ' + detail : ''}`);
     }
   }
@@ -408,7 +408,7 @@ export async function sendLeadViaWeTransfer(
     step.detail = detail;
     step.timestamp = nowIso();
     session.updatedAt = nowIso();
-    if (onStep) {
+    if (typeof onStep === 'function') {
       onStep(step, `[${step.label}] ${status}${detail ? ': ' + detail : ''}`);
     }
   }
@@ -624,7 +624,7 @@ export async function sendSequentialLeadBatchViaWeTransfer(
     step.timestamp = nowIso();
     session.updatedAt = nowIso();
 
-    if (onStep) {
+    if (typeof onStep === 'function') {
       onStep(
         step,
         `[${step.label}] ${status}${detail ? ': ' + detail : ''}`
