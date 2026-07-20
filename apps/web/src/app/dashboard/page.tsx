@@ -1149,7 +1149,62 @@ export default function DashboardPage() {
         attachment,
       }));
 
-      const sendPayloadPromise = (async () => {
+      // Every recipient batch gets its own fresh temp-mail mailbox and
+      // therefore its own fresh WeTransfer signup/account session.
+      const tempMailProvider = credentials.wetransfer.tempMailProvider || 'mailslurp';
+      const tempMailApiKey =
+        getSelectedTempMailApiKey(credentials.wetransfer) || '';
+
+      const prepareFreshBatchSession = fetch('/api/wetransfer/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          campaignId,
+          tempMailProvider,
+          tempMailApiKey,
+          forceNewMailbox: true,
+        }),
+      })
+        .then((res) => parseApiJson<WeTransferSessionApiResponse>(res))
+        .then((sessionData) => {
+          if (sessionData.error || sessionData.status === 'failed') {
+            throw new Error(
+              sessionData.error ||
+                'Failed to create fresh WeTransfer mailbox for this batch.'
+            );
+          }
+
+          if (Array.isArray(sessionData.logs)) {
+            sessionData.logs.forEach((line: string) =>
+              appendLog('info', line, 'wetransfer')
+            );
+          }
+
+          setWeTransferSession((prev) => ({
+            ...prev,
+            sessionId: sessionData.sessionId ?? prev.sessionId,
+            status: 'sending',
+            mailbox: sessionData.mailbox?.email ?? null,
+            mailboxMessageCount:
+              sessionData.mailboxMessageCount ?? null,
+            latestError: null,
+            steps:
+              (sessionData.steps as WeTransferStep[]) ??
+              prev.steps,
+          }));
+
+          appendLog(
+            'info',
+            `Fresh WeTransfer account prepared for this batch | mailbox: ${
+              sessionData.mailbox?.email ?? 'unknown'
+            } | recipients: ${leadEmails.length}`,
+            'wetransfer'
+          );
+
+          return sessionData;
+        });
+
+      const sendPayloadPromise = prepareFreshBatchSession.then(async () => {
         if (wtConfig.fileSource === 'upload') {
           const uploadFile = wetransferUploadFile;
           if (!uploadFile) {
@@ -1198,7 +1253,7 @@ export default function DashboardPage() {
             dolphinProfileId: selectedDolphinProfileId || undefined,
           }),
         };
-      })();
+      });
 
       sendPayloadPromise
         .then((requestInit) =>
@@ -1272,8 +1327,25 @@ export default function DashboardPage() {
               : `WeTransfer batch failed (${leadEmails.length} recipients): ${leadEmails.join(', ')}${failureDetail ? ` — ${failureDetail}` : ''}`,
             sender
           );
-          const delayMs = Math.max(300, senderConfigsRef.current[sender].rateLimitDelay * 1000);
-          timerRef.current = setTimeout(() => processNextLead(sender), delayMs);
+          // Dolphin may return HTTP 200 from /stop slightly before the profile is
+          // fully released by the local synchronizer. Give it a settling window
+          // before creating the next account/batch.
+          const configuredDelayMs =
+            senderConfigsRef.current[sender].rateLimitDelay * 1000;
+          const delayMs = Math.max(3500, configuredDelayMs);
+
+          appendLog(
+            'info',
+            `Batch complete. Waiting ${Math.round(
+              delayMs / 1000
+            )}s for Dolphin to fully stop before preparing the next WeTransfer account.`,
+            'wetransfer'
+          );
+
+          timerRef.current = setTimeout(
+            () => processNextLead(sender),
+            delayMs
+          );
         })
         .catch((err: Error) => {
           appendLog('error', `WeTransfer browser send error: ${err.message}`, 'wetransfer');
@@ -1491,62 +1563,25 @@ export default function DashboardPage() {
         'wetransfer'
       );
 
-      const campaignId = wtCampaignId.current;
-      fetch('/api/wetransfer/session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          campaignId,
-          tempMailProvider,
-          tempMailApiKey: apiKey,
-        }),
-      })
-        .then((res) => parseApiJson<WeTransferSessionApiResponse>(res))
-        .then((data) => {
-          setIsPreparing(false);
-          if (data.error || data.status === 'failed') {
-            const msg = data.error || 'WeTransfer session initialisation failed';
-            appendLog('error', msg, 'wetransfer');
-            addToast(msg, 'error');
-            setWeTransferSession((prev) => ({ ...prev, status: 'failed', latestError: msg }));
-            return;
-          }
-          // Log each step line from the init
-          if (Array.isArray(data.logs)) {
-            data.logs.forEach((line: string) => appendLog('info', line, 'wetransfer'));
-          }
-          setWeTransferSession({
-            sessionId: data.sessionId ?? null,
-            status: (data.status as WeTransferSessionState['status']) ?? 'ready',
-            mailbox: data.mailbox?.email ?? null,
-            mailboxMessageCount: data.mailboxMessageCount ?? null,
-            latestError: data.latestError ?? null,
-            attachment,
-            steps: (data.steps as WeTransferStep[]) ?? [],
-          });
-          appendLog(
-            'info',
-            `WeTransfer session prepared | mailbox: ${data.mailbox?.email ?? 'unknown'} | inbox messages: ${data.mailboxMessageCount ?? 'unknown'}`,
-            'wetransfer'
-          );
-          addToast(`Temp mailbox: ${data.mailbox?.email ?? '?'}`, 'success');
+      // Do not create one mailbox for the entire campaign.
+      // processNextLead('wetransfer') creates a fresh mailbox/session for every
+      // recipient batch (maximum 10 recipients per WeTransfer account).
+      setIsPreparing(false);
+      setRunState('running');
+      stopRequestedRef.current = false;
+      setWeTransferSession((prev) => ({
+        ...prev,
+        status: 'sending',
+        latestError: null,
+      }));
 
-          setRunState('running');
-          stopRequestedRef.current = false;
-          setWeTransferSession((prev) => ({ ...prev, status: 'sending' }));
-          appendLog(
-            'info',
-            `WeTransfer run started (${pendingForSender.length} pending). Real upload/send attempts will be executed and only confirmed sends are marked successful.`,
-            'wetransfer'
-          );
-          processNextLead('wetransfer');
-        })
-        .catch((err: Error) => {
-          setIsPreparing(false);
-          appendLog('error', `Failed to init WeTransfer session: ${err.message}`, 'wetransfer');
-          addToast('WeTransfer init failed', 'error');
-          setWeTransferSession((prev) => ({ ...prev, status: 'failed', latestError: err.message }));
-        });
+      appendLog(
+        'info',
+        `WeTransfer run started (${pendingForSender.length} pending). Each batch of up to 10 recipients will use a fresh temp-mail account and a fresh WeTransfer signup.`,
+        'wetransfer'
+      );
+
+      processNextLead('wetransfer');
       return;
     }
 
