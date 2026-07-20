@@ -1,15 +1,14 @@
 import {
-  createUnifiedTempMailbox,
-  getUnifiedTempMessage,
-  listUnifiedTempMessages,
-  normalizeTempMailProvider,
-  tempMailProviderLabel,
-  TempMailProvider,
-  UnifiedTempMailbox,
-  UnifiedTempMessage,
-} from './temp-mail-provider';
+  createMailSlurpMailbox,
+  getMailSlurpMessage,
+  listMailSlurpMessages,
+  MailSlurpMailbox,
+  MailSlurpMessage,
+} from './mailslurp';
 import {
   createWeTransferTransfer,
+  createWeTransferSequentialTransfers,
+  WeTransferSequentialJob,
   probeWeTransferWebsite,
   WeTransferSendPhase,
 } from './wetransfer';
@@ -45,7 +44,7 @@ export type WeTransferExecutionStep = {
 export type WeTransferSession = {
   id: string;
   campaignId: string;
-  tempMailbox: UnifiedTempMailbox | null;
+  tempMailbox: MailSlurpMailbox | null;
   mailboxMessageCount: number | null;
   latestError: string | null;
   steps: WeTransferExecutionStep[];
@@ -73,7 +72,7 @@ export type WeTransferSendResult = {
 const SETUP_STEP_DEFS: Array<{ id: string; label: string }> = [
   {
     id: 'create_mailbox',
-    label: 'Create temp mailbox',
+    label: 'Create temp mailbox (MailSlurp)',
   },
   {
     id: 'open_wetransfer',
@@ -139,7 +138,7 @@ function extractVerificationCode(messageText: string): string | null {
   return standaloneCode?.[1]?.toUpperCase() ?? null;
 }
 
-function messageMayBeWeTransferVerification(message: UnifiedTempMessage): boolean {
+function messageMayBeWeTransferVerification(message: MailSlurpMessage): boolean {
   const subject = (message.subject || '').toLowerCase();
   const from = (message.from || '').toLowerCase();
   const body = `${message.body_text || ''}\n${message.body_html || ''}`.toLowerCase();
@@ -153,22 +152,22 @@ function messageMayBeWeTransferVerification(message: UnifiedTempMessage): boolea
 }
 
 async function enrichMessageIfNeeded(
-  mailbox: UnifiedTempMailbox,
-  message: UnifiedTempMessage
-): Promise<UnifiedTempMessage> {
+  mailbox: MailSlurpMailbox,
+  message: MailSlurpMessage
+): Promise<MailSlurpMessage> {
   if ((message.body_text || message.body_html || '').trim()) {
     return message;
   }
 
   try {
-    return await getUnifiedTempMessage(mailbox, message.id);
+    return await getMailSlurpMessage(mailbox, message.id);
   } catch {
     return message;
   }
 }
 
 async function pollForVerificationEmail(
-  mailbox: UnifiedTempMailbox,
+  mailbox: MailSlurpMailbox,
   onProgress: (
     attempt: number,
     messageCount: number,
@@ -191,7 +190,7 @@ async function pollForVerificationEmail(
   let attempt = 0;
   while (maxAttempts <= 0 || attempt < maxAttempts) {
     attempt += 1;
-    const messages = await listUnifiedTempMessages(mailbox);
+    const messages = await listMailSlurpMessages(mailbox);
     latestCount = messages.length;
     onProgress(attempt, latestCount, delayMs);
 
@@ -223,7 +222,6 @@ async function pollForVerificationEmail(
 
 export async function initWeTransferSession(
   campaignId: string,
-  tempMailProvider: TempMailProvider,
   tempMailApiKey?: string,
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void,
   proxyConfig?: BrowserProxyConfig | null
@@ -252,34 +250,13 @@ export async function initWeTransferSession(
     }
   }
 
-  const normalizedProvider = normalizeTempMailProvider(tempMailProvider);
-
-  stepUpdate(
-    'create_mailbox',
-    'running',
-    `Provider: ${tempMailProviderLabel(normalizedProvider)}`
-  );
-
+  stepUpdate('create_mailbox', 'running');
   try {
-    const fallbackKey =
-      normalizedProvider === 'mailslurp'
-        ? process.env.MAILSLURP_API_KEY || ''
-        : process.env.TEMP_MAIL_IO_API_KEY || '';
-
-    const providerApiKey = (tempMailApiKey || fallbackKey).trim();
-    const mailbox = await createUnifiedTempMailbox(
-      normalizedProvider,
-      providerApiKey
-    );
-
+    const mailSlurpApiKey = (tempMailApiKey || process.env.MAILSLURP_API_KEY || '').trim();
+    const mailbox = await createMailSlurpMailbox(mailSlurpApiKey);
     session.tempMailbox = mailbox;
     session.latestError = null;
-
-    stepUpdate(
-      'create_mailbox',
-      'success',
-      `Mailbox: ${mailbox.email} | provider=${normalizedProvider}`
-    );
+    stepUpdate('create_mailbox', 'success', `Mailbox: ${mailbox.email} | provider=mailslurp`);
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
     stepUpdate('create_mailbox', 'failed', msg);
@@ -336,8 +313,8 @@ export async function initWeTransferSession(
     );
   }
 
-  stepUpdate('create_account', 'success', `Browser transport mode is active. Sender email will use ${tempMailProviderLabel(normalizedProvider)} inbox.`);
-  stepUpdate('verify_email', 'success', `${tempMailProviderLabel(normalizedProvider)} verification mailbox is ready and will be polled during signup flow.`);
+  stepUpdate('create_account', 'success', 'Browser transport mode is active. Sender email will use MailSlurp inbox.');
+  stepUpdate('verify_email', 'success', 'Verification mailbox is ready and will be polled during signup flow.');
 
   session.status = 'ready';
   return session;
@@ -575,5 +552,269 @@ export async function sendLeadViaWeTransfer(
       ? `Confirmed WeTransfer send for ${leadEmail}: ${transferUrl}`
       : `Confirmed WeTransfer send for ${leadEmail}`,
     confirmationStatus: 'confirmed',
+  };
+}
+
+
+export async function sendSequentialLeadBatchViaWeTransfer(
+  session: WeTransferSession,
+  jobs: Array<{
+    recipientEmail: string;
+    filename: string;
+    fileBuffer: Buffer;
+    attachmentPath: string;
+    leadName?: string;
+    ctaLink?: string;
+  }>,
+  options?: {
+    fileSource?: 'upload' | 'generated';
+    proxyConfig?: BrowserProxyConfig | null;
+    dolphinProfileId?: string;
+  },
+  onStep?: (step: WeTransferExecutionStep, logLine: string) => void
+): Promise<{
+  success: boolean;
+  results: Array<{
+    recipientEmail: string;
+    filename: string;
+    success: boolean;
+    transferUrl?: string;
+    error?: string;
+  }>;
+  detail?: string;
+}> {
+  const normalizedJobs = jobs
+    .map((job) => ({
+      ...job,
+      recipientEmail: job.recipientEmail.trim(),
+    }))
+    .filter((job) => job.recipientEmail)
+    .slice(0, 10);
+
+  if (!normalizedJobs.length) {
+    return {
+      success: false,
+      results: [],
+      detail: 'At least one recipient job is required',
+    };
+  }
+
+  if (!session.tempMailbox) {
+    return {
+      success: false,
+      results: [],
+      detail:
+        'No temp mailbox in session – session may have failed during init',
+    };
+  }
+
+  session.status = 'sending';
+  session.updatedAt = nowIso();
+
+  function stepUpdate(
+    stepId: string,
+    status: WeTransferStepStatus,
+    detail?: string
+  ): void {
+    const step = session.steps.find((s) => s.id === stepId);
+    if (!step) return;
+
+    step.status = status;
+    step.detail = detail;
+    step.timestamp = nowIso();
+    session.updatedAt = nowIso();
+
+    if (onStep) {
+      onStep(
+        step,
+        `[${step.label}] ${status}${detail ? ': ' + detail : ''}`
+      );
+    }
+  }
+
+  stepUpdate(
+    'send_to_lead',
+    'running',
+    `Starting ${normalizedJobs.length} sequential one-recipient transfer(s) using one WeTransfer account`
+  );
+
+  const mailboxEmail = session.tempMailbox.email;
+
+  const browserJobs: WeTransferSequentialJob[] = normalizedJobs.map(
+    (job) => ({
+      recipientEmail: job.recipientEmail,
+      filename: job.filename,
+      fileBuffer: job.fileBuffer,
+      attachmentPath: job.attachmentPath,
+      message: job.ctaLink?.trim()
+        ? `Secure link for ${job.leadName || job.recipientEmail}: ${job.ctaLink}`
+        : `Secure file package for ${job.leadName || job.recipientEmail}`,
+    })
+  );
+
+  const result = await createWeTransferSequentialTransfers(
+    browserJobs,
+    (phaseUpdate) => {
+      const phase = phaseUpdate.phase as WeTransferSendPhase;
+
+      if (phase === 'opening_browser') {
+        stepUpdate(
+          'open_wetransfer',
+          'opening_browser',
+          phaseUpdate.detail
+        );
+      } else if (
+        phase === 'loading_wetransfer' ||
+        phase === 'navigating_to_login'
+      ) {
+        stepUpdate(
+          'open_wetransfer',
+          'loading_wetransfer',
+          phaseUpdate.detail
+        );
+      } else if (
+        phase === 'signup_clicked' ||
+        phase === 'sender_email_entered'
+      ) {
+        stepUpdate(
+          'create_account',
+          'running',
+          phaseUpdate.detail
+        );
+      } else if (
+        phase === 'verification_code_requested' ||
+        phase === 'awaiting_sender_verification'
+      ) {
+        stepUpdate(
+          'verify_email',
+          'waiting_for_verification',
+          phaseUpdate.detail
+        );
+      } else if (
+        phase === 'verification_received' ||
+        phase === 'verification_submitted'
+      ) {
+        stepUpdate(
+          'verify_email',
+          'verification_received',
+          phaseUpdate.detail
+        );
+      } else if (phase === 'terms_accepted') {
+        stepUpdate(
+          'create_account',
+          'success',
+          phaseUpdate.detail
+        );
+      } else if (phase === 'uploader_visible') {
+        stepUpdate(
+          'open_wetransfer',
+          'success',
+          phaseUpdate.detail
+        );
+      } else if (phase === 'preparing_attachment') {
+        stepUpdate(
+          'upload_file',
+          'preparing_attachment',
+          phaseUpdate.detail
+        );
+      } else if (phase === 'upload_started') {
+        stepUpdate(
+          'upload_file',
+          'upload_started',
+          phaseUpdate.detail
+        );
+      } else if (phase === 'upload_completed') {
+        stepUpdate(
+          'upload_file',
+          'upload_completed',
+          phaseUpdate.detail
+        );
+      } else if (phase === 'send_submitted') {
+        stepUpdate(
+          'send_to_lead',
+          'send_submitted',
+          phaseUpdate.detail
+        );
+      } else if (phase === 'send_confirmed') {
+        stepUpdate(
+          'send_to_lead',
+          'send_confirmed',
+          phaseUpdate.detail
+        );
+      } else if (phase === 'failed') {
+        stepUpdate(
+          'send_to_lead',
+          'failed',
+          phaseUpdate.detail
+        );
+      }
+    },
+    {
+      senderEmail: mailboxEmail,
+      proxyConfig: options?.proxyConfig,
+      dolphinProfileId: options?.dolphinProfileId,
+      onVerificationRequired: async () => {
+        const verificationResult = await pollForVerificationEmail(
+          session.tempMailbox!,
+          (attempt, messageCount, delayMs) => {
+            session.mailboxMessageCount = messageCount;
+
+            stepUpdate(
+              'verify_email',
+              'waiting_for_verification',
+              `polling_for_code | attempt ${attempt} | mailbox=${mailboxEmail} | ` +
+                `${messageCount} message(s) | checking again in ${Math.round(
+                  delayMs / 1000
+                )}s`
+            );
+          }
+        );
+
+        session.mailboxMessageCount =
+          verificationResult.messageCount;
+
+        if (!verificationResult.found) {
+          return {
+            mailboxMessageCount:
+              verificationResult.messageCount,
+            detail:
+              'verification_failed | No WeTransfer verification email received',
+          };
+        }
+
+        return {
+          verificationLink:
+            verificationResult.verificationLink,
+          verificationCode:
+            verificationResult.verificationCode,
+          mailboxMessageCount:
+            verificationResult.messageCount,
+          detail:
+            `verification_received | ${
+              verificationResult.subject ||
+              'WeTransfer verification message detected'
+            }`,
+        };
+      },
+    }
+  );
+
+  session.status = 'ready';
+  session.latestError = result.success
+    ? null
+    : result.error || 'One or more sequential transfers failed';
+
+  const mappedResults = result.results.map((item) => ({
+    recipientEmail: item.recipientEmail,
+    filename: item.filename,
+    success: item.success,
+    transferUrl: item.downloadUrl,
+    error: item.error,
+  }));
+
+  return {
+    success: result.success,
+    results: mappedResults,
+    detail: result.error,
   };
 }
