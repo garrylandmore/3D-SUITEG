@@ -18,8 +18,8 @@ export function isDolphinEnabled(): boolean {
   return (process.env.DOLPHIN_ENABLED || 'false').trim().toLowerCase() === 'true';
 }
 
-function getProfileId(): number {
-  const raw = (process.env.DOLPHIN_PROFILE_ID || '').trim();
+function getProfileId(profileIdOverride?: string | number): number {
+  const raw = String(profileIdOverride ?? process.env.DOLPHIN_PROFILE_ID ?? '').trim();
   const id = Number(raw);
   if (!raw || !Number.isInteger(id) || id <= 0) {
     throw new Error('DOLPHIN_PROFILE_ID must be set to a valid positive browser profile ID');
@@ -94,8 +94,10 @@ async function connectToEndpoint(
   return { browser, profileId, endpoint };
 }
 
-export async function launchDolphinBrowser(): Promise<DolphinLaunchResult> {
-  const profileId = getProfileId();
+export async function launchDolphinBrowser(
+  profileIdOverride?: string | number
+): Promise<DolphinLaunchResult> {
+  const profileId = getProfileId(profileIdOverride);
 
   if (
     cachedBrowser &&
@@ -175,6 +177,59 @@ export async function launchDolphinBrowser(): Promise<DolphinLaunchResult> {
   console.log(`DOLPHIN | automation endpoint=${endpoint}`);
 
   return connectToEndpoint(profileId, endpoint);
+}
+
+
+
+export async function clearDolphinBrowserSession(browser: Browser): Promise<void> {
+  try {
+    const contexts = browser.contexts();
+
+    for (const context of contexts) {
+      await context.clearCookies().catch(() => undefined);
+
+      for (const page of context.pages()) {
+        await page
+          .evaluate(async () => {
+            try {
+              window.localStorage.clear();
+            } catch {}
+
+            try {
+              window.sessionStorage.clear();
+            } catch {}
+
+            try {
+              if ('caches' in window) {
+                const cacheKeys = await caches.keys();
+                await Promise.all(cacheKeys.map((key) => caches.delete(key)));
+              }
+            } catch {}
+
+            try {
+              if (window.indexedDB && indexedDB.databases) {
+                const databases = await indexedDB.databases();
+                for (const database of databases) {
+                  if (database.name) {
+                    indexedDB.deleteDatabase(database.name);
+                  }
+                }
+              }
+            } catch {}
+          })
+          .catch(() => undefined);
+      }
+    }
+
+    console.log(
+      `DOLPHIN | cleared cookies and browser storage for ${contexts.length} context(s)`
+    );
+  } catch (error) {
+    console.error(
+      'DOLPHIN | failed to clear browser session data |',
+      error instanceof Error ? error.message : String(error)
+    );
+  }
 }
 
 export async function stopDolphinProfile(profileId: number): Promise<void> {
