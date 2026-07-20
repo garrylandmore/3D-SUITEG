@@ -74,6 +74,7 @@ type SenderConfig = {
   fileSource: 'upload' | 'generate';
   attachmentNameTemplate: string;
   convertHtmlToPdf: boolean;
+  replaceBatchPlaceholdersInPdf: boolean;
   dolphinProfileIds: string[];
   randomizeDolphinProfiles: boolean;
   orientation: 'landscape' | 'portrait';
@@ -416,6 +417,7 @@ function createDefaultSenderConfig(): SenderConfig {
     fileSource: 'upload',
     attachmentNameTemplate: '{OriginalFile}',
     convertHtmlToPdf: false,
+    replaceBatchPlaceholdersInPdf: false,
     dolphinProfileIds: [],
     randomizeDolphinProfiles: false,
     orientation: 'landscape',
@@ -469,6 +471,7 @@ function normalizeSenderConfig(value: unknown): SenderConfig {
     fileSource: config.fileSource === 'generate' ? 'generate' : 'upload',
     attachmentNameTemplate: normalizeString(config.attachmentNameTemplate, defaults.attachmentNameTemplate),
     convertHtmlToPdf: Boolean(config.convertHtmlToPdf),
+    replaceBatchPlaceholdersInPdf: Boolean(config.replaceBatchPlaceholdersInPdf),
     dolphinProfileIds: Array.isArray(config.dolphinProfileIds)
       ? config.dolphinProfileIds.map((item) => String(item).trim()).filter(Boolean)
       : defaults.dolphinProfileIds,
@@ -1151,6 +1154,10 @@ export default function DashboardPage() {
           formData.append('uploadedFileName', uploadFile.name);
           formData.append('attachmentNameTemplate', wtConfig.attachmentNameTemplate || '{OriginalFile}');
           formData.append('convertHtmlToPdf', wtConfig.convertHtmlToPdf ? 'true' : 'false');
+          formData.append(
+            'replaceBatchPlaceholdersInPdf',
+            wtConfig.replaceBatchPlaceholdersInPdf ? 'true' : 'false'
+          );
           if (selectedDolphinProfileId) {
             formData.append('dolphinProfileId', selectedDolphinProfileId);
           }
@@ -1174,6 +1181,7 @@ export default function DashboardPage() {
             generatedSubtitle: wtConfig.generatedSubtitle,
             generatedBodyText: wtConfig.generatedBodyText,
             generatedLayout: wtConfig.generatedLayout,
+            replaceBatchPlaceholdersInPdf: wtConfig.replaceBatchPlaceholdersInPdf,
             dolphinProfileId: selectedDolphinProfileId || undefined,
           }),
         };
@@ -2292,6 +2300,45 @@ export default function DashboardPage() {
                           Double braces such as <code>{'{{Email}}'}</code> also work.
                         </div>
                       </div>
+
+                      <div className="rounded-lg border border-slate-200 bg-white p-3 space-y-2">
+                        <label className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+                          <input
+                            type="checkbox"
+                            checked={activeConfig.replaceBatchPlaceholdersInPdf}
+                            onChange={(event) =>
+                              setSenderConfigs((prev) => ({
+                                ...prev,
+                                wetransfer: {
+                                  ...prev.wetransfer,
+                                  replaceBatchPlaceholdersInPdf: event.target.checked,
+                                },
+                              }))
+                            }
+                          />
+                          Replace batch placeholders in uploaded PDF form fields
+                        </label>
+
+                        <div className="text-[11px] leading-5 text-slate-500">
+                          Generates one shared set of values for the whole recipient batch (up to 10 recipients).
+                          Supported placeholders:
+                          {' '}<code>{'{Date}'}</code>,
+                          {' '}<code>{'{Time}'}</code>,
+                          {' '}<code>{'{DateTime}'}</code>,
+                          {' '}<code>{'{Reference}'}</code>,
+                          {' '}<code>{'{Random6}'}</code>,
+                          {' '}<code>{'{Random8}'}</code>,
+                          {' '}<code>{'{UUID}'}</code>,
+                          {' '}<code>{'{BatchId}'}</code>.
+                        </div>
+
+                        <div className="text-[11px] leading-5 text-amber-700">
+                          For uploaded PDFs, reliable replacement works with PDF text/form fields whose field name
+                          or current value is one of these placeholders. Ordinary text already baked into a PDF page
+                          is left unchanged. HTML-to-PDF and attachment filenames support direct placeholder replacement.
+                        </div>
+                      </div>
+
                     </div>
                   )}
                   {activeConfig.fileSource === 'generate' && (
