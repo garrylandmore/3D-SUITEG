@@ -273,7 +273,7 @@ function getWeTransferAttachmentDebug(
         mimeType: null,
         sizeBytes: null,
         readiness: 'missing',
-        detail: 'Upload mode is selected but no file is attached. Re-select the document before sending.',
+        detail: 'Upload attachment mode is selected but no file is attached. Choose an attachment before sending.',
       };
     }
 
@@ -285,7 +285,7 @@ function getWeTransferAttachmentDebug(
       readiness: uploadFile.size > 0 ? 'ready' : 'missing',
       detail:
         uploadFile.size > 0
-          ? 'Uploaded file is ready to be reused for each lead.'
+          ? 'Selected attachment is ready and will be uploaded to WeTransfer for each lead.'
           : 'Uploaded file is empty and cannot be sent.',
     };
   }
@@ -386,7 +386,7 @@ function createDefaultSenderConfig(): SenderConfig {
   return {
     connected: true,
     fileType: 'PDF',
-    fileSource: 'generate',
+    fileSource: 'upload',
     orientation: 'landscape',
     design: 'Modern',
     generatedLayout: 'classic',
@@ -435,7 +435,7 @@ function normalizeSenderConfig(value: unknown): SenderConfig {
     ...defaults,
     connected: typeof config.connected === 'boolean' ? config.connected : defaults.connected,
     fileType: normalizeString(config.fileType, defaults.fileType),
-    fileSource: config.fileSource === 'upload' ? 'upload' : 'generate',
+    fileSource: config.fileSource === 'generate' ? 'generate' : 'upload',
     orientation: config.orientation === 'portrait' ? 'portrait' : 'landscape',
     design: normalizeString(config.design, defaults.design),
     generatedLayout: config.generatedLayout === 'highlight' ? 'highlight' : 'classic',
@@ -1451,7 +1451,7 @@ export default function DashboardPage() {
                           }))
                         }
                       >
-                        <option value="upload">Upload PDF / document</option>
+                        <option value="upload">Upload attachment</option>
                         <option value="generate">Generate PDF in app</option>
                       </select>
                     </Field>
@@ -1528,20 +1528,77 @@ export default function DashboardPage() {
                     </Field>
                   </div>
                   {activeConfig.fileSource === 'upload' && (
-                    <div className="mt-3 space-y-2">
-                      <label className="inline-flex items-center gap-2 text-xs cursor-pointer text-[#6C63FF]">
-                        <Upload className="w-3 h-3" /> Select PDF/document
-                        <input
-                          type="file"
-                          className="hidden"
-                          accept=".pdf,.doc,.docx,.ppt,.pptx,.zip"
-                          onChange={(event) => setWetransferUploadFile(event.target.files?.[0] || null)}
-                        />
-                      </label>
-                      <div className="text-xs text-slate-600">
-                        {wetransferUploadFile
-                          ? `Attached: ${wetransferUploadFile.name} (${formatBytes(wetransferUploadFile.size)})`
-                          : 'No file selected yet'}
+                    <div className="mt-3 space-y-3 rounded-lg border border-dashed border-slate-300 bg-slate-50 p-3">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-800">WeTransfer attachment</div>
+                        <div className="text-xs text-slate-500 mt-1">
+                          Select the exact file to upload to WeTransfer. The same selected attachment is reused for each lead in this run.
+                          PDF, HTML, ZIP, SVG, Office documents, images, text files, and other file types are supported.
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <label className="inline-flex items-center gap-2 px-3 py-2 rounded bg-[#6C63FF] text-white text-xs font-semibold cursor-pointer">
+                          <Upload className="w-4 h-4" />
+                          Choose attachment
+                          <input
+                            type="file"
+                            className="hidden"
+                            onChange={(event) => {
+                              const file = event.target.files?.[0] || null;
+                              setWetransferUploadFile(file);
+
+                              if (file) {
+                                setSenderConfigs((prev) => ({
+                                  ...prev,
+                                  wetransfer: {
+                                    ...prev.wetransfer,
+                                    fileSource: 'upload',
+                                    fileType:
+                                      file.name.includes('.')
+                                        ? file.name.split('.').pop()?.toUpperCase() || prev.wetransfer.fileType
+                                        : prev.wetransfer.fileType,
+                                  },
+                                }));
+
+                                appendLog(
+                                  'success',
+                                  `WeTransfer attachment selected: ${file.name} (${formatBytes(file.size)})`,
+                                  'wetransfer'
+                                );
+                              }
+                            }}
+                          />
+                        </label>
+
+                        {wetransferUploadFile && (
+                          <button
+                            type="button"
+                            className="px-3 py-2 rounded border border-slate-300 bg-white text-xs text-slate-700"
+                            onClick={() => {
+                              setWetransferUploadFile(null);
+                              appendLog('warning', 'WeTransfer attachment cleared', 'wetransfer');
+                            }}
+                          >
+                            Clear attachment
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="text-xs">
+                        {wetransferUploadFile ? (
+                          <div className="rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-emerald-800">
+                            <div className="font-semibold">Ready to upload</div>
+                            <div className="mt-1 break-all">{wetransferUploadFile.name}</div>
+                            <div className="mt-1 text-emerald-700">
+                              {formatBytes(wetransferUploadFile.size)} · {wetransferUploadFile.type || 'application/octet-stream'}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-amber-800">
+                            No attachment selected. Choose a file before starting the WeTransfer run.
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
