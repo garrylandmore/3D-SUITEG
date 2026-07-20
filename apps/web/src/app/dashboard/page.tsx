@@ -3710,23 +3710,65 @@ function AdobeSenderPanel({
 
       const data = await parseApiJson<{
         success?: boolean;
+        partial?: boolean;
         message?: string;
-        recipients?: string[];
+        totalCount?: number;
+        processedCount?: number;
+        sentCount?: number;
+        failedCount?: number;
         currentUrl?: string;
         error?: string;
+        results?: Array<{
+          index: number;
+          total: number;
+          recipient: string;
+          filename: string;
+          success: boolean;
+          message: string;
+          errorCode?: string;
+          error?: string;
+        }>;
       }>(response);
 
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || `Adobe share failed (HTTP ${response.status})`);
+      if (!response.ok) {
+        throw new Error(
+          data.error || `Adobe share failed (HTTP ${response.status})`
+        );
       }
 
-      const message =
-        data.message ||
-        `Adobe share submitted for ${data.recipients?.length || parsedRecipients.length} recipient(s)`;
+      const results = data.results || [];
 
-      setLastResult(message);
-      onLog('info', message);
-      onToast('Adobe share submitted', 'success');
+      for (const result of results) {
+        if (result.success) {
+          onLog(
+            'success',
+            `${result.index}/${result.total} ✅ SENT — ${result.recipient} — ${result.filename}`
+          );
+        } else {
+          onLog(
+            'error',
+            `${result.index}/${result.total} ❌ FAILED — ${result.recipient} — ${result.errorCode || 'ADOBE_SHARE_FAILED'} — ${result.error || result.message}`
+          );
+        }
+      }
+
+      const total = data.totalCount ?? parsedRecipients.length;
+      const sent = data.sentCount ?? results.filter((item) => item.success).length;
+      const failed =
+        data.failedCount ?? results.filter((item) => !item.success).length;
+      const processed = data.processedCount ?? results.length;
+
+      const summary =
+        `Adobe complete — ${sent} sent, ${failed} failed, ${processed}/${total} processed`;
+
+      setLastResult(summary);
+      onLog(failed > 0 ? 'warning' : 'success', summary);
+
+      if (failed > 0) {
+        onToast(summary, 'warning');
+      } else {
+        onToast('Adobe sharing completed successfully', 'success');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setLastResult(message);
