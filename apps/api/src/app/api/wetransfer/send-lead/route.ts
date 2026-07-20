@@ -6,13 +6,101 @@ import {
   sendLeadViaWeTransfer,
   WeTransferExecutionStep,
 } from '@/lib/wetransfer-engine';
-import { generateWeTransferBusinessPdf } from '@/lib/pdf';
 import {
   getWeTransferSessionLocal,
   setWeTransferSessionLocal,
   getBrowserProxyConfigLocal,
 } from '@/lib/local-store';
 import { getBrowserProxyDiagnostics } from '@/lib/browser-proxy';
+
+
+function splitOriginalFilename(filename: string): {
+  originalFile: string;
+  originalName: string;
+  ext: string;
+} {
+  const clean = filename.trim() || 'attachment';
+  const lastDot = clean.lastIndexOf('.');
+
+  if (lastDot <= 0 || lastDot === clean.length - 1) {
+    return {
+      originalFile: clean,
+      originalName: clean,
+      ext: '',
+    };
+  }
+
+  return {
+    originalFile: clean,
+    originalName: clean.slice(0, lastDot),
+    ext: clean.slice(lastDot + 1),
+  };
+}
+
+function resolveAttachmentNameTemplate(
+  template: string,
+  originalFilename: string,
+  leadEmail: string,
+  leadName: string
+): string {
+  const normalizedEmail = leadEmail.trim();
+  const atIndex = normalizedEmail.lastIndexOf('@');
+  const localPart = atIndex >= 0 ? normalizedEmail.slice(0, atIndex) : normalizedEmail;
+  const domain = atIndex >= 0 ? normalizedEmail.slice(atIndex + 1) : '';
+  const domainParts = domain.split('.').filter(Boolean);
+  const domainName = domainParts[0] || domain;
+  const tld = domainParts.length > 1 ? domainParts[domainParts.length - 1] : '';
+
+  const {
+    originalFile,
+    originalName,
+    ext,
+  } = splitOriginalFilename(originalFilename);
+
+  const replacements: Record<string, string> = {
+    Email: normalizedEmail,
+    email: normalizedEmail,
+    LocalPart: localPart,
+    localpart: localPart,
+    Domain: domain,
+    domain,
+    DomainName: domainName,
+    domainname: domainName,
+    TLD: tld,
+    tld,
+    Name: leadName.trim(),
+    name: leadName.trim(),
+    OriginalName: originalName,
+    originalname: originalName,
+    OriginalFile: originalFile,
+    originalfile: originalFile,
+    Ext: ext,
+    ext,
+  };
+
+  let resolved = (template || '{OriginalFile}').replace(
+    /\{([A-Za-z]+)\}/g,
+    (match, key: string) =>
+      Object.prototype.hasOwnProperty.call(replacements, key)
+        ? replacements[key]
+        : match
+  );
+
+  // If the user omitted an extension entirely, preserve the uploaded file extension.
+  if (ext && !/\.[A-Za-z0-9]{1,10}$/.test(resolved)) {
+    resolved = `${resolved}.${ext}`;
+  }
+
+  // Keep useful filename characters, including spaces and @, while removing
+  // characters that are invalid on Windows or unsafe as path separators.
+  resolved = resolved
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/g, '');
+
+  return resolved || originalFile || 'attachment';
+}
 
 type AttachmentDebugPayload = {
   name: string;
@@ -78,6 +166,9 @@ export async function POST(request: NextRequest) {
   const leadName = body.leadName ? String(body.leadName).trim() : '';
   const fileSource = body.fileSource === 'upload' ? 'upload' : 'generated';
   const ctaLink = body.ctaLink ? String(body.ctaLink).trim() : '';
+  const attachmentNameTemplate = body.attachmentNameTemplate
+    ? String(body.attachmentNameTemplate).trim()
+    : '{OriginalFile}';
 
   if (!campaignId || !leadEmail) {
     return NextResponse.json(
@@ -124,7 +215,13 @@ export async function POST(request: NextRequest) {
 
       if (uploadedFile) {
         attachmentBuffer = Buffer.from(await uploadedFile.arrayBuffer());
-        filename = uploadedFile.name || uploadedName || 'uploaded-document.pdf';
+        const originalFilename = uploadedFile.name || uploadedName || 'uploaded-document.pdf';
+        filename = resolveAttachmentNameTemplate(
+          attachmentNameTemplate,
+          originalFilename,
+          leadEmail,
+          leadName
+        );
         attachmentDebug = {
           name: filename,
           source: 'uploaded',
@@ -145,7 +242,13 @@ export async function POST(request: NextRequest) {
         }
 
         attachmentBuffer = Buffer.from(uploadedBase64, 'base64');
-        filename = uploadedName || 'uploaded-document.pdf';
+        const originalFilename = uploadedName || 'uploaded-document.pdf';
+        filename = resolveAttachmentNameTemplate(
+          attachmentNameTemplate,
+          originalFilename,
+          leadEmail,
+          leadName
+        );
         attachmentDebug = {
           name: filename,
           source: 'uploaded',
@@ -163,26 +266,35 @@ export async function POST(request: NextRequest) {
       }
 
       logs.push(
-        `[Attachment] READY: ${filename} | source=uploaded | size=${attachmentBuffer.length} bytes | mime=${attachmentDebug.mimeType ?? 'unknown'}`
+        `[Attachment] READY: ${filename} | source=uploaded | template=${attachmentNameTemplate} | size=${attachmentBuffer.length} bytes | mime=${attachmentDebug.mimeType ?? 'unknown'}`
       );
     } else {
-      const generatedTitle = body.generatedTitle ? String(body.generatedTitle).trim() : '';
-      const generatedSubtitle = body.generatedSubtitle ? String(body.generatedSubtitle).trim() : '';
-      const generatedBodyText = body.generatedBodyText ? String(body.generatedBodyText).trim() : '';
-      const generatedLayout =
-        body.generatedLayout === 'highlight' ? 'highlight' : 'classic';
+      // Temporary fixed-document mode:
+      // Use the Clearwater Tender Pack PDF as the default attachment instead of
+      // generating a per-lead proposal. Put the PDF at:
+      // apps/api/assets/clearwater-tender-pack-2026-27.pdf
+      const fixedPdfPath = path.join(
+        process.cwd(),
+        'assets',
+        'clearwater-tender-pack-2026-27.pdf'
+      );
 
-      attachmentBuffer = await generateWeTransferBusinessPdf({
-        campaignName: campaignId,
-        title: generatedTitle || undefined,
-        subtitle: generatedSubtitle || undefined,
-        bodyText: generatedBodyText || undefined,
-        ctaLink: ctaLink || undefined,
-        layoutMode: generatedLayout,
-        leadName: leadName || undefined,
-        leadEmail,
-      });
-      filename = `${leadEmail.replace(/[^a-z0-9._-]/gi, '_') || 'lead'}-proposal.pdf`;
+      try {
+        attachmentBuffer = await fs.readFile(fixedPdfPath);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        return NextResponse.json(
+          {
+            error:
+              'Fixed Clearwater PDF could not be loaded. ' +
+              `Expected file at ${fixedPdfPath}. ${message}`,
+          },
+          { status: 500 }
+        );
+      }
+
+      filename = 'Clearwater Holdings - Tender Pack 2026-27.pdf';
+
       attachmentDebug = {
         name: filename,
         source: 'generated',
@@ -193,17 +305,17 @@ export async function POST(request: NextRequest) {
 
       if (!attachmentBuffer.length) {
         return NextResponse.json(
-          { error: 'Generated PDF is empty and cannot be sent.' },
+          { error: 'Fixed Clearwater PDF is empty and cannot be sent.' },
           { status: 500 }
         );
       }
 
       logs.push(
-        `[Attachment] READY: ${filename} | source=generated | size=${attachmentBuffer.length} bytes | mime=application/pdf`
+        `[Attachment] READY: ${filename} | source=fixed-clearwater-pdf | size=${attachmentBuffer.length} bytes | mime=application/pdf`
       );
     }
 
-    const safeFilename = filename.replace(/[^a-z0-9._-]/gi, '_') || 'attachment.pdf';
+    const safeFilename = filename || 'attachment';
     attachmentDir = await fs.mkdtemp(path.join(os.tmpdir(), '3d-suite-wetransfer-'));
     attachmentPath = path.join(attachmentDir, safeFilename);
     await fs.writeFile(attachmentPath, attachmentBuffer);
