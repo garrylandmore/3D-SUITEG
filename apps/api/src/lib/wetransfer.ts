@@ -1208,6 +1208,8 @@ export async function createWeTransferTransfer(
     let transferAttemptError = '';
 
     for (let transferAttempt = 1; transferAttempt <= 2 && !confirmation; transferAttempt += 1) {
+      let transferClickedThisAttempt = false;
+
       try {
         onPhase?.({
           phase: 'upload_started',
@@ -1330,6 +1332,7 @@ export async function createWeTransferTransfer(
         });
 
         await transferByTestId.click({ timeout: 60000 });
+        transferClickedThisAttempt = true;
 
         console.log(
           `TRANSFER CLICKED | recipient=${normalizedRecipient} | url=${page.url()}`
@@ -1344,7 +1347,36 @@ export async function createWeTransferTransfer(
         // detection determine whether the transfer actually succeeded.
         await page.waitForTimeout(3000);
 
-        confirmation = await confirmSend(page);
+        try {
+          confirmation = await confirmSend(page);
+        } catch (confirmationError: unknown) {
+          const confirmationMessage =
+            confirmationError instanceof Error
+              ? confirmationError.message
+              : String(confirmationError);
+
+          // Important: once Transfer has been clicked, do not retry the send.
+          // A missing confirmation is ambiguous and retrying can duplicate delivery.
+          if (transferClickedThisAttempt) {
+            onPhase?.({
+              phase: 'send_submitted',
+              detail:
+                `Transfer was clicked, but confirmation could not be detected. ` +
+                `Not retrying to avoid duplicate send. Detail: ${confirmationMessage}`,
+            });
+
+            console.log(
+              `TRANSFER CLICKED BUT UNCONFIRMED | no retry | recipient=${normalizedRecipient} | detail=${confirmationMessage}`
+            );
+
+            // Treat as submitted but unconfirmed; return a placeholder confirmation
+            // so the outer retry loop stops and no second Transfer click occurs.
+            confirmation = {};
+            break;
+          }
+
+          throw confirmationError;
+        }
       } catch (error: unknown) {
         transferAttemptError =
           error instanceof Error ? error.message : String(error);
@@ -1354,13 +1386,13 @@ export async function createWeTransferTransfer(
           detail: `Transfer attempt ${transferAttempt}/2 failed: ${transferAttemptError}`,
         });
 
-        if (transferAttempt < 2) {
+        if (transferAttempt < 2 && !transferClickedThisAttempt) {
           const rootUrl = `${WETRANSFER_URL.replace(/\/$/, '')}/`;
 
           onPhase?.({
             phase: 'loading_wetransfer',
             detail:
-              `Retrying complete upload/send flow after redirect/failure. Reloading ${rootUrl}`,
+              `Transfer was not clicked on attempt ${transferAttempt}/2. Retrying once. Reloading ${rootUrl}`,
           });
 
           await page.goto(rootUrl, {
@@ -1380,7 +1412,18 @@ export async function createWeTransferTransfer(
         `Transfer failed after retry: ${transferAttemptError || 'unknown error'}`
       );
     }
-    onPhase?.({ phase: 'send_confirmed', detail: `Transfer confirmed for ${normalizedRecipient}` });
+    if (confirmation.transferUrl) {
+      onPhase?.({
+        phase: 'send_confirmed',
+        detail: `Transfer confirmed for ${normalizedRecipient}`,
+      });
+    } else {
+      onPhase?.({
+        phase: 'send_submitted',
+        detail:
+          `Transfer submitted once for ${normalizedRecipient}. Confirmation was not detected; no retry was performed to avoid duplicate delivery.`,
+      });
+    }
 
     return {
       success: true,
