@@ -210,41 +210,91 @@ async function openShareUi(page: any, filename: string): Promise<void> {
 async function addRecipients(page: any, recipients: string[]): Promise<void> {
   const inputSelectors = [
     'input[data-testid="invite-input-field"]',
-    'input[data-testid="invite-input-field-placeholder"]',
-    'input[placeholder="Add names or emails to invite"]',
-    'input[placeholder="Add name or email to invite"]',
     'input[aria-label="Add people to share Document with them"]',
+    'input[placeholder="Add names or emails to invite"]',
+    'input[data-testid="invite-input-field-placeholder"]',
+    'input[placeholder="Add name or email to invite"]',
+    'input.react-spectrum-TagField-input',
   ];
 
-  let input = null;
+  async function resolveInviteInput() {
+    for (const selector of inputSelectors) {
+      const locator = page.locator(selector).filter({ visible: true }).first();
 
-  for (const selector of inputSelectors) {
-    const locator = page.locator(selector).first();
-
-    if (
-      await locator
-        .waitFor({ state: 'visible', timeout: 5000 })
-        .then(() => true)
-        .catch(() => false)
-    ) {
-      input = locator;
-      break;
+      if (await locator.isVisible().catch(() => false)) {
+        return { locator, selector };
+      }
     }
-  }
 
-  if (!input) {
-    throw new Error(
-      'Adobe Share dialog opened, but the invite email field was not found.'
-    );
+    // Retry briefly because Adobe sometimes swaps the placeholder input
+    // for the real invite input after the Share panel renders.
+    const deadline = Date.now() + 15000;
+
+    while (Date.now() < deadline) {
+      for (const selector of inputSelectors) {
+        const locator = page.locator(selector).first();
+
+        if (await locator.isVisible().catch(() => false)) {
+          return { locator, selector };
+        }
+      }
+
+      await page.waitForTimeout(250);
+    }
+
+    return null;
   }
 
   for (const email of recipients) {
-    await input.click();
-    await input.fill(email);
+    const resolved = await resolveInviteInput();
+
+    if (!resolved) {
+      throw new Error(
+        'Adobe Share dialog opened, but no usable invite email field was found.'
+      );
+    }
+
+    const { locator: input, selector } = resolved;
+
+    await input.scrollIntoViewIfNeeded().catch(() => undefined);
+    await input.click({ timeout: 10000 });
+
+    // Use keyboard typing rather than fill because Adobe's TagField can
+    // replace the underlying React input while a recipient chip is created.
+    await input.press('Control+A').catch(() => undefined);
+    await input.press('Backspace').catch(() => undefined);
+
+    try {
+      await input.type(email, {
+        delay: 20,
+        timeout: 15000,
+      });
+    } catch {
+      // Re-resolve the React-controlled input and try once more.
+      const retry = await resolveInviteInput();
+
+      if (!retry) {
+        throw new Error(
+          `Adobe recipient field disappeared while entering ${email}.`
+        );
+      }
+
+      await retry.locator.click({ timeout: 10000 });
+      await retry.locator.type(email, {
+        delay: 20,
+        timeout: 15000,
+      });
+    }
+
     await page.keyboard.press('Enter');
 
-    // Wait briefly for Adobe to convert the typed address into a recipient tag.
-    await page.waitForTimeout(150);
+    // Give Adobe a moment to turn the address into a recipient tag,
+    // then continue with a freshly resolved input for the next address.
+    await page.waitForTimeout(200);
+
+    console.log(
+      `ADOBE RECIPIENT ADDED | ${email} | selector=${selector}`
+    );
   }
 }
 
