@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,6 +7,78 @@ import path from 'node:path';
 import { getAdobeBrowserStore } from '@/lib/adobe-browser-store';
 
 export const dynamic = 'force-dynamic';
+
+function sanitizeFilename(value: string): string {
+  return value
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[. ]+$/g, '');
+}
+
+function randomDigits(length: number): string {
+  let result = '';
+  for (let index = 0; index < length; index += 1) {
+    result += String(Math.floor(Math.random() * 10));
+  }
+  return result;
+}
+
+function resolveAdobeAttachmentName(
+  template: string,
+  originalFilename: string,
+  recipientEmail: string
+): string {
+  const atIndex = recipientEmail.lastIndexOf('@');
+  const emailUser =
+    atIndex > 0 ? recipientEmail.slice(0, atIndex) : recipientEmail;
+  const domain =
+    atIndex > 0 ? recipientEmail.slice(atIndex + 1) : '';
+  const domainName =
+    domain.split('.')[0] || domain;
+
+  const lastDot = originalFilename.lastIndexOf('.');
+  const originalName =
+    lastDot > 0 ? originalFilename.slice(0, lastDot) : originalFilename;
+  const ext =
+    lastDot > 0 ? originalFilename.slice(lastDot + 1) : 'pdf';
+
+  const now = new Date();
+  const values: Record<string, string> = {
+    Email: recipientEmail,
+    EmailUser: emailUser,
+    Domain: domain,
+    DomainName: domainName,
+    OriginalName: originalName,
+    Ext: ext,
+    Date: now.toISOString().slice(0, 10),
+    Time: now.toTimeString().slice(0, 5).replace(':', '-'),
+    Random6: randomDigits(6),
+    Random8: randomDigits(8),
+    UUID: crypto.randomUUID(),
+  };
+
+  let resolved =
+    template || '{OriginalName}-{EmailUser}-{Random6}.{Ext}';
+
+  resolved = resolved
+    .replace(/\{\{([A-Za-z]+)\}\}/g, (match, key: string) =>
+      Object.prototype.hasOwnProperty.call(values, key)
+        ? values[key]
+        : match
+    )
+    .replace(/\{([A-Za-z]+)\}/g, (match, key: string) =>
+      Object.prototype.hasOwnProperty.call(values, key)
+        ? values[key]
+        : match
+    );
+
+  if (!/\.pdf$/i.test(resolved)) {
+    resolved = `${resolved}.pdf`;
+  }
+
+  return sanitizeFilename(resolved) || `document-${randomDigits(6)}.pdf`;
+}
 
 function normalizeEmails(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -27,6 +100,42 @@ async function firstVisible(page: any, selectors: string[]) {
     }
   }
   return null;
+}
+
+async function prepareAdobeForNextUpload(page: any): Promise<void> {
+  const filesUrl = 'https://acrobat.adobe.com/documents/files/';
+
+  console.log(
+    `ADOBE NEXT UPLOAD | navigating to ${filesUrl}`
+  );
+
+  await page.goto(filesUrl, {
+    waitUntil: 'domcontentloaded',
+    timeout: 90000,
+  });
+
+  // Wait for the Files page to become usable before starting the next upload.
+  await Promise.race([
+    page
+      .locator('input[type="file"]')
+      .first()
+      .waitFor({ state: 'attached', timeout: 15000 })
+      .catch(() => undefined),
+    page
+      .getByText('Your files', { exact: false })
+      .first()
+      .waitFor({ state: 'visible', timeout: 15000 })
+      .catch(() => undefined),
+    page
+      .locator('button:has-text("Upload"), button[aria-label*="Upload" i]')
+      .first()
+      .waitFor({ state: 'visible', timeout: 15000 })
+      .catch(() => undefined),
+  ]);
+
+  console.log(
+    `ADOBE NEXT UPLOAD READY | url=${page.url()}`
+  );
 }
 
 async function attachPdf(page: any, filePath: string, filename: string): Promise<string> {
@@ -473,6 +582,10 @@ export async function POST(request: NextRequest) {
     const recipients = normalizeEmails(
       JSON.parse(String(recipientsRaw || '[]'))
     );
+    const attachmentNameTemplate = String(
+      formData.get('attachmentNameTemplate') ||
+        '{OriginalName}-{EmailUser}-{Random6}.{Ext}'
+    ).trim();
 
     if (!recipients.length) {
       return NextResponse.json(
@@ -488,48 +601,130 @@ export async function POST(request: NextRequest) {
       !filename.toLowerCase().endsWith('.pdf')
     ) {
       return NextResponse.json(
-        { success: false, error: 'Adobe browser sender currently accepts PDF files only.' },
+        {
+          success: false,
+          error: 'Adobe browser sender currently accepts PDF files only.',
+        },
         { status: 400 }
       );
     }
 
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), '3d-suite-adobe-'));
-    const safeName = filename.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
-    const filePath = path.join(tempDir, safeName);
+    tempDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), '3d-suite-adobe-')
+    );
 
-    await fs.writeFile(filePath, Buffer.from(await file.arrayBuffer()));
-
+    const sourceBuffer = Buffer.from(await file.arrayBuffer());
     const page = session.page;
+
+    const results: Array<{
+      recipient: string;
+      filename: string;
+      success: boolean;
+      error?: string;
+    }> = [];
+
     await page.bringToFront().catch(() => undefined);
 
-    if (!/acrobat\.adobe\.com|documentcloud\.adobe\.com/i.test(page.url())) {
-      await page.goto('https://acrobat.adobe.com/', {
-        waitUntil: 'domcontentloaded',
-        timeout: 90000,
-      });
+    for (let index = 0; index < recipients.length; index += 1) {
+      const recipient = recipients[index];
+      const resolvedFilename = resolveAdobeAttachmentName(
+        attachmentNameTemplate,
+        filename,
+        recipient
+      );
+
+      const filePath = path.join(
+        tempDir,
+        `${index + 1}-${resolvedFilename}`
+      );
+
+      await fs.writeFile(filePath, sourceBuffer);
+
+      try {
+        console.log(
+          `ADOBE PER-RECIPIENT START | ${index + 1}/${recipients.length} | recipient=${recipient} | filename=${resolvedFilename}`
+        );
+
+        if (
+          !/acrobat\.adobe\.com|documentcloud\.adobe\.com/i.test(
+            page.url()
+          )
+        ) {
+          await page.goto('https://acrobat.adobe.com/', {
+            waitUntil: 'domcontentloaded',
+            timeout: 90000,
+          });
+        }
+
+        const uploadMethod = await attachPdf(
+          page,
+          filePath,
+          resolvedFilename
+        );
+
+        await waitForUploadedFile(page, resolvedFilename);
+        await openShareUi(page, resolvedFilename);
+        await prepareAdobeShareDialog(page);
+        await addRecipients(page, [recipient]);
+        await submitShare(page);
+
+        results.push({
+          recipient,
+          filename: resolvedFilename,
+          success: true,
+        });
+
+        console.log(
+          `ADOBE PER-RECIPIENT SENT | ${index + 1}/${recipients.length} | recipient=${recipient} | filename=${resolvedFilename} | upload=${uploadMethod}`
+        );
+
+        if (index < recipients.length - 1) {
+          await prepareAdobeForNextUpload(page);
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : String(error);
+
+        results.push({
+          recipient,
+          filename: resolvedFilename,
+          success: false,
+          error: message,
+        });
+
+        console.error(
+          `ADOBE PER-RECIPIENT FAILED | ${recipient} | ${message}`
+        );
+
+        if (
+          /limit exceeded|limit of free file sends|upgrade to send more files/i.test(
+            message
+          )
+        ) {
+          break;
+        }
+
+        if (index < recipients.length - 1) {
+          await prepareAdobeForNextUpload(page).catch(
+            () => undefined
+          );
+        }
+      }
     }
 
-    let uploadMethod = 'existing Adobe document';
-
-    if (await currentAdobeDocumentMatches(page, safeName)) {
-      uploadMethod =
-        'current Adobe viewer already shows matching uploaded document';
-    } else {
-      uploadMethod = await attachPdf(page, filePath, safeName);
-      await waitForUploadedFile(page, safeName);
-    }
-
-    await openShareUi(page, safeName);
-    await prepareAdobeShareDialog(page);
-    await addRecipients(page, recipients);
-    await submitShare(page);
+    const successful = results.filter((item) => item.success);
+    const failed = results.filter((item) => !item.success);
 
     return NextResponse.json({
-      success: true,
-      message: `Adobe share submitted for ${recipients.length} recipient(s).`,
-      recipients,
-      filename: safeName,
-      uploadMethod,
+      success: failed.length === 0 && successful.length > 0,
+      partial: successful.length > 0 && failed.length > 0,
+      message:
+        failed.length === 0
+          ? `Adobe shared ${successful.length} uniquely named document(s).`
+          : `Adobe completed ${successful.length} and failed ${failed.length} recipient(s).`,
+      sentCount: successful.length,
+      failedCount: failed.length,
+      results,
       currentUrl: page.url(),
     });
   } catch (error) {
