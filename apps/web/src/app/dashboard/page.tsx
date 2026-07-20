@@ -1151,7 +1151,7 @@ export default function DashboardPage() {
 
       // Every recipient batch gets its own fresh temp-mail mailbox and
       // therefore its own fresh WeTransfer signup/account session.
-      const tempMailProvider = credentials.wetransfer.tempMailProvider || 'mailslurp';
+      const tempMailProvider = credentials.wetransfer.provider || 'mailslurp';
       const tempMailApiKey =
         getSelectedTempMailApiKey(credentials.wetransfer) || '';
 
