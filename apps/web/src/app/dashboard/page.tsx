@@ -942,28 +942,48 @@ export default function DashboardPage() {
       return;
     }
 
-    const nextLead = leadsRef.current.find(
+    const pendingLeadsForSender = leadsRef.current.filter(
       (lead) => lead.status === 'pending' && lead.senderStatus[sender] !== 'sent'
     );
 
-    if (!nextLead) {
+    if (!pendingLeadsForSender.length) {
       finalizeRun(sender);
       return;
     }
 
-    updateLeads((prev) =>
-      prev.map((lead) =>
-        lead.id === nextLead.id
-          ? { ...lead, status: 'sending', senderStatus: { ...lead.senderStatus, [sender]: 'sending' } }
-          : lead
-      )
-    );
+    const nextLead = pendingLeadsForSender[0];
 
     if (sender === 'wetransfer') {
       const campaignId = wtCampaignId.current;
       const wtConfig = normalizeSenderConfig(senderConfigsRef.current.wetransfer);
-      const leadEmail = nextLead.email || nextLead.normalized;
-      const leadName = nextLead.name || '';
+
+      // Batch up to 10 recipients into a single WeTransfer transfer.
+      // HTML-to-PDF personalization remains one lead per transfer because one
+      // shared PDF cannot contain different per-recipient placeholder values.
+      const batchLimit = wtConfig.convertHtmlToPdf ? 1 : 10;
+      const batchLeads = pendingLeadsForSender.slice(0, batchLimit);
+      const leadEmails = batchLeads.map((lead) => lead.email || lead.normalized);
+      const leadNames = batchLeads.map((lead) => lead.name || '');
+      const leadEmail = leadEmails[0];
+      const leadName = leadNames[0] || '';
+
+      updateLeads((prev) =>
+        prev.map((lead) =>
+          batchLeads.some((batchLead) => batchLead.id === lead.id)
+            ? {
+                ...lead,
+                status: 'sending',
+                senderStatus: { ...lead.senderStatus, [sender]: 'sending' },
+              }
+            : lead
+        )
+      );
+
+      appendLog(
+        'info',
+        `Preparing WeTransfer recipient batch (${leadEmails.length}/10): ${leadEmails.join(', ')}`,
+        'wetransfer'
+      );
       const attachment = getWeTransferAttachmentDebug(wtConfig, wetransferUploadFile);
 
       const configuredDolphinProfileIds = wtConfig.dolphinProfileIds.filter(Boolean);
@@ -1003,6 +1023,8 @@ export default function DashboardPage() {
           formData.append('campaignId', campaignId);
           formData.append('leadEmail', leadEmail);
           formData.append('leadName', leadName);
+          formData.append('leadEmails', JSON.stringify(leadEmails));
+          formData.append('leadNames', JSON.stringify(leadNames));
           formData.append('fileSource', 'upload');
           formData.append('ctaLink', wtConfig.ctaLink);
           formData.append('tempMailApiKey', credentials.wetransfer.tempMailApiKey || '');
@@ -1023,6 +1045,8 @@ export default function DashboardPage() {
             campaignId,
             leadEmail,
             leadName,
+            leadEmails,
+            leadNames,
             fileSource: 'generated' as const,
             ctaLink: wtConfig.ctaLink,
             tempMailApiKey: credentials.wetransfer.tempMailApiKey || '',
@@ -1083,18 +1107,28 @@ export default function DashboardPage() {
           }));
           updateLeads((prev) =>
             prev.map((lead) => {
-              if (lead.id !== nextLead.id) return lead;
+              if (!batchLeads.some((batchLead) => batchLead.id === lead.id)) return lead;
               if (confirmationStatus === 'failed') {
-                return { ...lead, status: 'failed', failedAt: nowIso(), senderStatus: { ...lead.senderStatus, [sender]: 'failed' } };
+                return {
+                  ...lead,
+                  status: 'failed',
+                  failedAt: nowIso(),
+                  senderStatus: { ...lead.senderStatus, [sender]: 'failed' },
+                };
               }
-              return { ...lead, status: 'sent', sentAt: nowIso(), senderStatus: { ...lead.senderStatus, [sender]: 'sent' } };
+              return {
+                ...lead,
+                status: 'sent',
+                sentAt: nowIso(),
+                senderStatus: { ...lead.senderStatus, [sender]: 'sent' },
+              };
             })
           );
           appendLog(
             confirmationStatus === 'confirmed' ? 'success' : 'error',
             confirmationStatus === 'confirmed'
-              ? `WeTransfer confirmed send: ${leadEmail}${data.transferUrl ? ` | ${data.transferUrl}` : ''}`
-              : `WeTransfer failed: ${leadEmail}${failureDetail ? ` — ${failureDetail}` : ''}`,
+              ? `WeTransfer confirmed batch send (${leadEmails.length} recipients): ${leadEmails.join(', ')}${data.transferUrl ? ` | ${data.transferUrl}` : ''}`
+              : `WeTransfer batch failed (${leadEmails.length} recipients): ${leadEmails.join(', ')}${failureDetail ? ` — ${failureDetail}` : ''}`,
             sender
           );
           const delayMs = Math.max(300, senderConfigsRef.current[sender].rateLimitDelay * 1000);
@@ -1105,8 +1139,13 @@ export default function DashboardPage() {
           setWeTransferSession((prev) => ({ ...prev, latestError: err.message }));
           updateLeads((prev) =>
             prev.map((lead) =>
-              lead.id === nextLead.id
-                ? { ...lead, status: 'failed', failedAt: nowIso(), senderStatus: { ...lead.senderStatus, [sender]: 'failed' } }
+              batchLeads.some((batchLead) => batchLead.id === lead.id)
+                ? {
+                    ...lead,
+                    status: 'failed',
+                    failedAt: nowIso(),
+                    senderStatus: { ...lead.senderStatus, [sender]: 'failed' },
+                  }
                 : lead
             )
           );
@@ -1117,6 +1156,18 @@ export default function DashboardPage() {
     }
 
     // Non-WeTransfer senders: local simulation
+    updateLeads((prev) =>
+      prev.map((lead) =>
+        lead.id === nextLead.id
+          ? {
+              ...lead,
+              status: 'sending',
+              senderStatus: { ...lead.senderStatus, [sender]: 'sending' },
+            }
+          : lead
+      )
+    );
+
     const delayMs = Math.max(300, senderConfigsRef.current[sender].rateLimitDelay * 1000);
     timerRef.current = setTimeout(() => {
       const shouldFail = nextLead.normalized.includes('fail') || Math.random() < 0.08;
