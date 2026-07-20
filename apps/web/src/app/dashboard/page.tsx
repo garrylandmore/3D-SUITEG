@@ -73,6 +73,7 @@ type SenderConfig = {
   fileType: string;
   fileSource: 'upload' | 'generate';
   attachmentNameTemplate: string;
+  convertHtmlToPdf: boolean;
   orientation: 'landscape' | 'portrait';
   design: string;
   generatedLayout: 'classic' | 'highlight';
@@ -389,6 +390,7 @@ function createDefaultSenderConfig(): SenderConfig {
     fileType: 'PDF',
     fileSource: 'upload',
     attachmentNameTemplate: '{OriginalFile}',
+    convertHtmlToPdf: false,
     orientation: 'landscape',
     design: 'Modern',
     generatedLayout: 'classic',
@@ -439,6 +441,7 @@ function normalizeSenderConfig(value: unknown): SenderConfig {
     fileType: normalizeString(config.fileType, defaults.fileType),
     fileSource: config.fileSource === 'generate' ? 'generate' : 'upload',
     attachmentNameTemplate: normalizeString(config.attachmentNameTemplate, defaults.attachmentNameTemplate),
+    convertHtmlToPdf: Boolean(config.convertHtmlToPdf),
     orientation: config.orientation === 'portrait' ? 'portrait' : 'landscape',
     design: normalizeString(config.design, defaults.design),
     generatedLayout: config.generatedLayout === 'highlight' ? 'highlight' : 'classic',
@@ -976,6 +979,7 @@ export default function DashboardPage() {
           formData.append('tempMailApiKey', credentials.wetransfer.tempMailApiKey || '');
           formData.append('uploadedFileName', uploadFile.name);
           formData.append('attachmentNameTemplate', wtConfig.attachmentNameTemplate || '{OriginalFile}');
+          formData.append('convertHtmlToPdf', wtConfig.convertHtmlToPdf ? 'true' : 'false');
           formData.append('uploadedFileMimeType', uploadFile.type || 'application/octet-stream');
           formData.append('uploadedFile', uploadFile);
           return { body: formData };
@@ -1650,6 +1654,39 @@ export default function DashboardPage() {
                           <code>{'{DomainName}-Tender-{Email}.{Ext}'}</code>
                           {' '}
                           → example-Tender-user@example.com.pdf
+                        </div>
+                      </div>
+
+                      <div className="rounded-lg border border-slate-200 bg-white p-3 space-y-2">
+                        <label className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+                          <input
+                            type="checkbox"
+                            checked={activeConfig.convertHtmlToPdf}
+                            onChange={(event) =>
+                              setSenderConfigs((prev) => ({
+                                ...prev,
+                                wetransfer: {
+                                  ...prev.wetransfer,
+                                  convertHtmlToPdf: event.target.checked,
+                                },
+                              }))
+                            }
+                          />
+                          Convert uploaded HTML to PDF per lead
+                        </label>
+                        <div className="text-[11px] leading-5 text-slate-500">
+                          When enabled, an uploaded .html/.htm file is personalized for each lead, rendered as PDF,
+                          and the generated PDF is sent through WeTransfer.
+                        </div>
+                        <div className="text-[11px] leading-5 text-slate-500">
+                          Placeholders supported inside the HTML:
+                          {' '}<code>{'{Email}'}</code>,
+                          {' '}<code>{'{LocalPart}'}</code>,
+                          {' '}<code>{'{Domain}'}</code>,
+                          {' '}<code>{'{DomainName}'}</code>,
+                          {' '}<code>{'{TLD}'}</code>,
+                          {' '}<code>{'{Name}'}</code>.
+                          Double braces such as <code>{'{{Email}}'}</code> also work.
                         </div>
                       </div>
                     </div>
