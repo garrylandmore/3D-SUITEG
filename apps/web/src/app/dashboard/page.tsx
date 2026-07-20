@@ -74,6 +74,8 @@ type SenderConfig = {
   fileSource: 'upload' | 'generate';
   attachmentNameTemplate: string;
   convertHtmlToPdf: boolean;
+  dolphinProfileIds: string[];
+  randomizeDolphinProfiles: boolean;
   orientation: 'landscape' | 'portrait';
   design: string;
   generatedLayout: 'classic' | 'highlight';
@@ -391,6 +393,8 @@ function createDefaultSenderConfig(): SenderConfig {
     fileSource: 'upload',
     attachmentNameTemplate: '{OriginalFile}',
     convertHtmlToPdf: false,
+    dolphinProfileIds: [],
+    randomizeDolphinProfiles: false,
     orientation: 'landscape',
     design: 'Modern',
     generatedLayout: 'classic',
@@ -442,6 +446,10 @@ function normalizeSenderConfig(value: unknown): SenderConfig {
     fileSource: config.fileSource === 'generate' ? 'generate' : 'upload',
     attachmentNameTemplate: normalizeString(config.attachmentNameTemplate, defaults.attachmentNameTemplate),
     convertHtmlToPdf: Boolean(config.convertHtmlToPdf),
+    dolphinProfileIds: Array.isArray(config.dolphinProfileIds)
+      ? config.dolphinProfileIds.map((item) => String(item).trim()).filter(Boolean)
+      : defaults.dolphinProfileIds,
+    randomizeDolphinProfiles: Boolean(config.randomizeDolphinProfiles),
     orientation: config.orientation === 'portrait' ? 'portrait' : 'landscape',
     design: normalizeString(config.design, defaults.design),
     generatedLayout: config.generatedLayout === 'highlight' ? 'highlight' : 'classic',
@@ -510,6 +518,7 @@ export default function DashboardPage() {
   const [toasts, setToasts] = React.useState<Toast[]>([]);
   const [isPreparing, setIsPreparing] = React.useState(false);
   const [wetransferUploadFile, setWetransferUploadFile] = React.useState<File | null>(null);
+  const [newDolphinProfileId, setNewDolphinProfileId] = React.useState('');
 
   const [leads, setLeads] = React.useState<Lead[]>([]);
   const [logs, setLogs] = React.useState<RuntimeLog[]>([]);
@@ -957,6 +966,26 @@ export default function DashboardPage() {
       const leadName = nextLead.name || '';
       const attachment = getWeTransferAttachmentDebug(wtConfig, wetransferUploadFile);
 
+      const configuredDolphinProfileIds = wtConfig.dolphinProfileIds.filter(Boolean);
+      const selectedDolphinProfileId =
+        configuredDolphinProfileIds.length === 0
+          ? ''
+          : wtConfig.randomizeDolphinProfiles && configuredDolphinProfileIds.length > 1
+            ? configuredDolphinProfileIds[
+                Math.floor(Math.random() * configuredDolphinProfileIds.length)
+              ]
+            : configuredDolphinProfileIds[0];
+
+      if (selectedDolphinProfileId) {
+        appendLog(
+          'info',
+          `Dolphin profile selected for ${leadEmail}: ${selectedDolphinProfileId}${
+            wtConfig.randomizeDolphinProfiles ? ' (randomized)' : ''
+          }`,
+          'wetransfer'
+        );
+      }
+
       setWeTransferSession((prev) => ({
         ...prev,
         status: 'sending',
@@ -980,6 +1009,9 @@ export default function DashboardPage() {
           formData.append('uploadedFileName', uploadFile.name);
           formData.append('attachmentNameTemplate', wtConfig.attachmentNameTemplate || '{OriginalFile}');
           formData.append('convertHtmlToPdf', wtConfig.convertHtmlToPdf ? 'true' : 'false');
+          if (selectedDolphinProfileId) {
+            formData.append('dolphinProfileId', selectedDolphinProfileId);
+          }
           formData.append('uploadedFileMimeType', uploadFile.type || 'application/octet-stream');
           formData.append('uploadedFile', uploadFile);
           return { body: formData };
@@ -998,6 +1030,7 @@ export default function DashboardPage() {
             generatedSubtitle: wtConfig.generatedSubtitle,
             generatedBodyText: wtConfig.generatedBodyText,
             generatedLayout: wtConfig.generatedLayout,
+            dolphinProfileId: selectedDolphinProfileId || undefined,
           }),
         };
       })();
@@ -1429,6 +1462,108 @@ export default function DashboardPage() {
                       </div>
                     </Field>
                   </div>
+                  <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-3">
+                    <div>
+                      <div className="text-sm font-semibold text-slate-800">Dolphin profile IDs</div>
+                      <div className="text-xs text-slate-500 mt-1">
+                        Add one or more existing Dolphin browser profile IDs. The selected profile is used for the WeTransfer run.
+                      </div>
+                    </div>
+
+                    <div className="flex gap-2">
+                      <input
+                        className="input flex-1"
+                        value={newDolphinProfileId}
+                        onChange={(event) => setNewDolphinProfileId(event.target.value)}
+                        placeholder="Example: 826665603"
+                      />
+                      <button
+                        type="button"
+                        className="px-3 py-2 rounded bg-[#6C63FF] text-white text-xs font-semibold"
+                        onClick={() => {
+                          const profileId = newDolphinProfileId.trim();
+                          if (!profileId) return;
+
+                          setSenderConfigs((prev) => {
+                            const existing = prev.wetransfer.dolphinProfileIds || [];
+                            if (existing.includes(profileId)) return prev;
+
+                            return {
+                              ...prev,
+                              wetransfer: {
+                                ...prev.wetransfer,
+                                dolphinProfileIds: [...existing, profileId],
+                              },
+                            };
+                          });
+
+                          setNewDolphinProfileId('');
+                        }}
+                      >
+                        Add
+                      </button>
+                    </div>
+
+                    <div className="flex flex-wrap gap-2">
+                      {activeConfig.dolphinProfileIds.length > 0 ? (
+                        activeConfig.dolphinProfileIds.map((profileId) => (
+                          <span
+                            key={profileId}
+                            className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-3 py-1 text-xs text-slate-700"
+                          >
+                            {profileId}
+                            <button
+                              type="button"
+                              className="text-red-500 font-bold"
+                              onClick={() =>
+                                setSenderConfigs((prev) => ({
+                                  ...prev,
+                                  wetransfer: {
+                                    ...prev.wetransfer,
+                                    dolphinProfileIds: prev.wetransfer.dolphinProfileIds.filter(
+                                      (id) => id !== profileId
+                                    ),
+                                  },
+                                }))
+                              }
+                              aria-label={`Delete Dolphin profile ${profileId}`}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))
+                      ) : (
+                        <div className="text-xs text-amber-700">No Dolphin profile ID added yet.</div>
+                      )}
+                    </div>
+
+                    {activeConfig.dolphinProfileIds.length > 1 && (
+                      <label className="flex items-center gap-2 text-sm text-slate-700">
+                        <input
+                          type="checkbox"
+                          checked={activeConfig.randomizeDolphinProfiles}
+                          onChange={(event) =>
+                            setSenderConfigs((prev) => ({
+                              ...prev,
+                              wetransfer: {
+                                ...prev.wetransfer,
+                                randomizeDolphinProfiles: event.target.checked,
+                              },
+                            }))
+                          }
+                        />
+                        Randomize Dolphin profile for each lead
+                      </label>
+                    )}
+
+                    {!activeConfig.randomizeDolphinProfiles &&
+                      activeConfig.dolphinProfileIds.length > 0 && (
+                        <div className="text-[11px] text-slate-500">
+                          Using first profile: <code>{activeConfig.dolphinProfileIds[0]}</code>
+                        </div>
+                      )}
+                  </div>
+
                   <div className="mt-3 flex items-center gap-3 text-sm">
                     <label className="flex items-center gap-2">
                       <input
