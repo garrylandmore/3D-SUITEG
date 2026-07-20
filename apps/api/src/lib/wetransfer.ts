@@ -6,6 +6,7 @@ import {
   clearDolphinBrowserSession,
   isDolphinEnabled,
   launchDolphinBrowser,
+  stopDolphinProfile,
 } from './dolphin-browser';
 import {
   buildPlaywrightProxyLaunchOptions,
@@ -1167,6 +1168,7 @@ export async function createWeTransferTransfer(
   options: WeTransferSendOptions = {}
 ): Promise<{ success: boolean; downloadUrl?: string; error?: string }> {
   let browser;
+  let activeDolphinProfileId: number | null = null;
   try {
     const normalizedRecipient = recipientEmail.trim();
     if (!normalizedRecipient) {
@@ -1196,6 +1198,16 @@ export async function createWeTransferTransfer(
       'send-transfer',
       options.dolphinProfileId
     );
+
+    if (isDolphinEnabled()) {
+      const rawProfileId =
+        options.dolphinProfileId || process.env.DOLPHIN_PROFILE_ID || '';
+      const parsedProfileId = Number(rawProfileId);
+
+      if (Number.isInteger(parsedProfileId) && parsedProfileId > 0) {
+        activeDolphinProfileId = parsedProfileId;
+      }
+    }
 
     const page = await createFreshWeTransferPage(browser);
 
@@ -1449,9 +1461,19 @@ export async function createWeTransferTransfer(
     };
   } finally {
     if (browser && isDolphinEnabled()) {
+      // Clear cookies and browser storage while the profile is still connected.
       await clearDolphinBrowserSession(browser);
-    }
 
-    await browser?.close().catch(() => undefined);
+      // Close the Playwright/CDP browser connection.
+      await browser.close().catch(() => undefined);
+
+      // Explicitly stop the Dolphin profile so the Anty browser process is
+      // actually terminated rather than left running/disconnected.
+      if (activeDolphinProfileId) {
+        await stopDolphinProfile(activeDolphinProfileId);
+      }
+    } else {
+      await browser?.close().catch(() => undefined);
+    }
   }
 }
