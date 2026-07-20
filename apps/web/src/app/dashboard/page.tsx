@@ -150,23 +150,17 @@ type CredentialsState = {
     mailSlurpApiKey: string;
     tempMailIoApiKey: string;
   };
-  adobe: {
-    clientId: string;
-    clientSecret: string;
-    redirectUri: string;
-    tenant: string;
-  };
+  adobe: { tenant: string };
   quickbooks: { companyId: string; environment: string };
   docusign: { accountId: string; integrationKey: string };
 };
 
 type AdobeConnectionStatus = {
   connected: boolean;
-  email?: string | null;
-  userName?: string | null;
-  apiAccessPoint?: string | null;
-  webAccessPoint?: string | null;
-  connectedAt?: string | null;
+  loggedIn?: boolean;
+  profileId?: string | null;
+  currentUrl?: string | null;
+  lastCheckedAt?: string | null;
   error?: string | null;
 };
 
@@ -650,12 +644,7 @@ export default function DashboardPage() {
       mailSlurpApiKey: '',
       tempMailIoApiKey: '',
     },
-    adobe: {
-      clientId: '',
-      clientSecret: '',
-      redirectUri: 'http://localhost:7201/api/adobe/oauth/callback',
-      tenant: '',
-    },
+    adobe: { tenant: '' },
     quickbooks: { companyId: '', environment: 'sandbox' },
     docusign: { accountId: '', integrationKey: '' },
   });
@@ -1360,7 +1349,7 @@ export default function DashboardPage() {
 
   const refreshAdobeConnection = React.useCallback(async () => {
     try {
-      const response = await fetch('/api/adobe/oauth/status', {
+      const response = await fetch('/api/adobe/browser/status', {
         method: 'GET',
         cache: 'no-store',
       });
@@ -1368,7 +1357,7 @@ export default function DashboardPage() {
       setAdobeConnection(data);
       setSenderConfigs((prev) => ({
         ...prev,
-        adobe: { ...prev.adobe, connected: Boolean(data.connected) },
+        adobe: { ...prev.adobe, connected: Boolean(data.connected && data.loggedIn) },
       }));
     } catch (error) {
       setAdobeConnection((prev) => ({
@@ -1385,15 +1374,8 @@ export default function DashboardPage() {
   }, [refreshAdobeConnection]);
 
   async function connectAdobeWithDolphin() {
-    const clientId = credentials.adobe.clientId.trim();
-    const clientSecret = credentials.adobe.clientSecret.trim();
-    const redirectUri = credentials.adobe.redirectUri.trim();
     const dolphinProfileId = selectedAdobeDolphinProfileId.trim();
 
-    if (!clientId || !clientSecret || !redirectUri) {
-      addToast('Adobe Client ID, Client Secret, and Redirect URI are required', 'error');
-      return;
-    }
     if (!dolphinProfileId) {
       addToast('Choose a Dolphin profile for Adobe login', 'error');
       return;
@@ -1401,26 +1383,31 @@ export default function DashboardPage() {
 
     setAdobeConnecting(true);
     try {
-      const response = await fetch('/api/adobe/oauth/connect', {
+      const response = await fetch('/api/adobe/browser/connect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clientId,
-          clientSecret,
-          redirectUri,
-          dolphinProfileId,
-        }),
+        body: JSON.stringify({ dolphinProfileId }),
       });
-      const data = await parseApiJson<{ success?: boolean; error?: string }>(response);
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || `Adobe connect failed (HTTP ${response.status})`);
+
+      const data = await parseApiJson<AdobeConnectionStatus & {
+        success?: boolean;
+      }>(response);
+
+      if (!response.ok || data.success === false) {
+        throw new Error(data.error || `Adobe browser connect failed (HTTP ${response.status})`);
       }
-      appendLog('info', `Adobe OAuth opened in Dolphin profile ${dolphinProfileId}`, 'adobe');
-      addToast('Adobe login opened in Dolphin', 'success');
+
+      setAdobeConnection(data);
+      appendLog(
+        'info',
+        `Adobe opened in Dolphin profile ${dolphinProfileId}. Log in manually in the Dolphin browser, then return here.`,
+        'adobe'
+      );
+      addToast('Adobe opened in Dolphin — log in manually', 'success');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setAdobeConnection((prev) => ({ ...prev, error: message }));
-      appendLog('error', `Adobe connection failed: ${message}`, 'adobe');
+      appendLog('error', `Adobe browser connection failed: ${message}`, 'adobe');
       addToast(message, 'error');
     } finally {
       setAdobeConnecting(false);
@@ -1429,17 +1416,26 @@ export default function DashboardPage() {
 
   async function disconnectAdobe() {
     try {
-      const response = await fetch('/api/adobe/oauth/status', { method: 'DELETE' });
+      const response = await fetch('/api/adobe/browser/status', {
+        method: 'DELETE',
+      });
       const data = await parseApiJson<{ success?: boolean; error?: string }>(response);
-      if (!response.ok || !data.success) throw new Error(data.error || 'Adobe disconnect failed');
-      setAdobeConnection({ connected: false });
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || 'Adobe disconnect failed');
+      }
+
+      setAdobeConnection({ connected: false, loggedIn: false });
       setSenderConfigs((prev) => ({
         ...prev,
         adobe: { ...prev.adobe, connected: false },
       }));
+      appendLog('info', 'Adobe Dolphin profile disconnected and stopped', 'adobe');
       addToast('Adobe disconnected', 'success');
     } catch (error) {
-      addToast(error instanceof Error ? error.message : String(error), 'error');
+      const message = error instanceof Error ? error.message : String(error);
+      appendLog('error', `Adobe disconnect failed: ${message}`, 'adobe');
+      addToast(message, 'error');
     }
   }
 
@@ -2694,19 +2690,17 @@ export default function DashboardPage() {
             <AdobeSenderPanel
               connection={adobeConnection}
               connecting={adobeConnecting}
-              credentials={credentials.adobe}
               dolphinProfileIds={senderConfigs.wetransfer.dolphinProfileIds}
               selectedDolphinProfileId={selectedAdobeDolphinProfileId}
+              leadEmails={leads
+                .map((lead) => lead.email || lead.normalized)
+                .filter((email): email is string => Boolean(email))}
               onSelectDolphinProfile={setSelectedAdobeDolphinProfileId}
-              onCredentialsChange={(next) =>
-                setCredentials((prev) => ({
-                  ...prev,
-                  adobe: { ...prev.adobe, ...next },
-                }))
-              }
               onConnect={() => void connectAdobeWithDolphin()}
               onDisconnect={() => void disconnectAdobe()}
               onRefresh={() => void refreshAdobeConnection()}
+              onLog={(level, message) => appendLog(level, message, 'adobe')}
+              onToast={addToast}
             />
           ) : (
             <MockSenderPanel
@@ -2943,10 +2937,10 @@ export default function DashboardPage() {
               <div>
                 <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Other Senders</p>
                 <div className="grid sm:grid-cols-2 gap-3">
-                  <Field label="Adobe Client ID"><input className="input" value={credentials.adobe.clientId} onChange={(e) => setCredentials((p) => ({ ...p, adobe: { ...p.adobe, clientId: e.target.value } }))} /></Field>
-                  <Field label="Adobe Client Secret"><input type="password" className="input" value={credentials.adobe.clientSecret} onChange={(e) => setCredentials((p) => ({ ...p, adobe: { ...p.adobe, clientSecret: e.target.value } }))} /></Field>
-                  <Field label="Adobe OAuth Redirect URI"><input className="input" value={credentials.adobe.redirectUri} onChange={(e) => setCredentials((p) => ({ ...p, adobe: { ...p.adobe, redirectUri: e.target.value } }))} /></Field>
-                  <Field label="Adobe Tenant / Notes (optional)"><input className="input" value={credentials.adobe.tenant} onChange={(e) => setCredentials((p) => ({ ...p, adobe: { ...p.adobe, tenant: e.target.value } }))} /></Field>
+                  <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                    Adobe browser mode does not require a Client ID, Client Secret, or OAuth Redirect URI.
+                    Choose a Dolphin profile from the Adobe sender tab and log in manually at acrobat.adobe.com.
+                  </div>
                   <Field label="QuickBooks Company ID"><input className="input" value={credentials.quickbooks.companyId} onChange={(e) => setCredentials((p) => ({ ...p, quickbooks: { ...p.quickbooks, companyId: e.target.value } }))} /></Field>
                   <Field label="DocuSign Account ID"><input className="input" value={credentials.docusign.accountId} onChange={(e) => setCredentials((p) => ({ ...p, docusign: { ...p.docusign, accountId: e.target.value } }))} /></Field>
                 </div>
@@ -3645,73 +3639,244 @@ function LogsModal({ logs, onClear }: { logs: RuntimeLog[]; onClear: () => void 
 function AdobeSenderPanel({
   connection,
   connecting,
-  credentials,
   dolphinProfileIds,
   selectedDolphinProfileId,
+  leadEmails,
   onSelectDolphinProfile,
-  onCredentialsChange,
   onConnect,
   onDisconnect,
   onRefresh,
+  onLog,
+  onToast,
 }: {
   connection: AdobeConnectionStatus;
   connecting: boolean;
-  credentials: CredentialsState['adobe'];
   dolphinProfileIds: string[];
   selectedDolphinProfileId: string;
+  leadEmails: string[];
   onSelectDolphinProfile: (value: string) => void;
-  onCredentialsChange: (next: Partial<CredentialsState['adobe']>) => void;
   onConnect: () => void;
   onDisconnect: () => void;
   onRefresh: () => void;
+  onLog: (level: LogLevel, message: string) => void;
+  onToast: (message: string, level?: LogLevel) => void;
 }) {
+  const [uploadFile, setUploadFile] = React.useState<File | null>(null);
+  const [recipientsText, setRecipientsText] = React.useState('');
+  const [sending, setSending] = React.useState(false);
+  const [lastResult, setLastResult] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!recipientsText.trim() && leadEmails.length) {
+      setRecipientsText(leadEmails.join('\n'));
+    }
+  }, [leadEmails, recipientsText]);
+
+  const parsedRecipients = React.useMemo(
+    () =>
+      Array.from(
+        new Set(
+          recipientsText
+            .split(/[\n,;\s]+/)
+            .map((value) => value.trim().toLowerCase())
+            .filter((value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value))
+        )
+      ),
+    [recipientsText]
+  );
+
+  async function sendAdobeShare() {
+    if (!connection.connected || !connection.loggedIn) {
+      onToast('Log into Adobe in the connected Dolphin browser first', 'error');
+      return;
+    }
+
+    if (!uploadFile) {
+      onToast('Choose a PDF to upload to Adobe', 'error');
+      return;
+    }
+
+    if (!parsedRecipients.length) {
+      onToast('Add at least one valid recipient email', 'error');
+      return;
+    }
+
+    setSending(true);
+    setLastResult(null);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', uploadFile);
+      formData.append('recipients', JSON.stringify(parsedRecipients));
+
+      onLog(
+        'info',
+        `Starting Adobe share: ${uploadFile.name} → ${parsedRecipients.length} recipient(s)`
+      );
+
+      const response = await fetch('/api/adobe/browser/send', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await parseApiJson<{
+        success?: boolean;
+        message?: string;
+        recipients?: string[];
+        currentUrl?: string;
+        error?: string;
+      }>(response);
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || `Adobe share failed (HTTP ${response.status})`);
+      }
+
+      const message =
+        data.message ||
+        `Adobe share submitted for ${data.recipients?.length || parsedRecipients.length} recipient(s)`;
+
+      setLastResult(message);
+      onLog('info', message);
+      onToast('Adobe share submitted', 'success');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setLastResult(message);
+      onLog('error', `Adobe share failed: ${message}`);
+      onToast(message, 'error');
+    } finally {
+      setSending(false);
+    }
+  }
+
   return (
     <div className="grid lg:grid-cols-2 gap-4">
-      <Panel title="Adobe Acrobat Sign Connection">
+      <Panel title="Adobe Document Cloud">
         <div className="space-y-3 text-sm">
-          <div className={`rounded border px-3 py-2 ${connection.connected ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
-            <div className="font-semibold">{connection.connected ? '● Connected' : '○ Not connected'}</div>
-            {connection.connected && (
-              <div className="mt-1 text-xs space-y-1">
-                {connection.email && <div>Account: {connection.email}</div>}
-                {connection.userName && <div>User: {connection.userName}</div>}
-                {connection.apiAccessPoint && <div className="break-all">API: {connection.apiAccessPoint}</div>}
-              </div>
+          <div
+            className={`rounded border px-3 py-2 ${
+              connection.connected && connection.loggedIn
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                : connection.connected
+                  ? 'border-amber-200 bg-amber-50 text-amber-800'
+                  : 'border-slate-200 bg-slate-50 text-slate-700'
+            }`}
+          >
+            <div className="font-semibold">
+              {connection.connected && connection.loggedIn
+                ? '● Connected — Adobe login detected'
+                : connection.connected
+                  ? '◐ Dolphin open — waiting for Adobe login'
+                  : '○ Not connected'}
+            </div>
+
+            {connection.profileId && (
+              <div className="mt-1 text-xs">Dolphin profile: {connection.profileId}</div>
+            )}
+            {connection.currentUrl && (
+              <div className="mt-1 text-xs break-all">URL: {connection.currentUrl}</div>
             )}
           </div>
 
           {!connection.connected ? (
             <>
-              <Field label="Adobe Client ID"><input className="input" value={credentials.clientId} onChange={(e) => onCredentialsChange({ clientId: e.target.value })} /></Field>
-              <Field label="Adobe Client Secret"><input type="password" className="input" value={credentials.clientSecret} onChange={(e) => onCredentialsChange({ clientSecret: e.target.value })} /></Field>
-              <Field label="OAuth Redirect URI"><input className="input" value={credentials.redirectUri} onChange={(e) => onCredentialsChange({ redirectUri: e.target.value })} /></Field>
               <Field label="Dolphin Profile">
-                <select className="input" value={selectedDolphinProfileId} onChange={(e) => onSelectDolphinProfile(e.target.value)}>
+                <select
+                  className="input"
+                  value={selectedDolphinProfileId}
+                  onChange={(event) => onSelectDolphinProfile(event.target.value)}
+                >
                   <option value="">Choose Dolphin profile</option>
-                  {dolphinProfileIds.map((profileId) => <option key={profileId} value={profileId}>{profileId}</option>)}
+                  {dolphinProfileIds.map((profileId) => (
+                    <option key={profileId} value={profileId}>
+                      {profileId}
+                    </option>
+                  ))}
                 </select>
               </Field>
-              {dolphinProfileIds.length === 0 && <div className="text-xs text-amber-700">Add Dolphin profile IDs in the WeTransfer connection settings first.</div>}
-              <button type="button" disabled={connecting} className="px-3 py-2 rounded bg-[#6C63FF] text-white disabled:opacity-50" onClick={onConnect}>
-                {connecting ? 'Opening Adobe Login…' : 'Connect with Adobe in Dolphin'}
+
+              {dolphinProfileIds.length === 0 && (
+                <div className="text-xs text-amber-700">
+                  Add Dolphin profile IDs in the WeTransfer connection settings first.
+                </div>
+              )}
+
+              <button
+                type="button"
+                disabled={connecting}
+                className="px-3 py-2 rounded bg-[#6C63FF] text-white disabled:opacity-50"
+                onClick={onConnect}
+              >
+                {connecting ? 'Opening Adobe…' : 'Open Adobe & Connect'}
               </button>
             </>
           ) : (
             <div className="flex flex-wrap gap-2">
-              <button type="button" className="px-3 py-2 rounded border" onClick={onRefresh}>Refresh status</button>
-              <button type="button" className="px-3 py-2 rounded border border-red-300 text-red-600" onClick={onDisconnect}>Disconnect Adobe</button>
+              <button type="button" className="px-3 py-2 rounded border" onClick={onRefresh}>
+                Check login
+              </button>
+              <button
+                type="button"
+                className="px-3 py-2 rounded border border-red-300 text-red-600"
+                onClick={onDisconnect}
+              >
+                Disconnect & Stop Dolphin
+              </button>
             </div>
           )}
 
-          {connection.error && <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{connection.error}</div>}
+          {connection.error && (
+            <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+              {connection.error}
+            </div>
+          )}
         </div>
       </Panel>
 
-      <Panel title="Adobe OAuth Flow">
-        <div className="space-y-2 text-sm text-slate-600">
-          <p>Choose Dolphin profile → Connect with Adobe → log in and approve inside Dolphin.</p>
-          <p>Adobe redirects to the 3D Suite callback, the OAuth tokens are stored by the API, and the Dolphin profile is stopped.</p>
-          <p>After connection, future Adobe API sending does not need Dolphin for each document.</p>
+      <Panel title="Upload & Share PDF">
+        <div className="space-y-3 text-sm">
+          <Field label="PDF attachment">
+            <input
+              type="file"
+              accept=".pdf,application/pdf"
+              className="input"
+              onChange={(event) => setUploadFile(event.target.files?.[0] || null)}
+            />
+          </Field>
+
+          <Field label={`Recipients (${parsedRecipients.length})`}>
+            <textarea
+              className="input min-h-40"
+              value={recipientsText}
+              onChange={(event) => setRecipientsText(event.target.value)}
+              placeholder="employee1@company.com&#10;employee2@company.com"
+            />
+          </Field>
+
+          <div className="text-xs text-slate-500">
+            Imported lead emails are prefilled automatically. Adobe remains open in the same Dolphin profile
+            and the sender uses Acrobat's normal browser upload/share interface.
+          </div>
+
+          <button
+            type="button"
+            disabled={
+              sending ||
+              !connection.connected ||
+              !connection.loggedIn ||
+              !uploadFile ||
+              parsedRecipients.length === 0
+            }
+            className="px-3 py-2 rounded bg-[#6C63FF] text-white disabled:opacity-50"
+            onClick={() => void sendAdobeShare()}
+          >
+            {sending ? 'Uploading & Sharing…' : 'Upload PDF & Share'}
+          </button>
+
+          {lastResult && (
+            <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-xs">
+              {lastResult}
+            </div>
+          )}
         </div>
       </Panel>
     </div>
