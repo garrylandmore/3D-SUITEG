@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { chromium } from 'playwright';
+import { PDFDocument, PDFTextField } from 'pdf-lib';
 import {
   sendLeadViaWeTransfer,
   WeTransferExecutionStep,
@@ -16,10 +17,138 @@ import { getBrowserProxyDiagnostics } from '@/lib/browser-proxy';
 
 
 
+
+type BatchPlaceholderValues = {
+  Date: string;
+  Time: string;
+  DateTime: string;
+  Reference: string;
+  Random6: string;
+  Random8: string;
+  UUID: string;
+  BatchId: string;
+};
+
+function randomDigits(length: number): string {
+  let value = '';
+  for (let index = 0; index < length; index += 1) {
+    value += String(Math.floor(Math.random() * 10));
+  }
+  return value;
+}
+
+function randomToken(length: number): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let value = '';
+  for (let index = 0; index < length; index += 1) {
+    value += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return value;
+}
+
+function createBatchPlaceholderValues(): BatchPlaceholderValues {
+  const now = new Date();
+  const date = now.toISOString().slice(0, 10);
+  const time = now.toTimeString().slice(0, 5);
+  const dateTime = `${date} ${time}`;
+  const uuid = crypto.randomUUID();
+
+  return {
+    Date: date,
+    Time: time,
+    DateTime: dateTime,
+    Reference: `REF-${randomToken(8)}`,
+    Random6: randomDigits(6),
+    Random8: randomDigits(8),
+    UUID: uuid,
+    BatchId: `BATCH-${randomToken(8)}`,
+  };
+}
+
+function replaceBatchPlaceholders(
+  input: string,
+  values: BatchPlaceholderValues
+): string {
+  let output = input;
+
+  for (const [key, value] of Object.entries(values)) {
+    output = output
+      .replace(new RegExp(`\\\\{\\\\{${key}\\\\}\\\\}`, 'gi'), value)
+      .replace(new RegExp(`\\\\{${key}\\\\}`, 'gi'), value);
+  }
+
+  return output;
+}
+
+function batchPlaceholderForField(
+  fieldName: string,
+  currentValue: string,
+  values: BatchPlaceholderValues
+): string | null {
+  const candidates = [fieldName.trim(), currentValue.trim()];
+
+  for (const candidate of candidates) {
+    for (const [key, value] of Object.entries(values)) {
+      const normalized = candidate
+        .replace(/^\{\{?/, '')
+        .replace(/\}\}?$/, '')
+        .trim()
+        .toLowerCase();
+
+      if (normalized === key.toLowerCase()) {
+        return value;
+      }
+    }
+  }
+
+  return null;
+}
+
+async function replaceBatchPlaceholdersInPdfFormFields(
+  pdfBuffer: Buffer,
+  values: BatchPlaceholderValues
+): Promise<{ buffer: Buffer; replacedCount: number }> {
+  const pdf = await PDFDocument.load(pdfBuffer, {
+    ignoreEncryption: false,
+  });
+
+  const form = pdf.getForm();
+  const fields = form.getFields();
+  let replacedCount = 0;
+
+  for (const field of fields) {
+    if (!(field instanceof PDFTextField)) continue;
+
+    const currentValue = field.getText() || '';
+    const replacement = batchPlaceholderForField(
+      field.getName(),
+      currentValue,
+      values
+    );
+
+    if (!replacement) continue;
+
+    field.setText(replacement);
+    replacedCount += 1;
+  }
+
+  if (replacedCount > 0) {
+    // Flatten so the generated batch values are visible and no longer editable.
+    form.flatten();
+  }
+
+  const bytes = await pdf.save();
+  return {
+    buffer: Buffer.from(bytes),
+    replacedCount,
+  };
+}
+
 function buildLeadContentPlaceholders(
   leadEmail: string,
   leadName: string,
-  ctaLink: string
+  ctaLink: string,
+  batchValues: BatchPlaceholderValues
 ): Record<string, string> {
   const email = leadEmail.trim();
   const at = email.lastIndexOf('@');
@@ -44,6 +173,7 @@ function buildLeadContentPlaceholders(
     name: leadName.trim(),
     Link: ctaLink.trim(),
     link: ctaLink.trim(),
+    ...batchValues,
   };
 }
 
@@ -51,9 +181,15 @@ function personalizeHtml(
   html: string,
   leadEmail: string,
   leadName: string,
-  ctaLink: string
+  ctaLink: string,
+  batchValues: BatchPlaceholderValues
 ): string {
-  const values = buildLeadContentPlaceholders(leadEmail, leadName, ctaLink);
+  const values = buildLeadContentPlaceholders(
+    leadEmail,
+    leadName,
+    ctaLink,
+    batchValues
+  );
 
   return html
     .replace(/\{\{([A-Za-z]+)\}\}/g, (match, key: string) =>
@@ -72,9 +208,16 @@ async function htmlToPdfBuffer(
   html: string,
   leadEmail: string,
   leadName: string,
-  ctaLink: string
+  ctaLink: string,
+  batchValues: BatchPlaceholderValues
 ): Promise<Buffer> {
-  const personalized = personalizeHtml(html, leadEmail, leadName, ctaLink);
+  const personalized = personalizeHtml(
+    html,
+    leadEmail,
+    leadName,
+    ctaLink,
+    batchValues
+  );
   const browser = await chromium.launch({ headless: true });
 
   try {
@@ -132,7 +275,8 @@ function resolveAttachmentNameTemplate(
   template: string,
   originalFilename: string,
   leadEmail: string,
-  leadName: string
+  leadName: string,
+  batchValues: BatchPlaceholderValues
 ): string {
   const normalizedEmail = leadEmail.trim();
   const atIndex = normalizedEmail.lastIndexOf('@');
@@ -167,15 +311,24 @@ function resolveAttachmentNameTemplate(
     originalfile: originalFile,
     Ext: ext,
     ext,
+    ...batchValues,
   };
 
-  let resolved = (template || '{OriginalFile}').replace(
-    /\{([A-Za-z]+)\}/g,
-    (match, key: string) =>
-      Object.prototype.hasOwnProperty.call(replacements, key)
-        ? replacements[key]
-        : match
-  );
+  let resolved = (template || '{OriginalFile}')
+    .replace(
+      /\{\{([A-Za-z]+)\}\}/g,
+      (match, key: string) =>
+        Object.prototype.hasOwnProperty.call(replacements, key)
+          ? replacements[key]
+          : match
+    )
+    .replace(
+      /\{([A-Za-z]+)\}/g,
+      (match, key: string) =>
+        Object.prototype.hasOwnProperty.call(replacements, key)
+          ? replacements[key]
+          : match
+    );
 
   // If the user omitted an extension entirely, preserve the uploaded file extension.
   if (ext && !/\.[A-Za-z0-9]{1,10}$/.test(resolved)) {
@@ -276,6 +429,7 @@ export async function POST(request: NextRequest) {
   }
 
   leadEmails = Array.from(new Set(leadEmails)).slice(0, 10);
+  const batchValues = createBatchPlaceholderValues();
   const fileSource = body.fileSource === 'upload' ? 'upload' : 'generated';
   const ctaLink = body.ctaLink ? String(body.ctaLink).trim() : '';
   const attachmentNameTemplate = body.attachmentNameTemplate
@@ -283,6 +437,8 @@ export async function POST(request: NextRequest) {
     : '{OriginalFile}';
   const convertHtmlToPdf =
     String(body.convertHtmlToPdf ?? 'false').toLowerCase() === 'true';
+  const replaceBatchPlaceholdersInPdf =
+    String(body.replaceBatchPlaceholdersInPdf ?? 'false').toLowerCase() === 'true';
   const dolphinProfileId = body.dolphinProfileId
     ? String(body.dolphinProfileId).trim()
     : '';
@@ -345,7 +501,8 @@ export async function POST(request: NextRequest) {
             html,
             leadEmail,
             leadName,
-            ctaLink
+            ctaLink,
+            batchValues
           );
 
           const originalParts = splitOriginalFilename(originalFilename);
@@ -358,7 +515,8 @@ export async function POST(request: NextRequest) {
             pdfTemplate,
             pdfOriginal,
             leadEmail,
-            leadName
+            leadName,
+            batchValues
           );
 
           attachmentDebug = {
@@ -373,11 +531,35 @@ export async function POST(request: NextRequest) {
             `[Attachment] HTML_TO_PDF: ${originalFilename} -> ${filename} | personalized for ${leadEmail}`
           );
         } else {
+          const isPdf =
+            uploadedFile.type === 'application/pdf' ||
+            /\.pdf$/i.test(originalFilename);
+
+          if (replaceBatchPlaceholdersInPdf && isPdf) {
+            try {
+              const processed = await replaceBatchPlaceholdersInPdfFormFields(
+                attachmentBuffer,
+                batchValues
+              );
+              attachmentBuffer = processed.buffer;
+              logs.push(
+                `[Attachment] PDF_BATCH_PLACEHOLDERS: replaced ${processed.replacedCount} form field(s) | BatchId=${batchValues.BatchId} | Reference=${batchValues.Reference}`
+              );
+            } catch (error: unknown) {
+              const message =
+                error instanceof Error ? error.message : String(error);
+              logs.push(
+                `[Attachment] PDF_BATCH_PLACEHOLDERS_SKIPPED: ${message}`
+              );
+            }
+          }
+
           filename = resolveAttachmentNameTemplate(
             attachmentNameTemplate,
             originalFilename,
             leadEmail,
-            leadName
+            leadName,
+            batchValues
           );
 
           attachmentDebug = {
@@ -410,7 +592,8 @@ export async function POST(request: NextRequest) {
             html,
             leadEmail,
             leadName,
-            ctaLink
+            ctaLink,
+            batchValues
           );
 
           const originalParts = splitOriginalFilename(originalFilename);
@@ -423,7 +606,8 @@ export async function POST(request: NextRequest) {
             pdfTemplate,
             pdfOriginal,
             leadEmail,
-            leadName
+            leadName,
+            batchValues
           );
 
           attachmentDebug = {
@@ -438,11 +622,33 @@ export async function POST(request: NextRequest) {
             `[Attachment] HTML_TO_PDF: ${originalFilename} -> ${filename} | personalized for ${leadEmail}`
           );
         } else {
+          const isPdf = /\.pdf$/i.test(originalFilename);
+
+          if (replaceBatchPlaceholdersInPdf && isPdf) {
+            try {
+              const processed = await replaceBatchPlaceholdersInPdfFormFields(
+                attachmentBuffer,
+                batchValues
+              );
+              attachmentBuffer = processed.buffer;
+              logs.push(
+                `[Attachment] PDF_BATCH_PLACEHOLDERS: replaced ${processed.replacedCount} form field(s) | BatchId=${batchValues.BatchId} | Reference=${batchValues.Reference}`
+              );
+            } catch (error: unknown) {
+              const message =
+                error instanceof Error ? error.message : String(error);
+              logs.push(
+                `[Attachment] PDF_BATCH_PLACEHOLDERS_SKIPPED: ${message}`
+              );
+            }
+          }
+
           filename = resolveAttachmentNameTemplate(
             attachmentNameTemplate,
             originalFilename,
             leadEmail,
-            leadName
+            leadName,
+            batchValues
           );
 
           attachmentDebug = {
@@ -490,7 +696,10 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      filename = 'Clearwater Holdings - Tender Pack 2026-27.pdf';
+      filename = replaceBatchPlaceholders(
+        'Clearwater Holdings - Tender Pack 2026-27.pdf',
+        batchValues
+      );
 
       attachmentDebug = {
         name: filename,
@@ -511,6 +720,10 @@ export async function POST(request: NextRequest) {
         `[Attachment] READY: ${filename} | source=fixed-clearwater-pdf | size=${attachmentBuffer.length} bytes | mime=application/pdf`
       );
     }
+
+    logs.push(
+      `[Batch] ${batchValues.BatchId} | ${batchValues.Reference} | ${batchValues.DateTime} | recipients=${leadEmails.length}`
+    );
 
     const safeFilename = filename || 'attachment';
     attachmentDir = await fs.mkdtemp(path.join(os.tmpdir(), '3d-suite-wetransfer-'));
