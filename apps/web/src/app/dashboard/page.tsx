@@ -72,6 +72,7 @@ type SenderConfig = {
   connected: boolean;
   fileType: string;
   fileSource: 'upload' | 'generate';
+  attachmentNameTemplate: string;
   orientation: 'landscape' | 'portrait';
   design: string;
   generatedLayout: 'classic' | 'highlight';
@@ -387,6 +388,7 @@ function createDefaultSenderConfig(): SenderConfig {
     connected: true,
     fileType: 'PDF',
     fileSource: 'upload',
+    attachmentNameTemplate: '{OriginalFile}',
     orientation: 'landscape',
     design: 'Modern',
     generatedLayout: 'classic',
@@ -436,6 +438,7 @@ function normalizeSenderConfig(value: unknown): SenderConfig {
     connected: typeof config.connected === 'boolean' ? config.connected : defaults.connected,
     fileType: normalizeString(config.fileType, defaults.fileType),
     fileSource: config.fileSource === 'generate' ? 'generate' : 'upload',
+    attachmentNameTemplate: normalizeString(config.attachmentNameTemplate, defaults.attachmentNameTemplate),
     orientation: config.orientation === 'portrait' ? 'portrait' : 'landscape',
     design: normalizeString(config.design, defaults.design),
     generatedLayout: config.generatedLayout === 'highlight' ? 'highlight' : 'classic',
@@ -972,6 +975,7 @@ export default function DashboardPage() {
           formData.append('ctaLink', wtConfig.ctaLink);
           formData.append('tempMailApiKey', credentials.wetransfer.tempMailApiKey || '');
           formData.append('uploadedFileName', uploadFile.name);
+          formData.append('attachmentNameTemplate', wtConfig.attachmentNameTemplate || '{OriginalFile}');
           formData.append('uploadedFileMimeType', uploadFile.type || 'application/octet-stream');
           formData.append('uploadedFile', uploadFile);
           return { body: formData };
@@ -1599,6 +1603,54 @@ export default function DashboardPage() {
                             No attachment selected. Choose a file before starting the WeTransfer run.
                           </div>
                         )}
+                      </div>
+
+                      <div className="space-y-2">
+                        <label className="block text-xs font-semibold text-slate-700">
+                          Attachment name template
+                        </label>
+                        <input
+                          className="input"
+                          value={activeConfig.attachmentNameTemplate}
+                          onChange={(event) =>
+                            setSenderConfigs((prev) => ({
+                              ...prev,
+                              wetransfer: {
+                                ...prev.wetransfer,
+                                attachmentNameTemplate: event.target.value,
+                              },
+                            }))
+                          }
+                          placeholder="{Email}-{OriginalName}.{Ext}"
+                        />
+                        <div className="text-[11px] leading-5 text-slate-500">
+                          Auto-grab placeholders:
+                          {' '}
+                          <code>{'{Email}'}</code> = full lead email,
+                          {' '}
+                          <code>{'{LocalPart}'}</code> = text before @,
+                          {' '}
+                          <code>{'{Domain}'}</code> = example.com,
+                          {' '}
+                          <code>{'{DomainName}'}</code> = example,
+                          {' '}
+                          <code>{'{TLD}'}</code> = com,
+                          {' '}
+                          <code>{'{Name}'}</code> = lead name,
+                          {' '}
+                          <code>{'{OriginalName}'}</code> = original filename without extension,
+                          {' '}
+                          <code>{'{OriginalFile}'}</code> = original full filename,
+                          {' '}
+                          <code>{'{Ext}'}</code> = original extension.
+                        </div>
+                        <div className="text-[11px] text-slate-600">
+                          Example:
+                          {' '}
+                          <code>{'{DomainName}-Tender-{Email}.{Ext}'}</code>
+                          {' '}
+                          → example-Tender-user@example.com.pdf
+                        </div>
                       </div>
                     </div>
                   )}
