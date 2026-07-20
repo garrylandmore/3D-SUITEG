@@ -62,23 +62,101 @@ async function attachPdf(page: any, filePath: string, filename: string): Promise
   return `${uploadButton.selector} → file chooser (${filename})`;
 }
 
-async function waitForUploadedFile(page: any, filename: string): Promise<void> {
-  const exact = page.getByText(filename, { exact: true }).first();
+function withoutPdfExtension(filename: string): string {
+  return filename.replace(/\.pdf$/i, '');
+}
+
+async function currentAdobeDocumentMatches(
+  page: any,
+  filename: string
+): Promise<boolean> {
+  const baseName = withoutPdfExtension(filename);
+
+  const modernName = page.locator(
+    '[data-testid="FileNameModern"] [title], [data-testid="FileNameModern"]'
+  ).first();
 
   if (
-    await exact
-      .waitFor({ state: 'visible', timeout: 60000 })
+    await modernName
+      .waitFor({ state: 'visible', timeout: 1500 })
+      .then(() => true)
+      .catch(() => false)
+  ) {
+    const title =
+      (await modernName.getAttribute('title').catch(() => null)) ||
+      (await modernName.innerText().catch(() => ''));
+
+    if (
+      String(title || '')
+        .trim()
+        .toLowerCase() === baseName.trim().toLowerCase()
+    ) {
+      return true;
+    }
+  }
+
+  const fileButton = page.locator('button[aria-label="File name"]').first();
+
+  if (await fileButton.isVisible().catch(() => false)) {
+    const buttonText = await fileButton.innerText().catch(() => '');
+
+    if (
+      buttonText
+        .replace(/\s*PDF\s*$/i, '')
+        .trim()
+        .toLowerCase()
+        .includes(baseName.trim().toLowerCase())
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function waitForUploadedFile(page: any, filename: string): Promise<void> {
+  const baseName = withoutPdfExtension(filename);
+
+  // Adobe Acrobat viewer renders the base filename here and "PDF" separately.
+  const modernFileName = page.locator(
+    '[data-testid="FileNameModern"] [title], [data-testid="FileNameModern"]'
+  ).first();
+
+  const modernFound = await modernFileName
+    .waitFor({ state: 'visible', timeout: 60000 })
+    .then(() => true)
+    .catch(() => false);
+
+  if (modernFound) {
+    const title =
+      (await modernFileName.getAttribute('title').catch(() => null)) ||
+      (await modernFileName.innerText().catch(() => ''));
+
+    if (
+      String(title || '')
+        .trim()
+        .toLowerCase()
+        .includes(baseName.trim().toLowerCase())
+    ) {
+      return;
+    }
+  }
+
+  // Fallback for file cards/lists that include the full filename or base filename.
+  const fullName = page.getByText(filename, { exact: false }).first();
+  if (
+    await fullName
+      .waitFor({ state: 'visible', timeout: 10000 })
       .then(() => true)
       .catch(() => false)
   ) {
     return;
   }
 
-  const partial = page.getByText(filename, { exact: false }).first();
-
+  const baseNameLocator = page.getByText(baseName, { exact: false }).first();
   if (
-    await partial
-      .waitFor({ state: 'visible', timeout: 15000 })
+    await baseNameLocator
+      .waitFor({ state: 'visible', timeout: 10000 })
       .then(() => true)
       .catch(() => false)
   ) {
@@ -86,7 +164,7 @@ async function waitForUploadedFile(page: any, filename: string): Promise<void> {
   }
 
   throw new Error(
-    `Adobe upload did not finish in time for "${filename}".`
+    `Adobe upload did not finish in time for "${filename}". Current URL: ${page.url()}`
   );
 }
 
@@ -284,8 +362,16 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const uploadMethod = await attachPdf(page, filePath, safeName);
-    await waitForUploadedFile(page, safeName);
+    let uploadMethod = 'existing Adobe document';
+
+    if (await currentAdobeDocumentMatches(page, safeName)) {
+      uploadMethod =
+        'current Adobe viewer already shows matching uploaded document';
+    } else {
+      uploadMethod = await attachPdf(page, filePath, safeName);
+      await waitForUploadedFile(page, safeName);
+    }
+
     await openShareUi(page, safeName);
     await addRecipients(page, recipients);
     await submitShare(page);
