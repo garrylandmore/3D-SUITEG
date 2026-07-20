@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
 
-import { stopDolphinProfile } from '@/lib/dolphin-browser';
 import {
   clearAdobeBrowserSession,
   getAdobeBrowserStore,
@@ -27,9 +26,14 @@ async function detectLoggedIn(): Promise<{
 
   try {
     const loginUrl =
-      /adobelogin\.com|\/signin|\/login|accounts\.adobe\.com/i.test(currentUrl);
+      /adobelogin\.com|\/signin|\/login|accounts\.adobe\.com/i.test(
+        currentUrl
+      );
 
-    if (!loginUrl && /acrobat\.adobe\.com|documentcloud\.adobe\.com/i.test(currentUrl)) {
+    if (
+      !loginUrl &&
+      /acrobat\.adobe\.com|documentcloud\.adobe\.com/i.test(currentUrl)
+    ) {
       const loggedInIndicators = [
         'button[aria-label*="account" i]',
         'button[aria-label*="profile" i]',
@@ -41,16 +45,28 @@ async function detectLoggedIn(): Promise<{
       ];
 
       for (const selector of loggedInIndicators) {
-        if (await page.locator(selector).first().isVisible().catch(() => false)) {
+        if (
+          await page
+            .locator(selector)
+            .first()
+            .isVisible()
+            .catch(() => false)
+        ) {
           loggedIn = true;
           break;
         }
       }
 
       if (!loggedIn) {
-        const bodyText = await page.locator('body').innerText().catch(() => '');
+        const bodyText = await page
+          .locator('body')
+          .innerText()
+          .catch(() => '');
+
         loggedIn =
-          /\bYour documents\b|\bRecent\b|\bDocuments\b|\bUpload\b|\bShare\b/i.test(bodyText) &&
+          /\bYour documents\b|\bRecent\b|\bDocuments\b|\bUpload\b|\bShare\b/i.test(
+            bodyText
+          ) &&
           !/\bSign in\b|\bLog in\b/i.test(bodyText);
       }
     }
@@ -59,7 +75,7 @@ async function detectLoggedIn(): Promise<{
   return {
     connected: true,
     loggedIn,
-    profileId: String(session.profileId),
+    profileId: session.sessionId,
     currentUrl,
   };
 }
@@ -79,11 +95,7 @@ export async function DELETE() {
 
   if (session) {
     try {
-      await session.browser.close();
-    } catch {}
-
-    try {
-      await stopDolphinProfile(session.profileId);
+      await session.context.close();
     } catch {}
   }
 
