@@ -207,14 +207,91 @@ async function openShareUi(page: any, filename: string): Promise<void> {
   await share.locator.click();
 }
 
+async function prepareAdobeShareDialog(page: any): Promise<void> {
+  // 1) Turn off "People can add comments" if Adobe has it enabled.
+  const commentToggle = page.locator(
+    'input.spectrum-ToggleSwitch-input[role="switch"][aria-label^="People can add comments"]'
+  ).first();
+
+  if (
+    await commentToggle
+      .waitFor({ state: 'attached', timeout: 10000 })
+      .then(() => true)
+      .catch(() => false)
+  ) {
+    const checkedAttr = await commentToggle.getAttribute('aria-checked');
+    const isChecked =
+      checkedAttr === 'true' ||
+      (await commentToggle.isChecked().catch(() => false));
+
+    if (isChecked) {
+      await commentToggle.click({ force: true });
+      await page.waitForFunction(
+        () => {
+          const el = document.querySelector(
+            'input.spectrum-ToggleSwitch-input[role="switch"][aria-label^="People can add comments"]'
+          ) as HTMLInputElement | null;
+
+          if (!el) return true;
+
+          return (
+            el.getAttribute('aria-checked') === 'false' ||
+            el.checked === false
+          );
+        },
+        { timeout: 10000 }
+      ).catch(() => undefined);
+
+      console.log('ADOBE SHARE COMMENTS TOGGLE | disabled');
+    }
+  }
+
+  // 2) Adobe initially renders a placeholder input. Clicking it causes
+  // the dialog to switch into the real invite-entry mode.
+  const placeholderInput = page.locator(
+    'input[data-testid="invite-input-field-placeholder"], input[placeholder="Add name or email to invite"]'
+  ).first();
+
+  if (
+    await placeholderInput
+      .waitFor({ state: 'visible', timeout: 10000 })
+      .then(() => true)
+      .catch(() => false)
+  ) {
+    await placeholderInput.click({ timeout: 10000 });
+
+    console.log(
+      'ADOBE SHARE INVITE PLACEHOLDER | clicked | waiting for real invite field'
+    );
+  }
+
+  // 3) Wait for Adobe to replace the placeholder with the real TagField input.
+  const realInviteInput = page.locator(
+    'input[data-testid="invite-input-field"], input[aria-label="Add people to share Document with them"], input[placeholder="Add names or emails to invite"]'
+  ).first();
+
+  const realReady = await realInviteInput
+    .waitFor({ state: 'visible', timeout: 15000 })
+    .then(() => true)
+    .catch(() => false);
+
+  if (!realReady) {
+    throw new Error(
+      'Adobe Share dialog did not switch to the real invite email field.'
+    );
+  }
+
+  await realInviteInput.click({ timeout: 10000 });
+
+  console.log('ADOBE SHARE INVITE FIELD | real invite field ready');
+}
+
 async function addRecipients(page: any, recipients: string[]): Promise<void> {
   const primarySelector = 'input[data-testid="invite-input-field"]';
 
   const fallbackSelectors = [
     'input[aria-label="Add people to share Document with them"]',
     'input[placeholder="Add names or emails to invite"]',
-    'input[data-testid="invite-input-field-placeholder"]',
-    'input[placeholder="Add name or email to invite"]',
     'input.react-spectrum-TagField-input',
   ];
 
@@ -519,6 +596,7 @@ export async function POST(request: NextRequest) {
     }
 
     await openShareUi(page, safeName);
+    await prepareAdobeShareDialog(page);
     await addRecipients(page, recipients);
     await submitShare(page);
 
