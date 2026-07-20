@@ -320,7 +320,7 @@ export async function initWeTransferSession(
 
 export async function sendLeadViaWeTransfer(
   session: WeTransferSession,
-  leadEmail: string,
+  leadEmails: string[],
   filename: string,
   options?: {
     fileSource?: 'upload' | 'generated';
@@ -334,6 +334,21 @@ export async function sendLeadViaWeTransfer(
   },
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void
 ): Promise<WeTransferSendResult> {
+  const normalizedLeadEmails = Array.from(
+    new Set(leadEmails.map((email) => email.trim()).filter(Boolean))
+  ).slice(0, 10);
+  const leadEmail = normalizedLeadEmails[0] || '';
+
+  if (!normalizedLeadEmails.length) {
+    return {
+      success: false,
+      leadEmail: '',
+      step: 'send_to_lead',
+      detail: 'At least one recipient email is required',
+      confirmationStatus: 'failed',
+    };
+  }
+
   if (!session.tempMailbox) {
     session.latestError = 'No temp mailbox in session – session may have failed during init';
     session.status = 'failed';
@@ -401,7 +416,7 @@ export async function sendLeadViaWeTransfer(
     'preparing_attachment',
     `preparing_attachment | ${filename} | ${options.fileBuffer.length} bytes | source=${options.fileSource ?? 'unknown'}`
   );
-  stepUpdate('send_to_lead', 'running', `Preparing browser send for ${leadEmail}`);
+  stepUpdate('send_to_lead', 'running', `Preparing browser send for ${normalizedLeadEmails.length} recipient(s): ${normalizedLeadEmails.join(', ')}`);
 
   let transferUrl: string | undefined;
   const mailboxEmail = session.tempMailbox.email;
@@ -409,7 +424,7 @@ export async function sendLeadViaWeTransfer(
   const result = await createWeTransferTransfer(
     filename,
     options.fileBuffer,
-    leadEmail,
+    normalizedLeadEmails,
     options?.ctaLink?.trim()
       ? `Secure link for ${options.leadName || leadEmail}: ${options.ctaLink}`
       : `Secure file package for ${options.leadName || leadEmail}`,
