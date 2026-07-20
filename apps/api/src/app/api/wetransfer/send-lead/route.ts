@@ -501,7 +501,6 @@ export async function POST(request: NextRequest) {
     console.log(
       `[wetransfer/send-lead] ${getBrowserProxyDiagnostics(
         proxyConfig,
-        dolphinProfileId: dolphinProfileId || undefined,
         'launchWeTransferBrowser',
         'POST /api/wetransfer/send-lead'
       )}`
@@ -519,6 +518,7 @@ export async function POST(request: NextRequest) {
         fileBuffer: attachmentBuffer,
         attachmentPath,
         proxyConfig,
+        dolphinProfileId: dolphinProfileId || undefined,
       },
       (step, logLine) => {
         stepSnapshots.push({ ...step });
