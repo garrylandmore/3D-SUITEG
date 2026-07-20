@@ -330,6 +330,7 @@ export async function sendLeadViaWeTransfer(
     fileBuffer?: Buffer;
     attachmentPath?: string;
     proxyConfig?: BrowserProxyConfig | null;
+    dolphinProfileId?: string;
   },
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void
 ): Promise<WeTransferSendResult> {
@@ -454,6 +455,7 @@ export async function sendLeadViaWeTransfer(
       attachmentPath: options.attachmentPath,
       senderEmail: mailboxEmail,
       proxyConfig: options.proxyConfig,
+      dolphinProfileId: options.dolphinProfileId,
       onVerificationRequired:
           async () => {
               console.log(`OTP POLLING CALLBACK ENTERED | mailbox=${mailboxEmail}`);
