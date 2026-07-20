@@ -711,8 +711,6 @@ export default function DashboardPage() {
   const [adobeConnection, setAdobeConnection] =
     React.useState<AdobeConnectionStatus>({ connected: false });
   const [adobeConnecting, setAdobeConnecting] = React.useState(false);
-  const [selectedAdobeDolphinProfileId, setSelectedAdobeDolphinProfileId] =
-    React.useState('');
 
   const wetransferAttachment = React.useMemo(
     () => getWeTransferAttachmentDebug(senderConfigs.wetransfer, wetransferUploadFile),
@@ -1373,20 +1371,14 @@ export default function DashboardPage() {
     return () => window.clearInterval(timer);
   }, [refreshAdobeConnection]);
 
-  async function connectAdobeWithDolphin() {
-    const dolphinProfileId = selectedAdobeDolphinProfileId.trim();
-
-    if (!dolphinProfileId) {
-      addToast('Choose a Dolphin profile for Adobe login', 'error');
-      return;
-    }
-
+  async function connectAdobeInBrowser() {
     setAdobeConnecting(true);
+
     try {
       const response = await fetch('/api/adobe/browser/connect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dolphinProfileId }),
+        body: JSON.stringify({}),
       });
 
       const data = await parseApiJson<AdobeConnectionStatus & {
@@ -1394,16 +1386,18 @@ export default function DashboardPage() {
       }>(response);
 
       if (!response.ok || data.success === false) {
-        throw new Error(data.error || `Adobe browser connect failed (HTTP ${response.status})`);
+        throw new Error(
+          data.error || `Adobe browser connect failed (HTTP ${response.status})`
+        );
       }
 
       setAdobeConnection(data);
       appendLog(
         'info',
-        `Adobe opened in Dolphin profile ${dolphinProfileId}. Log in manually in the Dolphin browser, then return here.`,
+        'Adobe opened in the normal browser. Log in manually, then return to 3D Suite.',
         'adobe'
       );
-      addToast('Adobe opened in Dolphin — log in manually', 'success');
+      addToast('Adobe opened in browser — log in manually', 'success');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setAdobeConnection((prev) => ({ ...prev, error: message }));
@@ -1430,7 +1424,7 @@ export default function DashboardPage() {
         ...prev,
         adobe: { ...prev.adobe, connected: false },
       }));
-      appendLog('info', 'Adobe Dolphin profile disconnected and stopped', 'adobe');
+      appendLog('info', 'Adobe browser session disconnected and closed', 'adobe');
       addToast('Adobe disconnected', 'success');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2690,13 +2684,10 @@ export default function DashboardPage() {
             <AdobeSenderPanel
               connection={adobeConnection}
               connecting={adobeConnecting}
-              dolphinProfileIds={senderConfigs.wetransfer.dolphinProfileIds}
-              selectedDolphinProfileId={selectedAdobeDolphinProfileId}
               leadEmails={leads
                 .map((lead) => lead.email || lead.normalized)
                 .filter((email): email is string => Boolean(email))}
-              onSelectDolphinProfile={setSelectedAdobeDolphinProfileId}
-              onConnect={() => void connectAdobeWithDolphin()}
+              onConnect={() => void connectAdobeInBrowser()}
               onDisconnect={() => void disconnectAdobe()}
               onRefresh={() => void refreshAdobeConnection()}
               onLog={(level, message) => appendLog(level, message, 'adobe')}
@@ -2939,7 +2930,7 @@ export default function DashboardPage() {
                 <div className="grid sm:grid-cols-2 gap-3">
                   <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
                     Adobe browser mode does not require a Client ID, Client Secret, or OAuth Redirect URI.
-                    Choose a Dolphin profile from the Adobe sender tab and log in manually at acrobat.adobe.com.
+                    Click Open Adobe & Connect and log in manually in the normal Chrome browser window.
                   </div>
                   <Field label="QuickBooks Company ID"><input className="input" value={credentials.quickbooks.companyId} onChange={(e) => setCredentials((p) => ({ ...p, quickbooks: { ...p.quickbooks, companyId: e.target.value } }))} /></Field>
                   <Field label="DocuSign Account ID"><input className="input" value={credentials.docusign.accountId} onChange={(e) => setCredentials((p) => ({ ...p, docusign: { ...p.docusign, accountId: e.target.value } }))} /></Field>
@@ -3639,10 +3630,7 @@ function LogsModal({ logs, onClear }: { logs: RuntimeLog[]; onClear: () => void 
 function AdobeSenderPanel({
   connection,
   connecting,
-  dolphinProfileIds,
-  selectedDolphinProfileId,
   leadEmails,
-  onSelectDolphinProfile,
   onConnect,
   onDisconnect,
   onRefresh,
@@ -3651,10 +3639,7 @@ function AdobeSenderPanel({
 }: {
   connection: AdobeConnectionStatus;
   connecting: boolean;
-  dolphinProfileIds: string[];
-  selectedDolphinProfileId: string;
   leadEmails: string[];
-  onSelectDolphinProfile: (value: string) => void;
   onConnect: () => void;
   onDisconnect: () => void;
   onRefresh: () => void;
@@ -3770,7 +3755,7 @@ function AdobeSenderPanel({
             </div>
 
             {connection.profileId && (
-              <div className="mt-1 text-xs">Dolphin profile: {connection.profileId}</div>
+              <div className="mt-1 text-xs">Browser session: {connection.profileId}</div>
             )}
             {connection.currentUrl && (
               <div className="mt-1 text-xs break-all">URL: {connection.currentUrl}</div>
@@ -3778,37 +3763,14 @@ function AdobeSenderPanel({
           </div>
 
           {!connection.connected ? (
-            <>
-              <Field label="Dolphin Profile">
-                <select
-                  className="input"
-                  value={selectedDolphinProfileId}
-                  onChange={(event) => onSelectDolphinProfile(event.target.value)}
-                >
-                  <option value="">Choose Dolphin profile</option>
-                  {dolphinProfileIds.map((profileId) => (
-                    <option key={profileId} value={profileId}>
-                      {profileId}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-
-              {dolphinProfileIds.length === 0 && (
-                <div className="text-xs text-amber-700">
-                  Add Dolphin profile IDs in the WeTransfer connection settings first.
-                </div>
-              )}
-
-              <button
-                type="button"
-                disabled={connecting}
-                className="px-3 py-2 rounded bg-[#6C63FF] text-white disabled:opacity-50"
-                onClick={onConnect}
-              >
-                {connecting ? 'Opening Adobe…' : 'Open Adobe & Connect'}
-              </button>
-            </>
+            <button
+              type="button"
+              disabled={connecting}
+              className="px-3 py-2 rounded bg-[#6C63FF] text-white disabled:opacity-50"
+              onClick={onConnect}
+            >
+              {connecting ? 'Opening Adobe…' : 'Open Adobe & Connect'}
+            </button>
           ) : (
             <div className="flex flex-wrap gap-2">
               <button type="button" className="px-3 py-2 rounded border" onClick={onRefresh}>
@@ -3819,7 +3781,7 @@ function AdobeSenderPanel({
                 className="px-3 py-2 rounded border border-red-300 text-red-600"
                 onClick={onDisconnect}
               >
-                Disconnect & Stop Dolphin
+                Disconnect & Close Browser
               </button>
             </div>
           )}
@@ -3853,7 +3815,7 @@ function AdobeSenderPanel({
           </Field>
 
           <div className="text-xs text-slate-500">
-            Imported lead emails are prefilled automatically. Adobe remains open in the same Dolphin profile
+            Imported lead emails are prefilled automatically. Adobe remains open in the same normal browser session
             and the sender uses Acrobat's normal browser upload/share interface.
           </div>
 
