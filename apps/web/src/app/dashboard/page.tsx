@@ -124,6 +124,23 @@ type BrowserProxyTestResult = {
   diagnostics?: string;
 };
 
+type CloudflareRedirectConfig = {
+  accountId: string;
+  apiToken: string;
+  namespaceId: string;
+  publicBaseUrl: string;
+};
+
+type CloudflareRedirectItem = {
+  alias: string;
+  destination: string;
+  statusCode: 301 | 302 | 307 | 308;
+  createdAt?: string;
+  updatedAt?: string;
+  redirectUrl: string;
+};
+
+
 type CredentialsState = {
   wetransfer: {
     provider: 'mailslurp' | 'tempmailio';
@@ -534,6 +551,22 @@ function getTempMailProviderLabel(
   return provider === 'tempmailio' ? 'Temp-Mail.io' : 'MailSlurp';
 }
 
+
+const CLOUDFLARE_REDIRECT_SESSION_KEY = '3d-suite-cloudflare-redirect-config';
+
+function normalizeCloudflarePublicBaseUrl(value: string): string {
+  return value.trim().replace(/\/+$/, '');
+}
+
+function createRandomRedirectAlias(): string {
+  const alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let value = '';
+  for (let index = 0; index < 8; index += 1) {
+    value += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return value;
+}
+
 export default function DashboardPage() {
   const [sidebarOpen, setSidebarOpen] = React.useState(true);
   const [campaignName, setCampaignName] = React.useState('Q3 Operations Campaign');
@@ -545,6 +578,22 @@ export default function DashboardPage() {
   const [isPreparing, setIsPreparing] = React.useState(false);
   const [wetransferUploadFile, setWetransferUploadFile] = React.useState<File | null>(null);
   const [newDolphinProfileId, setNewDolphinProfileId] = React.useState('');
+
+  const [cloudflareRedirectConfig, setCloudflareRedirectConfig] =
+    React.useState<CloudflareRedirectConfig>({
+      accountId: '',
+      apiToken: '',
+      namespaceId: '',
+      publicBaseUrl: '',
+    });
+  const [redirectDestination, setRedirectDestination] = React.useState('');
+  const [redirectAlias, setRedirectAlias] = React.useState('');
+  const [redirectStatusCode, setRedirectStatusCode] =
+    React.useState<301 | 302 | 307 | 308>(302);
+  const [redirectItems, setRedirectItems] = React.useState<CloudflareRedirectItem[]>([]);
+  const [redirectBusy, setRedirectBusy] = React.useState(false);
+  const [redirectEditingAlias, setRedirectEditingAlias] = React.useState<string | null>(null);
+  const [redirectError, setRedirectError] = React.useState<string | null>(null);
 
   const [leads, setLeads] = React.useState<Lead[]>([]);
   const [logs, setLogs] = React.useState<RuntimeLog[]>([]);
@@ -610,6 +659,24 @@ export default function DashboardPage() {
       }));
     } catch {
       // Ignore sessionStorage errors.
+    }
+  }, []);
+
+
+  React.useEffect(() => {
+    try {
+      const saved = window.sessionStorage.getItem(CLOUDFLARE_REDIRECT_SESSION_KEY);
+      if (!saved) return;
+
+      const parsed = JSON.parse(saved) as Partial<CloudflareRedirectConfig>;
+      setCloudflareRedirectConfig({
+        accountId: String(parsed.accountId || ''),
+        apiToken: String(parsed.apiToken || ''),
+        namespaceId: String(parsed.namespaceId || ''),
+        publicBaseUrl: String(parsed.publicBaseUrl || ''),
+      });
+    } catch {
+      // Ignore malformed/unavailable session storage.
     }
   }, []);
 
@@ -1394,6 +1461,206 @@ export default function DashboardPage() {
   }
 
   const activeConfig = senderConfigs[activeSender];
+
+
+  const cloudflareRedirectHeaders = React.useCallback(() => {
+    return {
+      'Content-Type': 'application/json',
+      'x-cf-account-id': cloudflareRedirectConfig.accountId.trim(),
+      'x-cf-api-token': cloudflareRedirectConfig.apiToken.trim(),
+      'x-cf-kv-namespace-id': cloudflareRedirectConfig.namespaceId.trim(),
+      'x-cf-public-base-url': normalizeCloudflarePublicBaseUrl(
+        cloudflareRedirectConfig.publicBaseUrl
+      ),
+    };
+  }, [cloudflareRedirectConfig]);
+
+  const refreshCloudflareRedirects = React.useCallback(async () => {
+    const { accountId, apiToken, namespaceId, publicBaseUrl } =
+      cloudflareRedirectConfig;
+
+    if (!accountId.trim() || !apiToken.trim() || !namespaceId.trim() || !publicBaseUrl.trim()) {
+      setRedirectItems([]);
+      return;
+    }
+
+    setRedirectBusy(true);
+    setRedirectError(null);
+
+    try {
+      const response = await fetch('/api/cloudflare-redirects', {
+        method: 'GET',
+        headers: cloudflareRedirectHeaders(),
+      });
+
+      const data = await parseApiJson<{
+        success?: boolean;
+        redirects?: CloudflareRedirectItem[];
+        error?: string;
+      }>(response);
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || `Could not load redirects (HTTP ${response.status})`);
+      }
+
+      setRedirectItems(Array.isArray(data.redirects) ? data.redirects : []);
+    } catch (error) {
+      setRedirectError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRedirectBusy(false);
+    }
+  }, [cloudflareRedirectConfig, cloudflareRedirectHeaders]);
+
+  const saveCloudflareRedirectConfigToSession = React.useCallback(() => {
+    const normalized = {
+      ...cloudflareRedirectConfig,
+      publicBaseUrl: normalizeCloudflarePublicBaseUrl(
+        cloudflareRedirectConfig.publicBaseUrl
+      ),
+    };
+
+    window.sessionStorage.setItem(
+      CLOUDFLARE_REDIRECT_SESSION_KEY,
+      JSON.stringify(normalized)
+    );
+    setCloudflareRedirectConfig(normalized);
+    addToast('Cloudflare redirect configuration saved to session', 'success');
+  }, [cloudflareRedirectConfig, addToast]);
+
+  const clearCloudflareRedirectConfig = React.useCallback(() => {
+    window.sessionStorage.removeItem(CLOUDFLARE_REDIRECT_SESSION_KEY);
+    setCloudflareRedirectConfig({
+      accountId: '',
+      apiToken: '',
+      namespaceId: '',
+      publicBaseUrl: '',
+    });
+    setRedirectItems([]);
+    setRedirectError(null);
+    addToast('Cloudflare redirect configuration cleared', 'success');
+  }, [addToast]);
+
+  const createOrUpdateCloudflareRedirect = React.useCallback(async () => {
+    const destination = redirectDestination.trim();
+
+    if (!destination) {
+      setRedirectError('Destination URL is required.');
+      return;
+    }
+
+    try {
+      const parsed = new URL(destination);
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error('Destination URL must use http or https.');
+      }
+    } catch {
+      setRedirectError('Enter a valid http:// or https:// destination URL.');
+      return;
+    }
+
+    const alias = (redirectAlias.trim() || createRandomRedirectAlias())
+      .replace(/^\/+|\/+$/g, '');
+
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(alias)) {
+      setRedirectError(
+        'Alias may contain only letters, numbers, hyphens, and underscores.'
+      );
+      return;
+    }
+
+    setRedirectBusy(true);
+    setRedirectError(null);
+
+    try {
+      const method = redirectEditingAlias ? 'PUT' : 'POST';
+      const response = await fetch('/api/cloudflare-redirects', {
+        method,
+        headers: cloudflareRedirectHeaders(),
+        body: JSON.stringify({
+          alias: redirectEditingAlias || alias,
+          newAlias: redirectEditingAlias ? alias : undefined,
+          destination,
+          statusCode: redirectStatusCode,
+        }),
+      });
+
+      const data = await parseApiJson<{
+        success?: boolean;
+        redirect?: CloudflareRedirectItem;
+        error?: string;
+      }>(response);
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || `Redirect operation failed (HTTP ${response.status})`);
+      }
+
+      setRedirectDestination('');
+      setRedirectAlias('');
+      setRedirectStatusCode(302);
+      setRedirectEditingAlias(null);
+
+      addToast(
+        redirectEditingAlias ? 'Redirect updated' : 'Redirect created',
+        'success'
+      );
+
+      await refreshCloudflareRedirects();
+    } catch (error) {
+      setRedirectError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRedirectBusy(false);
+    }
+  }, [
+    redirectDestination,
+    redirectAlias,
+    redirectStatusCode,
+    redirectEditingAlias,
+    cloudflareRedirectHeaders,
+    refreshCloudflareRedirects,
+    addToast,
+  ]);
+
+  const deleteCloudflareRedirect = React.useCallback(
+    async (alias: string) => {
+      setRedirectBusy(true);
+      setRedirectError(null);
+
+      try {
+        const response = await fetch(
+          `/api/cloudflare-redirects?alias=${encodeURIComponent(alias)}`,
+          {
+            method: 'DELETE',
+            headers: cloudflareRedirectHeaders(),
+          }
+        );
+
+        const data = await parseApiJson<{ success?: boolean; error?: string }>(
+          response
+        );
+
+        if (!response.ok || !data.success) {
+          throw new Error(
+            data.error || `Could not delete redirect (HTTP ${response.status})`
+          );
+        }
+
+        addToast(`Redirect /${alias} deleted`, 'success');
+        await refreshCloudflareRedirects();
+      } catch (error) {
+        setRedirectError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setRedirectBusy(false);
+      }
+    },
+    [cloudflareRedirectHeaders, refreshCloudflareRedirects, addToast]
+  );
+
+
+  React.useEffect(() => {
+    if (activeModal === 'redirect-generator') {
+      void refreshCloudflareRedirects();
+    }
+  }, [activeModal, refreshCloudflareRedirects]);
 
   return (
     <div className="min-h-screen flex bg-[#F8F9FC] text-slate-900">
@@ -2779,7 +3046,264 @@ export default function DashboardPage() {
             </div>
           )}
 
-          {!['leads', 'credentials', 'settings', 'logs', 'browser-proxy'].includes(activeModal as string) && (
+
+          {activeModal === 'redirect-generator' && (
+            <div className="space-y-4 text-sm">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-3">
+                <div>
+                  <h4 className="font-semibold text-slate-800">Cloudflare Configuration</h4>
+                  <p className="text-xs text-slate-500 mt-1">
+                    These values are stored only in this browser session when you click Save to session.
+                  </p>
+                </div>
+
+                <div className="grid sm:grid-cols-2 gap-3">
+                  <Field label="Account ID">
+                    <input
+                      className="input"
+                      value={cloudflareRedirectConfig.accountId}
+                      onChange={(event) =>
+                        setCloudflareRedirectConfig((prev) => ({
+                          ...prev,
+                          accountId: event.target.value,
+                        }))
+                      }
+                      placeholder="Cloudflare Account ID"
+                    />
+                  </Field>
+
+                  <Field label="KV Namespace ID">
+                    <input
+                      className="input"
+                      value={cloudflareRedirectConfig.namespaceId}
+                      onChange={(event) =>
+                        setCloudflareRedirectConfig((prev) => ({
+                          ...prev,
+                          namespaceId: event.target.value,
+                        }))
+                      }
+                      placeholder="Workers KV Namespace ID"
+                    />
+                  </Field>
+
+                  <div className="sm:col-span-2">
+                    <Field label="Cloudflare API Token">
+                      <input
+                        type="password"
+                        className="input"
+                        value={cloudflareRedirectConfig.apiToken}
+                        onChange={(event) =>
+                          setCloudflareRedirectConfig((prev) => ({
+                            ...prev,
+                            apiToken: event.target.value,
+                          }))
+                        }
+                        placeholder="API token with Workers KV read/write permission"
+                      />
+                    </Field>
+                  </div>
+
+                  <div className="sm:col-span-2">
+                    <Field label="Public Worker URL">
+                      <input
+                        className="input"
+                        value={cloudflareRedirectConfig.publicBaseUrl}
+                        onChange={(event) =>
+                          setCloudflareRedirectConfig((prev) => ({
+                            ...prev,
+                            publicBaseUrl: event.target.value,
+                          }))
+                        }
+                        placeholder="https://redirector.your-subdomain.workers.dev"
+                      />
+                    </Field>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    className="px-3 py-2 rounded bg-[#6C63FF] text-white text-xs font-semibold"
+                    onClick={saveCloudflareRedirectConfigToSession}
+                  >
+                    Save to session
+                  </button>
+                  <button
+                    type="button"
+                    className="px-3 py-2 rounded border border-red-300 text-red-600 text-xs font-semibold"
+                    onClick={clearCloudflareRedirectConfig}
+                  >
+                    Clear
+                  </button>
+                  <button
+                    type="button"
+                    className="px-3 py-2 rounded border border-slate-300 text-slate-700 text-xs font-semibold disabled:opacity-50"
+                    disabled={redirectBusy}
+                    onClick={() => void refreshCloudflareRedirects()}
+                  >
+                    {redirectBusy ? 'Loading…' : 'Refresh redirects'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-slate-200 bg-white p-3 space-y-3">
+                <h4 className="font-semibold text-slate-800">
+                  {redirectEditingAlias ? 'Edit Redirect' : 'Generate Redirect'}
+                </h4>
+
+                <Field label="Destination URL">
+                  <input
+                    className="input"
+                    value={redirectDestination}
+                    onChange={(event) => setRedirectDestination(event.target.value)}
+                    placeholder="https://example.com/document"
+                  />
+                </Field>
+
+                <div className="grid sm:grid-cols-2 gap-3">
+                  <Field label="Custom alias (optional)">
+                    <input
+                      className="input"
+                      value={redirectAlias}
+                      onChange={(event) => setRedirectAlias(event.target.value)}
+                      placeholder="tender-2026"
+                    />
+                  </Field>
+
+                  <Field label="Redirect type">
+                    <select
+                      className="input"
+                      value={redirectStatusCode}
+                      onChange={(event) =>
+                        setRedirectStatusCode(
+                          Number(event.target.value) as 301 | 302 | 307 | 308
+                        )
+                      }
+                    >
+                      <option value={302}>302 Temporary</option>
+                      <option value={301}>301 Permanent</option>
+                      <option value={307}>307 Temporary (preserve method)</option>
+                      <option value={308}>308 Permanent (preserve method)</option>
+                    </select>
+                  </Field>
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    className="px-3 py-2 rounded bg-emerald-600 text-white text-xs font-semibold disabled:opacity-50"
+                    disabled={redirectBusy}
+                    onClick={() => void createOrUpdateCloudflareRedirect()}
+                  >
+                    {redirectEditingAlias ? 'Save changes' : 'Generate Redirect'}
+                  </button>
+
+                  {redirectEditingAlias && (
+                    <button
+                      type="button"
+                      className="px-3 py-2 rounded border border-slate-300 text-xs"
+                      onClick={() => {
+                        setRedirectEditingAlias(null);
+                        setRedirectDestination('');
+                        setRedirectAlias('');
+                        setRedirectStatusCode(302);
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {redirectError && (
+                <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                  {redirectError}
+                </div>
+              )}
+
+              <div className="rounded-lg border border-slate-200 bg-white p-3">
+                <div className="flex items-center justify-between mb-3">
+                  <h4 className="font-semibold text-slate-800">Redirect History</h4>
+                  <span className="text-xs text-slate-500">{redirectItems.length} redirect(s)</span>
+                </div>
+
+                <div className="max-h-72 overflow-auto space-y-2">
+                  {redirectItems.length === 0 && (
+                    <div className="text-xs text-slate-400 py-4 text-center">
+                      No redirects loaded yet.
+                    </div>
+                  )}
+
+                  {redirectItems.map((item) => (
+                    <div
+                      key={item.alias}
+                      className="rounded border border-slate-200 p-3 space-y-2"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="font-mono text-xs text-[#6C63FF] break-all">
+                            {item.redirectUrl}
+                          </div>
+                          <div className="text-xs text-slate-500 mt-1 break-all">
+                            → {item.destination}
+                          </div>
+                          <div className="text-[11px] text-slate-400 mt-1">
+                            HTTP {item.statusCode}
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap gap-1 shrink-0">
+                          <button
+                            type="button"
+                            className="px-2 py-1 rounded border text-[11px]"
+                            onClick={() => {
+                              void navigator.clipboard.writeText(item.redirectUrl);
+                              addToast('Redirect URL copied', 'success');
+                            }}
+                          >
+                            Copy
+                          </button>
+
+                          <button
+                            type="button"
+                            className="px-2 py-1 rounded border text-[11px]"
+                            onClick={() =>
+                              window.open(item.redirectUrl, '_blank', 'noopener,noreferrer')
+                            }
+                          >
+                            Test
+                          </button>
+
+                          <button
+                            type="button"
+                            className="px-2 py-1 rounded border text-[11px]"
+                            onClick={() => {
+                              setRedirectEditingAlias(item.alias);
+                              setRedirectAlias(item.alias);
+                              setRedirectDestination(item.destination);
+                              setRedirectStatusCode(item.statusCode);
+                            }}
+                          >
+                            Edit
+                          </button>
+
+                          <button
+                            type="button"
+                            className="px-2 py-1 rounded border border-red-300 text-red-600 text-[11px]"
+                            onClick={() => void deleteCloudflareRedirect(item.alias)}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {!['leads', 'credentials', 'settings', 'logs', 'browser-proxy', 'redirect-generator'].includes(activeModal as string) && (
             <div className="space-y-2 text-sm">
               <p className="text-slate-600">Local editable workspace for {modalTitle(activeModal)}.</p>
               <textarea

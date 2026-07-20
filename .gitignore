@@ -39,3 +39,5 @@ build
 
 # Prisma
 prisma/migrations
+
+.turbo/
