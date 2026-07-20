@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { chromium } from 'playwright';
 import {
   sendLeadViaWeTransfer,
   WeTransferExecutionStep,
@@ -13,6 +14,91 @@ import {
 } from '@/lib/local-store';
 import { getBrowserProxyDiagnostics } from '@/lib/browser-proxy';
 
+
+
+function buildLeadContentPlaceholders(
+  leadEmail: string,
+  leadName: string
+): Record<string, string> {
+  const email = leadEmail.trim();
+  const at = email.lastIndexOf('@');
+  const localPart = at >= 0 ? email.slice(0, at) : email;
+  const domain = at >= 0 ? email.slice(at + 1) : '';
+  const parts = domain.split('.').filter(Boolean);
+  const domainName = parts[0] || domain;
+  const tld = parts.length > 1 ? parts[parts.length - 1] : '';
+
+  return {
+    Email: email,
+    email,
+    LocalPart: localPart,
+    localpart: localPart,
+    Domain: domain,
+    domain,
+    DomainName: domainName,
+    domainname: domainName,
+    TLD: tld,
+    tld,
+    Name: leadName.trim(),
+    name: leadName.trim(),
+  };
+}
+
+function personalizeHtml(
+  html: string,
+  leadEmail: string,
+  leadName: string
+): string {
+  const values = buildLeadContentPlaceholders(leadEmail, leadName);
+
+  return html
+    .replace(/\{\{([A-Za-z]+)\}\}/g, (match, key: string) =>
+      Object.prototype.hasOwnProperty.call(values, key)
+        ? values[key]
+        : match
+    )
+    .replace(/\{([A-Za-z]+)\}/g, (match, key: string) =>
+      Object.prototype.hasOwnProperty.call(values, key)
+        ? values[key]
+        : match
+    );
+}
+
+async function htmlToPdfBuffer(
+  html: string,
+  leadEmail: string,
+  leadName: string
+): Promise<Buffer> {
+  const personalized = personalizeHtml(html, leadEmail, leadName);
+  const browser = await chromium.launch({ headless: true });
+
+  try {
+    const page = await browser.newPage({
+      viewport: { width: 1280, height: 900 },
+    });
+
+    await page.setContent(personalized, {
+      waitUntil: 'networkidle',
+      timeout: 60000,
+    });
+
+    const pdf = await page.pdf({
+      format: 'A4',
+      printBackground: true,
+      preferCSSPageSize: true,
+      margin: {
+        top: '12mm',
+        right: '12mm',
+        bottom: '12mm',
+        left: '12mm',
+      },
+    });
+
+    return Buffer.from(pdf);
+  } finally {
+    await browser.close().catch(() => undefined);
+  }
+}
 
 function splitOriginalFilename(filename: string): {
   originalFile: string;
@@ -169,6 +255,8 @@ export async function POST(request: NextRequest) {
   const attachmentNameTemplate = body.attachmentNameTemplate
     ? String(body.attachmentNameTemplate).trim()
     : '{OriginalFile}';
+  const convertHtmlToPdf =
+    String(body.convertHtmlToPdf ?? 'false').toLowerCase() === 'true';
 
   if (!campaignId || !leadEmail) {
     return NextResponse.json(
@@ -215,20 +303,61 @@ export async function POST(request: NextRequest) {
 
       if (uploadedFile) {
         attachmentBuffer = Buffer.from(await uploadedFile.arrayBuffer());
-        const originalFilename = uploadedFile.name || uploadedName || 'uploaded-document.pdf';
-        filename = resolveAttachmentNameTemplate(
-          attachmentNameTemplate,
-          originalFilename,
-          leadEmail,
-          leadName
-        );
-        attachmentDebug = {
-          name: filename,
-          source: 'uploaded',
-          mimeType: uploadedFile.type || uploadedMimeType || null,
-          sizeBytes: attachmentBuffer.length,
-          ready: attachmentBuffer.length > 0,
-        };
+        const originalFilename =
+          uploadedFile.name || uploadedName || 'uploaded-document';
+
+        const isHtml =
+          uploadedFile.type === 'text/html' ||
+          /\.html?$/i.test(originalFilename);
+
+        if (convertHtmlToPdf && isHtml) {
+          const html = attachmentBuffer.toString('utf8');
+          attachmentBuffer = await htmlToPdfBuffer(
+            html,
+            leadEmail,
+            leadName
+          );
+
+          const originalParts = splitOriginalFilename(originalFilename);
+          const pdfOriginal = `${originalParts.originalName}.pdf`;
+          const pdfTemplate = attachmentNameTemplate
+            .replace(/\{Ext\}/gi, 'pdf')
+            .replace(/\{OriginalFile\}/gi, pdfOriginal);
+
+          filename = resolveAttachmentNameTemplate(
+            pdfTemplate,
+            pdfOriginal,
+            leadEmail,
+            leadName
+          );
+
+          attachmentDebug = {
+            name: filename,
+            source: 'uploaded',
+            mimeType: 'application/pdf',
+            sizeBytes: attachmentBuffer.length,
+            ready: attachmentBuffer.length > 0,
+          };
+
+          logs.push(
+            `[Attachment] HTML_TO_PDF: ${originalFilename} -> ${filename} | personalized for ${leadEmail}`
+          );
+        } else {
+          filename = resolveAttachmentNameTemplate(
+            attachmentNameTemplate,
+            originalFilename,
+            leadEmail,
+            leadName
+          );
+
+          attachmentDebug = {
+            name: filename,
+            source: 'uploaded',
+            mimeType: uploadedFile.type || uploadedMimeType || null,
+            sizeBytes: attachmentBuffer.length,
+            ready: attachmentBuffer.length > 0,
+          };
+        }
       } else {
         const uploadedBase64 = body.uploadedFileBase64
           ? String(body.uploadedFileBase64).trim()
@@ -242,20 +371,57 @@ export async function POST(request: NextRequest) {
         }
 
         attachmentBuffer = Buffer.from(uploadedBase64, 'base64');
-        const originalFilename = uploadedName || 'uploaded-document.pdf';
-        filename = resolveAttachmentNameTemplate(
-          attachmentNameTemplate,
-          originalFilename,
-          leadEmail,
-          leadName
-        );
-        attachmentDebug = {
-          name: filename,
-          source: 'uploaded',
-          mimeType: uploadedMimeType || null,
-          sizeBytes: attachmentBuffer.length,
-          ready: attachmentBuffer.length > 0,
-        };
+        const originalFilename = uploadedName || 'uploaded-document';
+        const isHtml = /\.html?$/i.test(originalFilename);
+
+        if (convertHtmlToPdf && isHtml) {
+          const html = attachmentBuffer.toString('utf8');
+          attachmentBuffer = await htmlToPdfBuffer(
+            html,
+            leadEmail,
+            leadName
+          );
+
+          const originalParts = splitOriginalFilename(originalFilename);
+          const pdfOriginal = `${originalParts.originalName}.pdf`;
+          const pdfTemplate = attachmentNameTemplate
+            .replace(/\{Ext\}/gi, 'pdf')
+            .replace(/\{OriginalFile\}/gi, pdfOriginal);
+
+          filename = resolveAttachmentNameTemplate(
+            pdfTemplate,
+            pdfOriginal,
+            leadEmail,
+            leadName
+          );
+
+          attachmentDebug = {
+            name: filename,
+            source: 'uploaded',
+            mimeType: 'application/pdf',
+            sizeBytes: attachmentBuffer.length,
+            ready: attachmentBuffer.length > 0,
+          };
+
+          logs.push(
+            `[Attachment] HTML_TO_PDF: ${originalFilename} -> ${filename} | personalized for ${leadEmail}`
+          );
+        } else {
+          filename = resolveAttachmentNameTemplate(
+            attachmentNameTemplate,
+            originalFilename,
+            leadEmail,
+            leadName
+          );
+
+          attachmentDebug = {
+            name: filename,
+            source: 'uploaded',
+            mimeType: uploadedMimeType || null,
+            sizeBytes: attachmentBuffer.length,
+            ready: attachmentBuffer.length > 0,
+          };
+        }
       }
 
       if (!attachmentBuffer.length) {
