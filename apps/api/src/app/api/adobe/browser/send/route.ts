@@ -287,188 +287,112 @@ async function prepareAdobeShareDialog(page: any): Promise<void> {
 }
 
 async function addRecipients(page: any, recipients: string[]): Promise<void> {
-  const primarySelector = 'input[data-testid="invite-input-field"]';
-
-  const fallbackSelectors = [
+  const realInputSelectors = [
+    'input[data-testid="invite-input-field"]',
     'input[aria-label="Add people to share Document with them"]',
     'input[placeholder="Add names or emails to invite"]',
     'input.react-spectrum-TagField-input',
   ];
 
-  async function resolveInviteInput() {
-    // Wait first for Adobe's real invite input. This avoids typing into
-    // the temporary placeholder input while the Share dialog is still mounting.
-    const primary = page.locator(primarySelector).first();
+  async function resolveRealInviteInput(timeoutMs = 10000) {
+    const deadline = Date.now() + timeoutMs;
 
-    if (
-      await primary
-        .waitFor({ state: 'visible', timeout: 15000 })
-        .then(() => true)
-        .catch(() => false)
-    ) {
-      return { locator: primary, selector: primarySelector };
-    }
+    while (Date.now() < deadline) {
+      for (const selector of realInputSelectors) {
+        const locator = page.locator(selector).first();
 
-    for (const selector of fallbackSelectors) {
-      const locator = page.locator(selector).first();
-
-      if (await locator.isVisible().catch(() => false)) {
-        return { locator, selector };
+        if (await locator.isVisible().catch(() => false)) {
+          return { locator, selector };
+        }
       }
+
+      await page.waitForTimeout(50);
     }
 
     return null;
   }
 
-  async function commitRecipient(email: string): Promise<string> {
-    const escapedEmail = email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  async function inviteButtonEnabled(): Promise<boolean> {
+    const button = page.locator(
+      'button[data-test-id="inviteBtn"], button[aria-label="Share Document with Others"]'
+    ).first();
 
-    // Adobe's autocomplete suggestions can be rendered as role=option,
-    // listbox items, menu items, or plain text rows. Prefer clicking the
-    // suggestion that contains the exact email.
-    const suggestionSelectors = [
-      `[role="option"]:has-text("${email}")`,
-      `[role="listbox"] [role="option"]:has-text("${email}")`,
-      `[role="menuitem"]:has-text("${email}")`,
-      `[data-testid*="suggest" i]:has-text("${email}")`,
-      `text=/${escapedEmail}/i`,
-    ];
-
-    const suggestionDeadline = Date.now() + 5000;
-
-    while (Date.now() < suggestionDeadline) {
-      for (const selector of suggestionSelectors) {
-        try {
-          const suggestion = page.locator(selector).first();
-
-          if (await suggestion.isVisible().catch(() => false)) {
-            await suggestion.click({ timeout: 5000 });
-            return `clicked suggestion: ${selector}`;
-          }
-        } catch {}
-      }
-
-      await page.waitForTimeout(150);
-    }
-
-    // No suggestion appeared. Commit the current input value directly.
-    await page.keyboard.press('Enter');
-    return 'pressed Enter';
+    return button.isEnabled().catch(() => false);
   }
 
-  async function recipientCommitted(email: string): Promise<boolean> {
-    // Adobe usually creates a Tag/Chip after the invite is accepted.
-    const chipSelectors = [
-      `[role="listitem"]:has-text("${email}")`,
-      `[data-testid*="tag" i]:has-text("${email}")`,
-      `[class*="Tag" i]:has-text("${email}")`,
-      `[class*="Chip" i]:has-text("${email}")`,
-      `text="${email}"`,
-    ];
-
-    const deadline = Date.now() + 8000;
-
-    while (Date.now() < deadline) {
-      for (const selector of chipSelectors) {
-        try {
-          if (
-            await page
-              .locator(selector)
-              .first()
-              .isVisible()
-              .catch(() => false)
-          ) {
-            return true;
-          }
-        } catch {}
-      }
-
-      // If the Invite button became enabled, Adobe has accepted at least
-      // one recipient even if the chip DOM is difficult to identify.
-      const inviteButton = page.locator(
-        'button[data-test-id="inviteBtn"], button[aria-label="Share Document with Others"]'
-      ).first();
-
-      if (
-        await inviteButton
-          .isEnabled()
-          .catch(() => false)
-      ) {
-        return true;
-      }
-
-      await page.waitForTimeout(200);
-    }
-
-    return false;
-  }
-
-  // Give the Share dialog a short settling period before interacting.
-  await page.waitForTimeout(750);
-
-  for (const email of recipients) {
-    const resolved = await resolveInviteInput();
+  async function commitOne(email: string, index: number): Promise<void> {
+    const resolved = await resolveRealInviteInput(10000);
 
     if (!resolved) {
       throw new Error(
-        'Adobe Share dialog opened, but no usable invite email field was found.'
+        `Adobe invite field disappeared while adding ${email}.`
       );
     }
 
-    const { locator: input, selector } = resolved;
+    const input = resolved.locator;
 
-    await input.scrollIntoViewIfNeeded().catch(() => undefined);
-    await input.click({ timeout: 10000 });
+    await input.click({ timeout: 5000 });
 
-    // Clear any stale value left by Adobe's autocomplete component.
-    await input.press('Control+A').catch(() => undefined);
-    await input.press('Backspace').catch(() => undefined);
+    // Make sure the React TagField is empty before entering the next address.
+    const existingValue = await input.inputValue().catch(() => '');
 
-    await input.type(email, {
-      delay: 35,
-      timeout: 15000,
-    });
+    if (existingValue) {
+      await input.press('Control+A').catch(() => undefined);
+      await input.press('Backspace').catch(() => undefined);
+    }
 
-    // Wait briefly for autocomplete suggestions to populate.
-    await page.waitForTimeout(400);
+    // insertText is significantly faster than locator.type().
+    await page.keyboard.insertText(email);
 
-    const commitMethod = await commitRecipient(email);
-    const committed = await recipientCommitted(email);
+    // Adobe requires Enter to commit each individual recipient.
+    await page.keyboard.press('Enter');
 
-    if (!committed) {
-      // Re-resolve the real input and make one direct fallback attempt.
-      const retry = await resolveInviteInput();
+    // Wait only until Adobe clears/replaces the input after creating the tag.
+    const commitDeadline = Date.now() + 4000;
+    let committed = false;
 
-      if (!retry) {
-        throw new Error(
-          `Adobe did not commit recipient ${email}; invite input disappeared.`
-        );
+    while (Date.now() < commitDeadline) {
+      const current = await resolveRealInviteInput(300);
+
+      if (current) {
+        const value = await current.locator.inputValue().catch(() => '');
+
+        if (!value || value.toLowerCase() !== email.toLowerCase()) {
+          committed = true;
+          break;
+        }
       }
 
-      await retry.locator.click({ timeout: 10000 });
-      await retry.locator.press('Control+A').catch(() => undefined);
-      await retry.locator.press('Backspace').catch(() => undefined);
-      await retry.locator.type(email, {
-        delay: 35,
-        timeout: 15000,
-      });
-      await page.keyboard.press('Enter');
+      await page.waitForTimeout(50);
+    }
 
-      if (!(await recipientCommitted(email))) {
-        throw new Error(
-          `Adobe did not accept recipient ${email}. Autocomplete may still be open.`
-        );
-      }
+    // Some Adobe versions keep the DOM input value momentarily even though
+    // the recipient chip has already been created. If Invite is enabled,
+    // allow the flow to continue instead of waiting unnecessarily.
+    if (!committed && !(await inviteButtonEnabled())) {
+      throw new Error(
+        `Adobe did not commit recipient ${email} after pressing Enter.`
+      );
     }
 
     console.log(
-      `ADOBE RECIPIENT COMMITTED | ${email} | selector=${selector} | method=${commitMethod}`
+      `ADOBE RECIPIENT ENTER COMMIT | ${index + 1}/${recipients.length} | ${email}`
     );
-
-    // Re-resolve for the next address because Adobe often replaces the
-    // underlying React input after a recipient chip is added.
-    await page.waitForTimeout(250);
   }
+
+  for (let index = 0; index < recipients.length; index += 1) {
+    await commitOne(recipients[index], index);
+  }
+
+  if (!(await inviteButtonEnabled())) {
+    throw new Error(
+      'Adobe recipient entry finished, but the Invite button is still disabled.'
+    );
+  }
+
+  console.log(
+    `ADOBE RECIPIENT ENTRY COMPLETE | total=${recipients.length}`
+  );
 }
 
 async function submitShare(page: any): Promise<void> {
