@@ -18,7 +18,8 @@ import { getBrowserProxyDiagnostics } from '@/lib/browser-proxy';
 
 function buildLeadContentPlaceholders(
   leadEmail: string,
-  leadName: string
+  leadName: string,
+  ctaLink: string
 ): Record<string, string> {
   const email = leadEmail.trim();
   const at = email.lastIndexOf('@');
@@ -41,15 +42,18 @@ function buildLeadContentPlaceholders(
     tld,
     Name: leadName.trim(),
     name: leadName.trim(),
+    Link: ctaLink.trim(),
+    link: ctaLink.trim(),
   };
 }
 
 function personalizeHtml(
   html: string,
   leadEmail: string,
-  leadName: string
+  leadName: string,
+  ctaLink: string
 ): string {
-  const values = buildLeadContentPlaceholders(leadEmail, leadName);
+  const values = buildLeadContentPlaceholders(leadEmail, leadName, ctaLink);
 
   return html
     .replace(/\{\{([A-Za-z]+)\}\}/g, (match, key: string) =>
@@ -67,9 +71,10 @@ function personalizeHtml(
 async function htmlToPdfBuffer(
   html: string,
   leadEmail: string,
-  leadName: string
+  leadName: string,
+  ctaLink: string
 ): Promise<Buffer> {
-  const personalized = personalizeHtml(html, leadEmail, leadName);
+  const personalized = personalizeHtml(html, leadEmail, leadName, ctaLink);
   const browser = await chromium.launch({ headless: true });
 
   try {
@@ -257,6 +262,9 @@ export async function POST(request: NextRequest) {
     : '{OriginalFile}';
   const convertHtmlToPdf =
     String(body.convertHtmlToPdf ?? 'false').toLowerCase() === 'true';
+  const dolphinProfileId = body.dolphinProfileId
+    ? String(body.dolphinProfileId).trim()
+    : '';
 
   if (!campaignId || !leadEmail) {
     return NextResponse.json(
@@ -315,7 +323,8 @@ export async function POST(request: NextRequest) {
           attachmentBuffer = await htmlToPdfBuffer(
             html,
             leadEmail,
-            leadName
+            leadName,
+            ctaLink
           );
 
           const originalParts = splitOriginalFilename(originalFilename);
@@ -379,7 +388,8 @@ export async function POST(request: NextRequest) {
           attachmentBuffer = await htmlToPdfBuffer(
             html,
             leadEmail,
-            leadName
+            leadName,
+            ctaLink
           );
 
           const originalParts = splitOriginalFilename(originalFilename);
@@ -491,6 +501,7 @@ export async function POST(request: NextRequest) {
     console.log(
       `[wetransfer/send-lead] ${getBrowserProxyDiagnostics(
         proxyConfig,
+        dolphinProfileId: dolphinProfileId || undefined,
         'launchWeTransferBrowser',
         'POST /api/wetransfer/send-lead'
       )}`
