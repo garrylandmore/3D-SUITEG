@@ -1,6 +1,9 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
+import crypto from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
 
-import { launchDolphinBrowser, stopDolphinProfile } from '@/lib/dolphin-browser';
+import { chromium } from 'playwright';
 import {
   clearAdobeBrowserSession,
   getAdobeBrowserStore,
@@ -8,79 +11,95 @@ import {
 
 export const dynamic = 'force-dynamic';
 
+function getAdobeUserDataDir(): string {
+  return (
+    process.env.ADOBE_BROWSER_USER_DATA_DIR ||
+    path.join(os.homedir(), '.3d-suite', 'adobe-browser-profile')
+  );
+}
+
 async function closeExistingSession(): Promise<void> {
   const store = getAdobeBrowserStore();
   const existing = store.session;
+
   if (!existing) return;
 
   try {
-    await existing.browser.close();
-  } catch {}
-
-  try {
-    await stopDolphinProfile(existing.profileId);
+    await existing.context.close();
   } catch {}
 
   clearAdobeBrowserSession();
 }
 
-export async function POST(request: NextRequest) {
+export async function POST() {
   try {
-    const body = await request.json();
-    const profileId = Number(body.dolphinProfileId);
-
-    if (!Number.isInteger(profileId) || profileId <= 0) {
-      return NextResponse.json(
-        { success: false, error: 'A valid Dolphin profile ID is required.' },
-        { status: 400 }
-      );
-    }
-
     const store = getAdobeBrowserStore();
 
-    if (
-      store.session &&
-      store.session.profileId === profileId &&
-      !store.session.page.isClosed()
-    ) {
+    if (store.session && !store.session.page.isClosed()) {
       await store.session.page.bringToFront().catch(() => undefined);
+
       return NextResponse.json({
         success: true,
         connected: true,
         loggedIn: false,
-        profileId: String(profileId),
+        profileId: store.session.sessionId,
         currentUrl: store.session.page.url(),
       });
     }
 
     await closeExistingSession();
 
-    const { browser } = await launchDolphinBrowser(profileId);
-    const context = browser.contexts()[0] || (await browser.newContext());
+    const userDataDir = getAdobeUserDataDir();
+
+    let context;
+
+    try {
+      // Prefer the user's installed Google Chrome for a normal-browser experience.
+      context = await chromium.launchPersistentContext(userDataDir, {
+        channel: 'chrome',
+        headless: false,
+        viewport: null,
+        args: ['--start-maximized'],
+      });
+    } catch {
+      // Fall back to Playwright Chromium when Google Chrome is unavailable.
+      context = await chromium.launchPersistentContext(userDataDir, {
+        headless: false,
+        viewport: null,
+        args: ['--start-maximized'],
+      });
+    }
+
     const pages = context.pages();
-    const page = pages.find((candidate) => !candidate.isClosed()) || (await context.newPage());
+    const page =
+      pages.find((candidate) => !candidate.isClosed()) ||
+      (await context.newPage());
 
     await page.goto('https://acrobat.adobe.com/', {
       waitUntil: 'domcontentloaded',
       timeout: 90000,
     });
+
     await page.bringToFront().catch(() => undefined);
 
+    const sessionId = crypto.randomUUID();
+
     store.session = {
-      profileId,
-      browser,
+      sessionId,
       context,
       page,
       startedAt: new Date().toISOString(),
+      userDataDir,
     };
 
     return NextResponse.json({
       success: true,
       connected: true,
       loggedIn: false,
-      profileId: String(profileId),
+      profileId: sessionId,
       currentUrl: page.url(),
-      message: 'Adobe opened in Dolphin. Log in manually in the browser.',
+      message:
+        'Adobe opened in a normal Chrome browser window. Log in manually.',
     });
   } catch (error) {
     return NextResponse.json(
@@ -88,7 +107,8 @@ export async function POST(request: NextRequest) {
         success: false,
         connected: false,
         loggedIn: false,
-        error: error instanceof Error ? error.message : String(error),
+        error:
+          error instanceof Error ? error.message : String(error),
       },
       { status: 500 }
     );
