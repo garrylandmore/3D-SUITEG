@@ -1482,3 +1482,364 @@ export async function createWeTransferTransfer(
     }
   }
 }
+
+
+export type WeTransferSequentialJob = {
+  recipientEmail: string;
+  filename: string;
+  fileBuffer: Buffer;
+  attachmentPath: string;
+  message?: string;
+};
+
+export async function createWeTransferSequentialTransfers(
+  jobs: WeTransferSequentialJob[],
+  onPhase?: (update: WeTransferSendPhaseUpdate) => void,
+  options: WeTransferSendOptions = {}
+): Promise<{
+  success: boolean;
+  results: Array<{
+    recipientEmail: string;
+    filename: string;
+    success: boolean;
+    downloadUrl?: string;
+    error?: string;
+  }>;
+  error?: string;
+}> {
+  let browser;
+  let activeDolphinProfileId: number | null = null;
+
+  const normalizedJobs = jobs
+    .map((job) => ({
+      ...job,
+      recipientEmail: String(job.recipientEmail || '').trim(),
+      filename: String(job.filename || '').trim(),
+      attachmentPath: String(job.attachmentPath || '').trim(),
+    }))
+    .filter(
+      (job) =>
+        job.recipientEmail &&
+        job.filename &&
+        job.attachmentPath &&
+        job.fileBuffer?.length > 0
+    )
+    .slice(0, 10);
+
+  const results: Array<{
+    recipientEmail: string;
+    filename: string;
+    success: boolean;
+    downloadUrl?: string;
+    error?: string;
+  }> = [];
+
+  try {
+    if (!normalizedJobs.length) {
+      throw new Error('At least one sequential WeTransfer job is required');
+    }
+
+    const senderEmail = (options.senderEmail || '').trim();
+
+    if (!senderEmail) {
+      throw new Error(
+        'Sender email (temp mailbox) is required for the WeTransfer signup/login flow'
+      );
+    }
+
+    // Validate all files before launching the browser.
+    for (const job of normalizedJobs) {
+      const stats = await stat(job.attachmentPath).catch(() => null);
+
+      if (!stats || !stats.isFile() || stats.size <= 0) {
+        throw new Error(
+          `Attachment file is missing or empty: ${job.attachmentPath}`
+        );
+      }
+    }
+
+    browser = await launchWeTransferBrowser(
+      options.proxyConfig,
+      onPhase,
+      'send-transfer',
+      options.dolphinProfileId
+    );
+
+    if (isDolphinEnabled()) {
+      const rawProfileId =
+        options.dolphinProfileId || process.env.DOLPHIN_PROFILE_ID || '';
+      const parsedProfileId = Number(rawProfileId);
+
+      if (Number.isInteger(parsedProfileId) && parsedProfileId > 0) {
+        activeDolphinProfileId = parsedProfileId;
+      }
+    }
+
+    const page = await createFreshWeTransferPage(browser);
+
+    // Sign up / verify ONCE for this account batch.
+    await performSignupAndVerification(
+      page,
+      senderEmail,
+      options,
+      onPhase
+    );
+
+    await waitForWeTransferAuthCallbackToFinish(page, onPhase);
+    await ensureUploaderReadyAfterRedirect(page, onPhase);
+
+    for (let jobIndex = 0; jobIndex < normalizedJobs.length; jobIndex += 1) {
+      const job = normalizedJobs[jobIndex];
+      const recipient = job.recipientEmail;
+
+      try {
+        onPhase?.({
+          phase: 'preparing_attachment',
+          detail:
+            `Sequential transfer ${jobIndex + 1}/${normalizedJobs.length} | ` +
+            `${recipient} | ${job.filename}`,
+        });
+
+        // For transfers after the first, return to a clean uploader.
+        if (jobIndex > 0) {
+          const rootUrl = `${WETRANSFER_URL.replace(/\/$/, '')}/`;
+
+          onPhase?.({
+            phase: 'loading_wetransfer',
+            detail:
+              `Returning to uploader for transfer ${jobIndex + 1}/${normalizedJobs.length}: ${rootUrl}`,
+          });
+
+          await page.goto(rootUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000,
+          });
+
+          await dismissConsentAndPopups(page).catch(() => undefined);
+          await ensureUploaderReadyAfterRedirect(page, onPhase);
+        }
+
+        onPhase?.({
+          phase: 'upload_started',
+          detail:
+            `Sequential transfer ${jobIndex + 1}/${normalizedJobs.length} | ` +
+            `uploading "${job.filename}" for ${recipient}`,
+        });
+
+        await uploadAttachment(page, job.attachmentPath, (msg) => {
+          onPhase?.({
+            phase: 'upload_started',
+            detail:
+              `Sequential transfer ${jobIndex + 1}/${normalizedJobs.length} | ${msg}`,
+          });
+        });
+
+        await waitForWeTransferUploadReady(page, job.filename, (msg) => {
+          onPhase?.({
+            phase: 'upload_started',
+            detail:
+              `Sequential transfer ${jobIndex + 1}/${normalizedJobs.length} | ${msg}`,
+          });
+        });
+
+        onPhase?.({
+          phase: 'upload_completed',
+          detail:
+            `Sequential transfer ${jobIndex + 1}/${normalizedJobs.length} | ` +
+            `upload ready "${job.filename}"`,
+        });
+
+        console.log(
+          `WETRANSFER SEQUENTIAL RECIPIENT | ${jobIndex + 1}/${normalizedJobs.length} | ${recipient}`
+        );
+
+        let recipientInput = page
+          .locator('input#autosuggest[name="autosuggest"]')
+          .first();
+
+        if (!(await recipientInput.isVisible().catch(() => false))) {
+          const emailToLabel = page
+            .getByText(/^Email to$/i, { exact: true })
+            .first();
+
+          if (await emailToLabel.isVisible().catch(() => false)) {
+            const forAttr = await emailToLabel
+              .getAttribute('for')
+              .catch(() => null);
+
+            if (forAttr) {
+              recipientInput = page.locator(`#${forAttr}`).first();
+            }
+          }
+        }
+
+        await recipientInput.waitFor({
+          state: 'visible',
+          timeout: 60000,
+        });
+
+        await recipientInput.click({ timeout: 60000 });
+        await recipientInput.fill('');
+
+        // Fast single-recipient entry.
+        await recipientInput.pressSequentially(recipient, {
+          delay: 40,
+        });
+
+        const actual = await recipientInput.inputValue();
+
+        if (actual !== recipient) {
+          throw new Error(
+            `Recipient email field mismatch: expected ${recipient}, got ${actual}`
+          );
+        }
+
+        await recipientInput.press('Enter');
+        await page.waitForTimeout(500);
+
+        onPhase?.({
+          phase: 'send_submitted',
+          detail:
+            `Sequential transfer ${jobIndex + 1}/${normalizedJobs.length} | ` +
+            `recipient committed: ${recipient}`,
+        });
+
+        const transferButton = page
+          .locator('button[data-testid="uploaderForm-transfer-button"]')
+          .first();
+
+        await transferButton.waitFor({
+          state: 'visible',
+          timeout: 60000,
+        });
+
+        await transferButton.click({ timeout: 60000 });
+
+        onPhase?.({
+          phase: 'send_submitted',
+          detail:
+            `Sequential transfer ${jobIndex + 1}/${normalizedJobs.length} | ` +
+            `Transfer clicked for ${recipient}`,
+        });
+
+        await page.waitForTimeout(3000);
+
+        let confirmation: { transferUrl?: string } = {};
+
+        try {
+          confirmation = await confirmSend(page);
+        } catch (confirmationError: unknown) {
+          const detail =
+            confirmationError instanceof Error
+              ? confirmationError.message
+              : String(confirmationError);
+
+          // Transfer was already clicked. Do not click again.
+          onPhase?.({
+            phase: 'send_submitted',
+            detail:
+              `Sequential transfer ${jobIndex + 1}/${normalizedJobs.length} | ` +
+              `clicked but confirmation not detected; no retry to avoid duplicate. ${detail}`,
+          });
+        }
+
+        results.push({
+          recipientEmail: recipient,
+          filename: job.filename,
+          success: true,
+          downloadUrl: confirmation.transferUrl,
+        });
+
+        onPhase?.({
+          phase: confirmation.transferUrl
+            ? 'send_confirmed'
+            : 'send_submitted',
+          detail:
+            `Sequential transfer ${jobIndex + 1}/${normalizedJobs.length} complete | ` +
+            `${recipient} | ${job.filename}`,
+        });
+
+        console.log(
+          `WETRANSFER SEQUENTIAL COMPLETE | ${jobIndex + 1}/${normalizedJobs.length} | ${recipient} | ${job.filename}`
+        );
+      } catch (error: unknown) {
+        const message =
+          error instanceof Error ? error.message : String(error);
+
+        results.push({
+          recipientEmail: recipient,
+          filename: job.filename,
+          success: false,
+          error: message,
+        });
+
+        onPhase?.({
+          phase: 'failed',
+          detail:
+            `Sequential transfer ${jobIndex + 1}/${normalizedJobs.length} failed | ` +
+            `${recipient} | ${message}`,
+        });
+
+        console.error(
+          `WETRANSFER SEQUENTIAL FAILED | ${jobIndex + 1}/${normalizedJobs.length} | ${recipient} | ${message}`
+        );
+
+        // Try to recover the uploader for the next lead, but do not recreate
+        // the account or browser session.
+        if (jobIndex < normalizedJobs.length - 1) {
+          const rootUrl = `${WETRANSFER_URL.replace(/\/$/, '')}/`;
+
+          await page
+            .goto(rootUrl, {
+              waitUntil: 'domcontentloaded',
+              timeout: 60000,
+            })
+            .catch(() => undefined);
+
+          await dismissConsentAndPopups(page).catch(() => undefined);
+          await ensureUploaderReadyAfterRedirect(page, onPhase).catch(
+            () => undefined
+          );
+        }
+      }
+    }
+
+    const successful = results.filter((item) => item.success).length;
+
+    return {
+      success: successful === normalizedJobs.length,
+      results,
+      error:
+        successful === normalizedJobs.length
+          ? undefined
+          : `${successful}/${normalizedJobs.length} sequential transfer(s) completed successfully`,
+    };
+  } catch (error: unknown) {
+    const message =
+      error instanceof Error ? error.message : String(error);
+
+    onPhase?.({
+      phase: 'failed',
+      detail: message,
+    });
+
+    return {
+      success: false,
+      results,
+      error: message,
+    };
+  } finally {
+    // IMPORTANT: cleanup only ONCE, after all up-to-10 one-recipient
+    // transfers for this account/session are finished.
+    if (browser && isDolphinEnabled()) {
+      await clearDolphinBrowserSession(browser);
+      await browser.close().catch(() => undefined);
+
+      if (activeDolphinProfileId) {
+        await stopDolphinProfile(activeDolphinProfileId);
+      }
+    } else {
+      await browser?.close().catch(() => undefined);
+    }
+  }
+}
