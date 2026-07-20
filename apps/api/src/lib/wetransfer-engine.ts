@@ -1,10 +1,13 @@
 import {
-  createMailSlurpMailbox,
-  getMailSlurpMessage,
-  listMailSlurpMessages,
-  MailSlurpMailbox,
-  MailSlurpMessage,
-} from './mailslurp';
+  createUnifiedTempMailbox,
+  getUnifiedTempMessage,
+  listUnifiedTempMessages,
+  normalizeTempMailProvider,
+  tempMailProviderLabel,
+  TempMailProvider,
+  UnifiedTempMailbox,
+  UnifiedTempMessage,
+} from './temp-mail-provider';
 import {
   createWeTransferTransfer,
   probeWeTransferWebsite,
@@ -42,7 +45,7 @@ export type WeTransferExecutionStep = {
 export type WeTransferSession = {
   id: string;
   campaignId: string;
-  tempMailbox: MailSlurpMailbox | null;
+  tempMailbox: UnifiedTempMailbox | null;
   mailboxMessageCount: number | null;
   latestError: string | null;
   steps: WeTransferExecutionStep[];
@@ -70,7 +73,7 @@ export type WeTransferSendResult = {
 const SETUP_STEP_DEFS: Array<{ id: string; label: string }> = [
   {
     id: 'create_mailbox',
-    label: 'Create temp mailbox (MailSlurp)',
+    label: 'Create temp mailbox',
   },
   {
     id: 'open_wetransfer',
@@ -136,7 +139,7 @@ function extractVerificationCode(messageText: string): string | null {
   return standaloneCode?.[1]?.toUpperCase() ?? null;
 }
 
-function messageMayBeWeTransferVerification(message: MailSlurpMessage): boolean {
+function messageMayBeWeTransferVerification(message: UnifiedTempMessage): boolean {
   const subject = (message.subject || '').toLowerCase();
   const from = (message.from || '').toLowerCase();
   const body = `${message.body_text || ''}\n${message.body_html || ''}`.toLowerCase();
@@ -150,22 +153,22 @@ function messageMayBeWeTransferVerification(message: MailSlurpMessage): boolean 
 }
 
 async function enrichMessageIfNeeded(
-  mailbox: MailSlurpMailbox,
-  message: MailSlurpMessage
-): Promise<MailSlurpMessage> {
+  mailbox: UnifiedTempMailbox,
+  message: UnifiedTempMessage
+): Promise<UnifiedTempMessage> {
   if ((message.body_text || message.body_html || '').trim()) {
     return message;
   }
 
   try {
-    return await getMailSlurpMessage(mailbox, message.id);
+    return await getUnifiedTempMessage(mailbox, message.id);
   } catch {
     return message;
   }
 }
 
 async function pollForVerificationEmail(
-  mailbox: MailSlurpMailbox,
+  mailbox: UnifiedTempMailbox,
   onProgress: (
     attempt: number,
     messageCount: number,
@@ -188,7 +191,7 @@ async function pollForVerificationEmail(
   let attempt = 0;
   while (maxAttempts <= 0 || attempt < maxAttempts) {
     attempt += 1;
-    const messages = await listMailSlurpMessages(mailbox);
+    const messages = await listUnifiedTempMessages(mailbox);
     latestCount = messages.length;
     onProgress(attempt, latestCount, delayMs);
 
@@ -220,6 +223,7 @@ async function pollForVerificationEmail(
 
 export async function initWeTransferSession(
   campaignId: string,
+  tempMailProvider: TempMailProvider,
   tempMailApiKey?: string,
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void,
   proxyConfig?: BrowserProxyConfig | null
@@ -248,13 +252,34 @@ export async function initWeTransferSession(
     }
   }
 
-  stepUpdate('create_mailbox', 'running');
+  const normalizedProvider = normalizeTempMailProvider(tempMailProvider);
+
+  stepUpdate(
+    'create_mailbox',
+    'running',
+    `Provider: ${tempMailProviderLabel(normalizedProvider)}`
+  );
+
   try {
-    const mailSlurpApiKey = (tempMailApiKey || process.env.MAILSLURP_API_KEY || '').trim();
-    const mailbox = await createMailSlurpMailbox(mailSlurpApiKey);
+    const fallbackKey =
+      normalizedProvider === 'mailslurp'
+        ? process.env.MAILSLURP_API_KEY || ''
+        : process.env.TEMP_MAIL_IO_API_KEY || '';
+
+    const providerApiKey = (tempMailApiKey || fallbackKey).trim();
+    const mailbox = await createUnifiedTempMailbox(
+      normalizedProvider,
+      providerApiKey
+    );
+
     session.tempMailbox = mailbox;
     session.latestError = null;
-    stepUpdate('create_mailbox', 'success', `Mailbox: ${mailbox.email} | provider=mailslurp`);
+
+    stepUpdate(
+      'create_mailbox',
+      'success',
+      `Mailbox: ${mailbox.email} | provider=${normalizedProvider}`
+    );
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
     stepUpdate('create_mailbox', 'failed', msg);
@@ -311,8 +336,8 @@ export async function initWeTransferSession(
     );
   }
 
-  stepUpdate('create_account', 'success', 'Browser transport mode is active. Sender email will use MailSlurp inbox.');
-  stepUpdate('verify_email', 'success', 'Verification mailbox is ready and will be polled during signup flow.');
+  stepUpdate('create_account', 'success', `Browser transport mode is active. Sender email will use ${tempMailProviderLabel(normalizedProvider)} inbox.`);
+  stepUpdate('verify_email', 'success', `${tempMailProviderLabel(normalizedProvider)} verification mailbox is ready and will be polled during signup flow.`);
 
   session.status = 'ready';
   return session;
