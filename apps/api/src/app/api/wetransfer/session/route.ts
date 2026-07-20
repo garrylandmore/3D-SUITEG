@@ -9,6 +9,7 @@ import {
   getBrowserProxyConfigLocal,
 } from '@/lib/local-store';
 import { getBrowserProxyDiagnostics } from '@/lib/browser-proxy';
+import { normalizeTempMailProvider, tempMailProviderLabel } from '@/lib/temp-mail-provider';
 
 type WeTransferSessionResponse = {
   sessionId?: string;
@@ -41,17 +42,18 @@ export async function POST(request: NextRequest) {
   }
 
   const campaignId = body.campaignId ? String(body.campaignId).trim() : '';
-  const mailSlurpApiKey = body.tempMailApiKey
+  const tempMailProvider = normalizeTempMailProvider(body.tempMailProvider);
+  const tempMailApiKey = body.tempMailApiKey
     ? String(body.tempMailApiKey).trim()
-    : body.mailSlurpApiKey
-      ? String(body.mailSlurpApiKey).trim()
-      : (process.env.MAILSLURP_API_KEY || '').trim();
+    : tempMailProvider === 'mailslurp'
+      ? (process.env.MAILSLURP_API_KEY || '').trim()
+      : (process.env.TEMP_MAIL_IO_API_KEY || '').trim();
   if (!campaignId) {
     return NextResponse.json({ error: 'campaignId is required' }, { status: 400 });
   }
-  if (!mailSlurpApiKey) {
+  if (!tempMailApiKey) {
     return NextResponse.json(
-      { error: 'MailSlurp API key is required. Enter it in the API key field or set MAILSLURP_API_KEY.' },
+      { error: `${tempMailProviderLabel(tempMailProvider)} API key is required.` },
       { status: 400 }
     );
   }
@@ -71,7 +73,8 @@ export async function POST(request: NextRequest) {
   try {
     const session = await initWeTransferSession(
       campaignId,
-      mailSlurpApiKey,
+      tempMailProvider,
+      tempMailApiKey,
       (step, logLine) => {
         steps.push({ ...step });
         logs.push(logLine);
