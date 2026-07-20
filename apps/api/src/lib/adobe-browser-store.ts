@@ -1,11 +1,14 @@
-import type { Browser, BrowserContext, Page } from 'playwright';
+import type {
+  BrowserContext,
+  Page,
+} from 'playwright';
 
 export type AdobeBrowserSession = {
-  profileId: number;
-  browser: Browser;
+  sessionId: string;
   context: BrowserContext;
   page: Page;
   startedAt: string;
+  userDataDir: string;
 };
 
 type AdobeBrowserStore = {
