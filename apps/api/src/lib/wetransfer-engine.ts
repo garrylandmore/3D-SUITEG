@@ -222,6 +222,7 @@ async function pollForVerificationEmail(
 
 export async function initWeTransferSession(
   campaignId: string,
+  tempMailProvider: string = 'mailslurp',
   tempMailApiKey?: string,
   onStep?: (step: WeTransferExecutionStep, logLine: string) => void,
   proxyConfig?: BrowserProxyConfig | null
@@ -252,11 +253,35 @@ export async function initWeTransferSession(
 
   stepUpdate('create_mailbox', 'running');
   try {
-    const mailSlurpApiKey = (tempMailApiKey || process.env.MAILSLURP_API_KEY || '').trim();
+    const normalizedProvider = String(tempMailProvider || 'mailslurp')
+      .trim()
+      .toLowerCase();
+
+    if (normalizedProvider !== 'mailslurp') {
+      throw new Error(
+        `Unsupported temp mail provider in this engine build: ${normalizedProvider}`
+      );
+    }
+
+    const mailSlurpApiKey = (
+      tempMailApiKey ||
+      process.env.MAILSLURP_API_KEY ||
+      ''
+    ).trim();
+
+    if (!mailSlurpApiKey) {
+      throw new Error('MailSlurp API key is required.');
+    }
+
     const mailbox = await createMailSlurpMailbox(mailSlurpApiKey);
     session.tempMailbox = mailbox;
     session.latestError = null;
-    stepUpdate('create_mailbox', 'success', `Mailbox: ${mailbox.email} | provider=mailslurp`);
+
+    stepUpdate(
+      'create_mailbox',
+      'success',
+      `Mailbox: ${mailbox.email} | provider=${normalizedProvider}`
+    );
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
     stepUpdate('create_mailbox', 'failed', msg);
