@@ -2,7 +2,11 @@ import { stat } from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, Page } from 'playwright';
 import type { BrowserProxyConfig } from './browser-proxy-types';
-import { isDolphinEnabled, launchDolphinBrowser } from './dolphin-browser';
+import {
+  clearDolphinBrowserSession,
+  isDolphinEnabled,
+  launchDolphinBrowser,
+} from './dolphin-browser';
 import {
   buildPlaywrightProxyLaunchOptions,
   getBrowserProxyDiagnostics,
@@ -47,6 +51,7 @@ export type WeTransferSendOptions = {
   senderEmail?: string;
   onVerificationRequired?: () => Promise<VerificationResolution | null>;
   proxyConfig?: BrowserProxyConfig | null;
+  dolphinProfileId?: string;
 };
 
 function isHeadlessEnabled(): boolean {
@@ -104,7 +109,8 @@ async function createFreshWeTransferPage(browser: any): Promise<Page> {
 async function launchWeTransferBrowser(
   proxyConfig: BrowserProxyConfig | null | undefined,
   onPhase: ((update: WeTransferSendPhaseUpdate) => void) | undefined,
-  launchPath: string
+  launchPath: string,
+  dolphinProfileId?: string
 ) {
   if (isDolphinEnabled()) {
     onPhase?.({
@@ -112,7 +118,7 @@ async function launchWeTransferBrowser(
       detail: `Launching Dolphin{anty} browser profile | path=${launchPath}`,
     });
 
-    const { browser, profileId, endpoint } = await launchDolphinBrowser();
+    const { browser, profileId, endpoint } = await launchDolphinBrowser(dolphinProfileId);
     console.log(
       `DOLPHIN ACTIVE | profileId=${profileId} | endpoint=${endpoint} | path=${launchPath}`
     );
@@ -1184,7 +1190,12 @@ export async function createWeTransferTransfer(
       );
     }
 
-    browser = await launchWeTransferBrowser(options.proxyConfig, onPhase, 'send-transfer');
+    browser = await launchWeTransferBrowser(
+      options.proxyConfig,
+      onPhase,
+      'send-transfer',
+      options.dolphinProfileId
+    );
 
     const page = await createFreshWeTransferPage(browser);
 
@@ -1437,6 +1448,10 @@ export async function createWeTransferTransfer(
       error: message,
     };
   } finally {
+    if (browser && isDolphinEnabled()) {
+      await clearDolphinBrowserSession(browser);
+    }
+
     await browser?.close().catch(() => undefined);
   }
 }
