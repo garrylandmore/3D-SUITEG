@@ -125,7 +125,13 @@ type BrowserProxyTestResult = {
 };
 
 type CredentialsState = {
-  wetransfer: { provider: string; account: string; proxy: string; tempMailApiKey: string };
+  wetransfer: {
+    provider: 'mailslurp' | 'tempmailio';
+    account: string;
+    proxy: string;
+    mailSlurpApiKey: string;
+    tempMailIoApiKey: string;
+  };
   adobe: { clientId: string; tenant: string };
   quickbooks: { companyId: string; environment: string };
   docusign: { accountId: string; integrationKey: string };
@@ -508,6 +514,26 @@ function normalizeBrowserProxyPanelState(value: unknown): BrowserProxyPanelState
 
 const LOCAL_STORAGE_KEY = 'crm-console-session-v2';
 
+
+const TEMP_MAIL_SESSION_KEYS = {
+  mailslurp: '3d-suite-temp-mail-key-mailslurp',
+  tempmailio: '3d-suite-temp-mail-key-tempmailio',
+} as const;
+
+function getSelectedTempMailApiKey(
+  credentials: CredentialsState['wetransfer']
+): string {
+  return credentials.provider === 'tempmailio'
+    ? credentials.tempMailIoApiKey
+    : credentials.mailSlurpApiKey;
+}
+
+function getTempMailProviderLabel(
+  provider: CredentialsState['wetransfer']['provider']
+): string {
+  return provider === 'tempmailio' ? 'Temp-Mail.io' : 'MailSlurp';
+}
+
 export default function DashboardPage() {
   const [sidebarOpen, setSidebarOpen] = React.useState(true);
   const [campaignName, setCampaignName] = React.useState('Q3 Operations Campaign');
@@ -550,7 +576,13 @@ export default function DashboardPage() {
   const [browserProxyTestResult, setBrowserProxyTestResult] = React.useState<BrowserProxyTestResult | null>(null);
 
   const [credentials, setCredentials] = React.useState<CredentialsState>({
-    wetransfer: { provider: 'temp-mail.io', account: '', proxy: '', tempMailApiKey: '' },
+    wetransfer: {
+      provider: 'mailslurp',
+      account: '',
+      proxy: '',
+      mailSlurpApiKey: '',
+      tempMailIoApiKey: '',
+    },
     adobe: { clientId: '', tenant: '' },
     quickbooks: { companyId: '', environment: 'sandbox' },
     docusign: { accountId: '', integrationKey: '' },
@@ -559,6 +591,27 @@ export default function DashboardPage() {
   const [senderConfigs, setSenderConfigs] = React.useState<Record<SenderKey, SenderConfig>>(
     createDefaultSenderConfigs
   );
+
+
+  React.useEffect(() => {
+    try {
+      const mailSlurpApiKey =
+        window.sessionStorage.getItem(TEMP_MAIL_SESSION_KEYS.mailslurp) || '';
+      const tempMailIoApiKey =
+        window.sessionStorage.getItem(TEMP_MAIL_SESSION_KEYS.tempmailio) || '';
+
+      setCredentials((prev) => ({
+        ...prev,
+        wetransfer: {
+          ...prev.wetransfer,
+          mailSlurpApiKey,
+          tempMailIoApiKey,
+        },
+      }));
+    } catch {
+      // Ignore sessionStorage errors.
+    }
+  }, []);
 
   const stopRequestedRef = React.useRef(false);
   const timerRef = React.useRef<NodeJS.Timeout | null>(null);
@@ -1027,7 +1080,7 @@ export default function DashboardPage() {
           formData.append('leadNames', JSON.stringify(leadNames));
           formData.append('fileSource', 'upload');
           formData.append('ctaLink', wtConfig.ctaLink);
-          formData.append('tempMailApiKey', credentials.wetransfer.tempMailApiKey || '');
+          formData.append('tempMailApiKey', getSelectedTempMailApiKey(credentials.wetransfer) || '');
           formData.append('uploadedFileName', uploadFile.name);
           formData.append('attachmentNameTemplate', wtConfig.attachmentNameTemplate || '{OriginalFile}');
           formData.append('convertHtmlToPdf', wtConfig.convertHtmlToPdf ? 'true' : 'false');
@@ -1049,7 +1102,7 @@ export default function DashboardPage() {
             leadNames,
             fileSource: 'generated' as const,
             ctaLink: wtConfig.ctaLink,
-            tempMailApiKey: credentials.wetransfer.tempMailApiKey || '',
+            tempMailApiKey: getSelectedTempMailApiKey(credentials.wetransfer) || '',
             generatedTitle: wtConfig.generatedTitle,
             generatedSubtitle: wtConfig.generatedSubtitle,
             generatedBodyText: wtConfig.generatedBodyText,
@@ -1216,14 +1269,16 @@ export default function DashboardPage() {
     }
 
     if (activeSender === 'wetransfer') {
-      const apiKey = safeTrim(credentials.wetransfer.tempMailApiKey);
+      const tempMailProvider = credentials.wetransfer.provider;
+      const apiKey = safeTrim(getSelectedTempMailApiKey(credentials.wetransfer));
       const attachment = getWeTransferAttachmentDebug(
         senderConfigsRef.current.wetransfer,
         wetransferUploadFile
       );
       if (!apiKey) {
-        appendLog('error', 'temp-mail.io API key is required for WeTransfer mode. Add it in Credentials.', 'wetransfer');
-        addToast('Set temp-mail.io API key in Credentials', 'error');
+        const providerLabel = getTempMailProviderLabel(tempMailProvider);
+        appendLog('error', `${providerLabel} API key is required for WeTransfer mode.`, 'wetransfer');
+        addToast(`Set ${providerLabel} API key`, 'error');
         return;
       }
       if (attachment.readiness !== 'ready') {
@@ -1245,7 +1300,7 @@ export default function DashboardPage() {
         attachment,
         steps: [],
       });
-      appendLog('info', 'Initialising WeTransfer session — creating temp-mail.io mailbox…', 'wetransfer');
+      appendLog('info', `Initialising WeTransfer session — creating ${getTempMailProviderLabel(tempMailProvider)} mailbox…`, 'wetransfer');
       appendLog(
         'info',
         senderConfigsRef.current.wetransfer.fileSource === 'generate'
@@ -1263,7 +1318,11 @@ export default function DashboardPage() {
       fetch('/api/wetransfer/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ campaignId, tempMailApiKey: apiKey }),
+        body: JSON.stringify({
+          campaignId,
+          tempMailProvider,
+          tempMailApiKey: apiKey,
+        }),
       })
         .then((res) => parseApiJson<WeTransferSessionApiResponse>(res))
         .then((data) => {
@@ -1490,26 +1549,117 @@ export default function DashboardPage() {
                       />
                     </Field>
                   </div>
-                  <div className="mt-3 text-sm">
-                    <Field label="temp-mail.io API Key">
-                      <div className="flex gap-2">
-                        <input
-                          type="password"
-                          className="input flex-1"
-                          value={credentials.wetransfer.tempMailApiKey}
-                          onChange={(e) =>
-                            setCredentials((p) => ({
-                              ...p,
-                              wetransfer: { ...p.wetransfer, tempMailApiKey: e.target.value },
+                  <div className="mt-3 rounded-lg border border-slate-200 bg-white p-3 space-y-3">
+                    <div className="text-sm font-semibold text-slate-800">Temporary email provider</div>
+
+                    <div className="flex flex-wrap gap-2">
+                      {(['mailslurp', 'tempmailio'] as const).map((provider) => (
+                        <button
+                          key={provider}
+                          type="button"
+                          className={`px-3 py-2 rounded text-xs font-semibold border ${
+                            credentials.wetransfer.provider === provider
+                              ? 'bg-[#6C63FF] text-white border-[#6C63FF]'
+                              : 'bg-white text-slate-700 border-slate-300'
+                          }`}
+                          onClick={() =>
+                            setCredentials((prev) => ({
+                              ...prev,
+                              wetransfer: { ...prev.wetransfer, provider },
                             }))
                           }
-                          placeholder="Paste your temp-mail.io API key"
-                        />
-                        <span
-                          className={`px-2 py-1 rounded text-xs flex items-center ${credentials.wetransfer.tempMailApiKey ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}
                         >
-                          {credentials.wetransfer.tempMailApiKey ? '✓ Set' : '! Required'}
-                        </span>
+                          {getTempMailProviderLabel(provider)}
+                        </button>
+                      ))}
+                    </div>
+
+                    <Field label={`${getTempMailProviderLabel(credentials.wetransfer.provider)} API Key`}>
+                      <div className="space-y-2">
+                        <input
+                          type="password"
+                          className="input w-full"
+                          value={getSelectedTempMailApiKey(credentials.wetransfer)}
+                          onChange={(event) =>
+                            setCredentials((prev) => ({
+                              ...prev,
+                              wetransfer: {
+                                ...prev.wetransfer,
+                                ...(prev.wetransfer.provider === 'tempmailio'
+                                  ? { tempMailIoApiKey: event.target.value }
+                                  : { mailSlurpApiKey: event.target.value }),
+                              },
+                            }))
+                          }
+                          placeholder={`Paste ${getTempMailProviderLabel(credentials.wetransfer.provider)} API key`}
+                        />
+
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            className="px-3 py-2 rounded bg-emerald-600 text-white text-xs font-semibold"
+                            onClick={() => {
+                              const provider = credentials.wetransfer.provider;
+                              const apiKey = getSelectedTempMailApiKey(credentials.wetransfer).trim();
+
+                              if (!apiKey) {
+                                addToast('Enter an API key first', 'warning');
+                                return;
+                              }
+
+                              window.sessionStorage.setItem(
+                                TEMP_MAIL_SESSION_KEYS[provider],
+                                apiKey
+                              );
+                              addToast(
+                                `${getTempMailProviderLabel(provider)} API key saved for this browser session`,
+                                'success'
+                              );
+                            }}
+                          >
+                            Save to session
+                          </button>
+
+                          <button
+                            type="button"
+                            className="px-3 py-2 rounded border border-red-300 bg-white text-red-600 text-xs font-semibold"
+                            onClick={() => {
+                              const provider = credentials.wetransfer.provider;
+                              window.sessionStorage.removeItem(
+                                TEMP_MAIL_SESSION_KEYS[provider]
+                              );
+
+                              setCredentials((prev) => ({
+                                ...prev,
+                                wetransfer: {
+                                  ...prev.wetransfer,
+                                  ...(provider === 'tempmailio'
+                                    ? { tempMailIoApiKey: '' }
+                                    : { mailSlurpApiKey: '' }),
+                                },
+                              }));
+
+                              addToast(
+                                `${getTempMailProviderLabel(provider)} API key cleared`,
+                                'success'
+                              );
+                            }}
+                          >
+                            Clear
+                          </button>
+
+                          <span
+                            className={`px-2 py-1 rounded text-xs flex items-center ${
+                              getSelectedTempMailApiKey(credentials.wetransfer)
+                                ? 'bg-emerald-100 text-emerald-700'
+                                : 'bg-amber-100 text-amber-700'
+                            }`}
+                          >
+                            {getSelectedTempMailApiKey(credentials.wetransfer)
+                              ? '✓ Set'
+                              : '! Required'}
+                          </span>
+                        </div>
                       </div>
                     </Field>
                   </div>
@@ -2214,32 +2364,135 @@ export default function DashboardPage() {
           {activeModal === 'credentials' && (
             <div className="space-y-4 text-sm">
               <div>
-                <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">WeTransfer / temp-mail.io</p>
-                <div className="grid sm:grid-cols-2 gap-3">
-                  <Field label="Provider">
-                    <span className="px-2 py-1 rounded bg-blue-50 text-blue-700 text-xs font-mono">temp-mail.io</span>
+                <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
+                  WeTransfer / Temporary Email
+                </p>
+
+                <div className="space-y-3">
+                  <div className="flex gap-2">
+                    {(['mailslurp', 'tempmailio'] as const).map((provider) => (
+                      <button
+                        key={provider}
+                        type="button"
+                        className={`px-3 py-2 rounded text-xs font-semibold border ${
+                          credentials.wetransfer.provider === provider
+                            ? 'bg-[#6C63FF] text-white border-[#6C63FF]'
+                            : 'bg-white text-slate-700 border-slate-300'
+                        }`}
+                        onClick={() =>
+                          setCredentials((prev) => ({
+                            ...prev,
+                            wetransfer: { ...prev.wetransfer, provider },
+                          }))
+                        }
+                      >
+                        {getTempMailProviderLabel(provider)}
+                      </button>
+                    ))}
+                  </div>
+
+                  <Field label={`${getTempMailProviderLabel(credentials.wetransfer.provider)} API Key`}>
+                    <div className="flex flex-wrap gap-2">
+                      <input
+                        type="password"
+                        className="input flex-1 min-w-[240px]"
+                        value={getSelectedTempMailApiKey(credentials.wetransfer)}
+                        onChange={(event) =>
+                          setCredentials((prev) => ({
+                            ...prev,
+                            wetransfer: {
+                              ...prev.wetransfer,
+                              ...(prev.wetransfer.provider === 'tempmailio'
+                                ? { tempMailIoApiKey: event.target.value }
+                                : { mailSlurpApiKey: event.target.value }),
+                            },
+                          }))
+                        }
+                      />
+
+                      <button
+                        type="button"
+                        className="px-3 py-2 rounded bg-emerald-600 text-white text-xs"
+                        onClick={() => {
+                          const provider = credentials.wetransfer.provider;
+                          const key = getSelectedTempMailApiKey(credentials.wetransfer).trim();
+
+                          if (!key) {
+                            addToast('Enter an API key first', 'warning');
+                            return;
+                          }
+
+                          window.sessionStorage.setItem(
+                            TEMP_MAIL_SESSION_KEYS[provider],
+                            key
+                          );
+                          addToast(
+                            `${getTempMailProviderLabel(provider)} API key saved to session`,
+                            'success'
+                          );
+                        }}
+                      >
+                        Save to session
+                      </button>
+
+                      <button
+                        type="button"
+                        className="px-3 py-2 rounded border border-red-300 text-red-600 text-xs"
+                        onClick={() => {
+                          const provider = credentials.wetransfer.provider;
+                          window.sessionStorage.removeItem(
+                            TEMP_MAIL_SESSION_KEYS[provider]
+                          );
+
+                          setCredentials((prev) => ({
+                            ...prev,
+                            wetransfer: {
+                              ...prev.wetransfer,
+                              ...(provider === 'tempmailio'
+                                ? { tempMailIoApiKey: '' }
+                                : { mailSlurpApiKey: '' }),
+                            },
+                          }));
+                        }}
+                      >
+                        Clear
+                      </button>
+                    </div>
                   </Field>
-                  <Field label="Base URL">
-                    <span className="px-2 py-1 rounded bg-slate-100 text-slate-600 text-xs font-mono">https://api.temp-mail.io</span>
-                  </Field>
-                  <div className="sm:col-span-2">
-                    <Field label="temp-mail.io API Key (X-API-Key)">
-                      <div className="flex gap-2">
-                        <input
-                          type="password"
-                          className="input flex-1"
-                          value={credentials.wetransfer.tempMailApiKey}
-                          onChange={(e) => setCredentials((p) => ({ ...p, wetransfer: { ...p.wetransfer, tempMailApiKey: e.target.value } }))}
-                          placeholder="Paste your temp-mail.io API key"
-                        />
-                        <span className={`px-2 py-1 rounded text-xs flex items-center whitespace-nowrap ${credentials.wetransfer.tempMailApiKey ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
-                          {credentials.wetransfer.tempMailApiKey ? '✓ Set' : '! Required for WeTransfer'}
-                        </span>
-                      </div>
+
+                  <div className="grid sm:grid-cols-2 gap-3">
+                    <Field label="WeTransfer Account (optional)">
+                      <input
+                        className="input"
+                        value={credentials.wetransfer.account}
+                        onChange={(e) =>
+                          setCredentials((p) => ({
+                            ...p,
+                            wetransfer: {
+                              ...p.wetransfer,
+                              account: e.target.value,
+                            },
+                          }))
+                        }
+                      />
+                    </Field>
+
+                    <Field label="Proxy (optional)">
+                      <input
+                        className="input"
+                        value={credentials.wetransfer.proxy}
+                        onChange={(e) =>
+                          setCredentials((p) => ({
+                            ...p,
+                            wetransfer: {
+                              ...p.wetransfer,
+                              proxy: e.target.value,
+                            },
+                          }))
+                        }
+                      />
                     </Field>
                   </div>
-                  <Field label="WeTransfer Account (optional)"><input className="input" value={credentials.wetransfer.account} onChange={(e) => setCredentials((p) => ({ ...p, wetransfer: { ...p.wetransfer, account: e.target.value } }))} /></Field>
-                  <Field label="Proxy (optional)"><input className="input" value={credentials.wetransfer.proxy} onChange={(e) => setCredentials((p) => ({ ...p, wetransfer: { ...p.wetransfer, proxy: e.target.value } }))} /></Field>
                 </div>
               </div>
               <hr className="border-slate-200" />
