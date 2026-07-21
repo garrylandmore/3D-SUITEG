@@ -4000,6 +4000,9 @@ function GmailSenderPanel({
     'chromium' | 'chromium-extension' | 'manual'
   >('chromium');
   const [gmailOAuthUrl, setGmailOAuthUrl] = React.useState('');
+  const [gmailCallbackUrl, setGmailCallbackUrl] = React.useState('');
+  const [finishingManualOAuth, setFinishingManualOAuth] =
+    React.useState(false);
   const [loadingProfiles, setLoadingProfiles] = React.useState(false);
   const [connecting, setConnecting] = React.useState(false);
   const [sending, setSending] = React.useState(false);
@@ -4192,7 +4195,6 @@ function GmailSenderPanel({
   ]);
 
   React.useEffect(() => {
-    void loadProfiles();
     void refreshConnections();
 
     const timer = window.setInterval(() => {
@@ -4200,7 +4202,7 @@ function GmailSenderPanel({
     }, 5000);
 
     return () => window.clearInterval(timer);
-  }, [loadProfiles, refreshConnections]);
+  }, [refreshConnections]);
 
   async function connectGmail() {
     if (!googleClientId.trim()) {
@@ -4285,6 +4287,62 @@ function GmailSenderPanel({
       onToast(message, 'error');
     } finally {
       setConnecting(false);
+    }
+  }
+
+  async function finishManualOAuth() {
+    const callbackUrl = gmailCallbackUrl.trim();
+
+    if (!callbackUrl) {
+      onToast('Paste the full Google callback URL first', 'warning');
+      return;
+    }
+
+    setFinishingManualOAuth(true);
+
+    try {
+      const response = await fetch('/api/gmail/oauth/callback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callbackUrl }),
+      });
+
+      const data = await parseApiJson<{
+        success?: boolean;
+        email?: string;
+        error?: string;
+      }>(response);
+
+      if (!response.ok || !data.success) {
+        throw new Error(
+          data.error ||
+            `Gmail OAuth completion failed (HTTP ${response.status})`
+        );
+      }
+
+      onLog(
+        'success',
+        `Gmail connected successfully: ${data.email || 'account connected'}`
+      );
+      onToast(
+        `Gmail connected: ${data.email || 'success'}`,
+        'success'
+      );
+
+      setGmailCallbackUrl('');
+      setGmailOAuthUrl('');
+      await refreshConnections();
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+
+      onLog(
+        'error',
+        `Manual Gmail OAuth completion failed: ${message}`
+      );
+      onToast(message, 'error');
+    } finally {
+      setFinishingManualOAuth(false);
     }
   }
 
@@ -4431,9 +4489,16 @@ function GmailSenderPanel({
             />
           </Field>
 
-          <div className="text-xs text-slate-500">
-            Add this exact redirect URI to the Authorized redirect URIs
-            for your Google OAuth client.
+          <div className="text-xs text-slate-500 space-y-1">
+            <div>
+              Add this exact redirect URI to the Authorized redirect URIs
+              for your Google OAuth client.
+            </div>
+            <div>
+              The Client ID and Client Secret belong to your 3D Suite Google OAuth app,
+              not to the Gmail account you are connecting. They cannot be read or
+              generated from a Chromium/Gmail profile.
+            </div>
           </div>
 
           <Field label="Chromium User Data directory — optional">
@@ -4481,7 +4546,7 @@ function GmailSenderPanel({
               onClick={() => void loadProfiles()}
               disabled={loadingProfiles}
             >
-              {loadingProfiles ? 'Scanning…' : 'Rescan profiles'}
+              {loadingProfiles ? 'Scanning…' : 'Scan Chromium profiles'}
             </button>
           </div>
 
@@ -4554,7 +4619,11 @@ function GmailSenderPanel({
               disabled={gmailConnectionMode === 'manual'}
               onChange={(event) => setSelectedProfile(event.target.value)}
             >
-              <option value="">Choose Chromium profile</option>
+              <option value="">
+                {profiles.length
+                  ? 'Choose Chromium profile'
+                  : 'Click "Scan Chromium profiles" first'}
+              </option>
               {profiles.map((profile) => (
                 <option key={profile.directory} value={profile.directory}>
                   {profile.name} ({profile.directory})
@@ -4651,8 +4720,36 @@ function GmailSenderPanel({
 
               <div className="text-xs text-emerald-800">
                 Paste this URL into the Chromium/Gmail profile you want to connect.
-                After you approve access, Google will redirect to the OAuth callback
-                and the account will appear under Connected Gmail accounts.
+                If that browser is on another PC, the final localhost page will not
+                open there. Copy the full URL from its address bar and paste it below.
+              </div>
+
+              <div className="border-t border-emerald-200 pt-3 space-y-2">
+                <div className="text-xs font-semibold text-emerald-800">
+                  Paste OAuth callback URL from another PC
+                </div>
+
+                <textarea
+                  className="input min-h-28 text-xs"
+                  value={gmailCallbackUrl}
+                  onChange={(event) =>
+                    setGmailCallbackUrl(event.target.value)
+                  }
+                  placeholder="http://localhost:7201/api/gmail/oauth/callback?state=...&code=..."
+                />
+
+                <button
+                  type="button"
+                  className="rounded bg-[#6C63FF] px-3 py-2 text-xs text-white disabled:opacity-50"
+                  disabled={
+                    finishingManualOAuth || !gmailCallbackUrl.trim()
+                  }
+                  onClick={() => void finishManualOAuth()}
+                >
+                  {finishingManualOAuth
+                    ? 'Finishing Gmail connection…'
+                    : 'Finish Gmail Connection'}
+                </button>
               </div>
             </div>
           )}
