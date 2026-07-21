@@ -3996,6 +3996,10 @@ function GmailSenderPanel({
   );
   const [chromiumUserDataDir, setChromiumUserDataDir] = React.useState('');
   const [chromiumExecutablePath, setChromiumExecutablePath] = React.useState('');
+  const [gmailConnectionMode, setGmailConnectionMode] = React.useState<
+    'chromium' | 'chromium-extension' | 'manual'
+  >('chromium');
+  const [gmailOAuthUrl, setGmailOAuthUrl] = React.useState('');
   const [loadingProfiles, setLoadingProfiles] = React.useState(false);
   const [connecting, setConnecting] = React.useState(false);
   const [sending, setSending] = React.useState(false);
@@ -4040,6 +4044,7 @@ function GmailSenderPanel({
         chromiumUserDataDir?: string;
         chromiumExecutablePath?: string;
         extensionPath?: string;
+        connectionMode?: 'chromium' | 'chromium-extension' | 'manual';
       };
 
       setGoogleClientId(String(saved.clientId || ''));
@@ -4057,6 +4062,13 @@ function GmailSenderPanel({
         String(saved.chromiumExecutablePath || '')
       );
       setExtensionPath(String(saved.extensionPath || ''));
+      setGmailConnectionMode(
+        saved.connectionMode === 'manual'
+          ? 'manual'
+          : saved.connectionMode === 'chromium-extension'
+            ? 'chromium-extension'
+            : 'chromium'
+      );
     } catch {}
   }, []);
 
@@ -4082,6 +4094,7 @@ function GmailSenderPanel({
           chromiumExecutablePath:
             chromiumExecutablePath.trim(),
           extensionPath: extensionPath.trim(),
+          connectionMode: gmailConnectionMode,
         })
       );
 
@@ -4104,6 +4117,8 @@ function GmailSenderPanel({
     setChromiumUserDataDir('');
     setChromiumExecutablePath('');
     setExtensionPath('');
+    setGmailConnectionMode('chromium');
+    setGmailOAuthUrl('');
     onToast('Gmail session settings cleared', 'success');
   }
 
@@ -4203,7 +4218,10 @@ function GmailSenderPanel({
       return;
     }
 
-    if (!selectedProfile) {
+    if (
+      gmailConnectionMode !== 'manual' &&
+      !selectedProfile
+    ) {
       onToast('Choose a Chromium profile first', 'warning');
       return;
     }
@@ -4215,7 +4233,10 @@ function GmailSenderPanel({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           profileDirectory: selectedProfile,
-          extensionPath: extensionPath.trim() || undefined,
+          extensionPath:
+            gmailConnectionMode === 'chromium-extension'
+              ? extensionPath.trim() || undefined
+              : undefined,
           googleClientId: googleClientId.trim(),
           googleClientSecret: googleClientSecret.trim(),
           googleRedirectUri: googleRedirectUri.trim(),
@@ -4223,11 +4244,14 @@ function GmailSenderPanel({
             chromiumUserDataDir.trim() || undefined,
           chromiumExecutablePath:
             chromiumExecutablePath.trim() || undefined,
+          connectionMode: gmailConnectionMode,
         }),
       });
 
       const data = await parseApiJson<{
         success?: boolean;
+        authorizationUrl?: string;
+        mode?: 'chromium' | 'manual';
         error?: string;
       }>(response);
 
@@ -4235,13 +4259,26 @@ function GmailSenderPanel({
         throw new Error(data.error || `Gmail connection failed (HTTP ${response.status})`);
       }
 
-      onLog(
-        'info',
-        `Google OAuth opened in Chromium profile "${selectedProfile}"${
-          extensionPath.trim() ? ' with unpacked extension loaded' : ''
-        }.`
-      );
-      onToast('Google OAuth opened in Chromium', 'success');
+      if (data.mode === 'manual' && data.authorizationUrl) {
+        setGmailOAuthUrl(data.authorizationUrl);
+        onLog(
+          'info',
+          'Google OAuth URL generated. Paste it into the Gmail/Chromium profile you want to connect.'
+        );
+        onToast('Google OAuth URL generated', 'success');
+      } else {
+        setGmailOAuthUrl('');
+        onLog(
+          'info',
+          `Google OAuth opened in Chromium profile "${selectedProfile}"${
+            gmailConnectionMode === 'chromium-extension' &&
+            extensionPath.trim()
+              ? ' with unpacked extension loaded'
+              : ''
+          }.`
+        );
+        onToast('Google OAuth opened in Chromium', 'success');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       onLog('error', `Gmail connection failed: ${message}`);
@@ -4407,6 +4444,7 @@ function GmailSenderPanel({
                 setChromiumUserDataDir(event.target.value)
               }
               placeholder="Auto-detected, or C:\Users\Vergio\AppData\Local\Chromium\User Data"
+              disabled={gmailConnectionMode === 'manual'}
             />
           </Field>
 
@@ -4418,6 +4456,7 @@ function GmailSenderPanel({
                 setChromiumExecutablePath(event.target.value)
               }
               placeholder="Auto-detected, or C:\path\to\chromium\chrome.exe"
+              disabled={gmailConnectionMode === 'manual'}
             />
           </Field>
 
@@ -4446,10 +4485,73 @@ function GmailSenderPanel({
             </button>
           </div>
 
+          <Field label="Connection mode">
+            <div className="grid lg:grid-cols-3 gap-2">
+              <button
+                type="button"
+                className={`rounded border px-3 py-2 text-left ${
+                  gmailConnectionMode === 'chromium'
+                    ? 'border-[#6C63FF] bg-violet-50 text-violet-700'
+                    : 'border-slate-300 bg-white text-slate-700'
+                }`}
+                onClick={() => {
+                  setGmailConnectionMode('chromium');
+                  setGmailOAuthUrl('');
+                }}
+              >
+                <div className="font-semibold">Existing Chromium profile</div>
+                <div className="mt-1 text-xs opacity-75">
+                  Open OAuth in an existing Chromium profile/session.
+                </div>
+              </button>
+
+              <button
+                type="button"
+                className={`rounded border px-3 py-2 text-left ${
+                  gmailConnectionMode === 'chromium-extension'
+                    ? 'border-[#6C63FF] bg-violet-50 text-violet-700'
+                    : 'border-slate-300 bg-white text-slate-700'
+                }`}
+                onClick={() => {
+                  setGmailConnectionMode('chromium-extension');
+                  setGmailOAuthUrl('');
+                }}
+              >
+                <div className="font-semibold">Chromium profile + extension</div>
+                <div className="mt-1 text-xs opacity-75">
+                  Launch the selected profile with an unpacked extension.
+                </div>
+              </button>
+
+              <button
+                type="button"
+                className={`rounded border px-3 py-2 text-left ${
+                  gmailConnectionMode === 'manual'
+                    ? 'border-[#6C63FF] bg-violet-50 text-violet-700'
+                    : 'border-slate-300 bg-white text-slate-700'
+                }`}
+                onClick={() => setGmailConnectionMode('manual')}
+              >
+                <div className="font-semibold">Manual OAuth URL</div>
+                <div className="mt-1 text-xs opacity-75">
+                  Generate a URL and paste it into any Gmail/Chromium session.
+                </div>
+              </button>
+            </div>
+          </Field>
+
+          {gmailConnectionMode === 'manual' && (
+            <div className="rounded border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800">
+              Chromium profile, executable path, User Data directory, and extension
+              folder are optional in Manual OAuth URL mode.
+            </div>
+          )}
+
           <Field label="Chromium profile">
             <select
               className="input"
               value={selectedProfile}
+              disabled={gmailConnectionMode === 'manual'}
               onChange={(event) => setSelectedProfile(event.target.value)}
             >
               <option value="">Choose Chromium profile</option>
@@ -4461,28 +4563,99 @@ function GmailSenderPanel({
             </select>
           </Field>
 
-          <Field label="Optional unpacked extension folder">
-            <input
-              className="input"
-              value={extensionPath}
-              onChange={(event) => setExtensionPath(event.target.value)}
-              placeholder="C:\path\to\extension"
-            />
-          </Field>
+          {gmailConnectionMode === 'chromium-extension' && (
+            <>
+              <Field label="Unpacked extension folder — required for this mode">
+                <input
+                  className="input"
+                  value={extensionPath}
+                  onChange={(event) => setExtensionPath(event.target.value)}
+                  placeholder="C:\path\to\extension"
+                />
+              </Field>
 
-          <div className="text-xs text-slate-500">
-            The extension folder must contain <code>manifest.json</code>. It is loaded only
-            inside the selected Chromium profile.
-          </div>
+              <div className="text-xs text-slate-500">
+                The extension folder must contain <code>manifest.json</code>.
+              </div>
+            </>
+          )}
 
           <button
             type="button"
             className="rounded bg-[#6C63FF] px-3 py-2 text-white disabled:opacity-50"
-            disabled={connecting || !selectedProfile}
+            disabled={
+              connecting ||
+              !googleClientId.trim() ||
+              !googleClientSecret.trim() ||
+              !googleRedirectUri.trim() ||
+              (gmailConnectionMode !== 'manual' && !selectedProfile) ||
+              (gmailConnectionMode === 'chromium-extension' &&
+                !extensionPath.trim())
+            }
             onClick={() => void connectGmail()}
           >
-            {connecting ? 'Opening Google OAuth…' : 'Connect Gmail'}
+            {connecting
+              ? gmailConnectionMode === 'manual'
+                ? 'Generating OAuth URL…'
+                : 'Opening Google OAuth…'
+              : gmailConnectionMode === 'manual'
+                ? 'Generate OAuth URL'
+                : gmailConnectionMode === 'chromium-extension'
+                  ? 'Connect Gmail with Extension'
+                  : 'Connect Gmail'}
           </button>
+
+          {gmailConnectionMode === 'manual' && gmailOAuthUrl && (
+            <div className="space-y-2 rounded border border-emerald-200 bg-emerald-50 p-3">
+              <div className="text-xs font-semibold text-emerald-800">
+                Google OAuth URL
+              </div>
+
+              <textarea
+                readOnly
+                className="input min-h-28 text-xs"
+                value={gmailOAuthUrl}
+                onFocus={(event) => event.currentTarget.select()}
+              />
+
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="rounded bg-emerald-600 px-3 py-2 text-xs text-white"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(gmailOAuthUrl);
+                      onToast('OAuth URL copied', 'success');
+                    } catch {
+                      onToast('Unable to copy OAuth URL', 'error');
+                    }
+                  }}
+                >
+                  Copy OAuth URL
+                </button>
+
+                <button
+                  type="button"
+                  className="rounded border border-emerald-400 px-3 py-2 text-xs text-emerald-800"
+                  onClick={() =>
+                    window.open(
+                      gmailOAuthUrl,
+                      '_blank',
+                      'noopener,noreferrer'
+                    )
+                  }
+                >
+                  Open OAuth URL
+                </button>
+              </div>
+
+              <div className="text-xs text-emerald-800">
+                Paste this URL into the Chromium/Gmail profile you want to connect.
+                After you approve access, Google will redirect to the OAuth callback
+                and the account will appear under Connected Gmail accounts.
+              </div>
+            </div>
+          )}
 
           <div className="border-t pt-3">
             <div className="mb-2 text-xs font-semibold uppercase text-slate-500">
