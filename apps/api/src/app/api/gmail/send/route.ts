@@ -43,7 +43,7 @@ async function renderHtmlWithLinks(
 
   try {
     const page = await browser.newPage({
-      viewport: { width: 1200, height: 1600 },
+      viewport: { width: 1240, height: 1754 },
       deviceScaleFactor: 1,
     });
 
@@ -52,22 +52,27 @@ async function renderHtmlWithLinks(
       timeout: 60000,
     });
 
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(900);
 
     const metrics = await page.evaluate(() => {
       const doc = document.documentElement;
+      const body = document.body;
+
       const width = Math.max(
         doc.scrollWidth,
-        document.body?.scrollWidth || 0,
-        1200
-      );
-      const height = Math.max(
-        doc.scrollHeight,
-        document.body?.scrollHeight || 0,
-        1600
+        body?.scrollWidth || 0,
+        1240
       );
 
-      const links = Array.from(document.querySelectorAll('a[href]'))
+      const height = Math.max(
+        doc.scrollHeight,
+        body?.scrollHeight || 0,
+        1754
+      );
+
+      const links = Array.from(
+        document.querySelectorAll('a[href]')
+      )
         .map((anchor) => {
           const rect = anchor.getBoundingClientRect();
           const href = (anchor as HTMLAnchorElement).href || '';
@@ -125,22 +130,79 @@ async function htmlToPdfBuffer(
   });
 
   try {
-    const page = await browser.newPage();
+    const page = await browser.newPage({
+      viewport: {
+        width: 1240,
+        height: 1754,
+      },
+    });
+
     await page.setContent(html, {
       waitUntil: 'networkidle',
       timeout: 60000,
     });
-    await page.waitForTimeout(800);
+
+    await page.waitForTimeout(900);
+
+    // Measure the natural HTML size and scale the whole document to one A4 page.
+    const dimensions = await page.evaluate(() => {
+      const doc = document.documentElement;
+      const body = document.body;
+
+      return {
+        width: Math.max(
+          doc.scrollWidth,
+          body?.scrollWidth || 0,
+          1
+        ),
+        height: Math.max(
+          doc.scrollHeight,
+          body?.scrollHeight || 0,
+          1
+        ),
+      };
+    });
+
+    const a4WidthPx = 794;
+    const a4HeightPx = 1123;
+
+    const fitScale = Math.min(
+      1,
+      a4WidthPx / dimensions.width,
+      a4HeightPx / dimensions.height
+    );
+
+    await page.addStyleTag({
+      content: `
+        @page {
+          size: A4 portrait;
+          margin: 8mm;
+        }
+
+        html, body {
+          margin: 0 !important;
+          padding: 0 !important;
+        }
+
+        body {
+          transform: scale(${fitScale});
+          transform-origin: top left;
+          width: ${100 / fitScale}%;
+        }
+      `,
+    });
 
     return Buffer.from(
       await page.pdf({
         format: 'A4',
         printBackground: true,
+        preferCSSPageSize: true,
+        pageRanges: '1',
         margin: {
-          top: '12mm',
-          right: '12mm',
-          bottom: '12mm',
-          left: '12mm',
+          top: '8mm',
+          right: '8mm',
+          bottom: '8mm',
+          left: '8mm',
         },
       })
     );
@@ -150,16 +212,15 @@ async function htmlToPdfBuffer(
 }
 
 function htmlToSvgBuffer(html: string): Buffer {
-  const encodedHtml = html
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
-
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1600" viewBox="0 0 1200 1600">
-  <foreignObject width="100%" height="100%">
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="794"
+     height="1123"
+     viewBox="0 0 794 1123"
+     preserveAspectRatio="xMidYMid meet">
+  <foreignObject x="0" y="0" width="794" height="1123">
     <div xmlns="http://www.w3.org/1999/xhtml"
-         style="width:100%;height:100%;box-sizing:border-box;">
+         style="width:794px;height:1123px;box-sizing:border-box;overflow:hidden;">
       ${html}
     </div>
   </foreignObject>
@@ -168,19 +229,120 @@ function htmlToSvgBuffer(html: string): Buffer {
   return Buffer.from(svg, 'utf8');
 }
 
+async function sliceRenderedPng(
+  png: Buffer,
+  sourceWidth: number,
+  sourceHeight: number,
+  pageAspect: number
+): Promise<Array<{
+  data: Buffer;
+  sourceY: number;
+  sourceHeight: number;
+}>> {
+  // Use Playwright itself to crop the rendered PNG into page/slide-sized pieces.
+  // This avoids introducing an additional image-processing dependency.
+  const browser = await chromium.launch({ headless: true });
+
+  try {
+    const slices: Array<{
+      data: Buffer;
+      sourceY: number;
+      sourceHeight: number;
+    }> = [];
+
+    const sliceHeight = Math.max(
+      1,
+      Math.floor(sourceWidth / pageAspect)
+    );
+
+    for (
+      let sourceY = 0;
+      sourceY < sourceHeight;
+      sourceY += sliceHeight
+    ) {
+      const currentHeight = Math.min(
+        sliceHeight,
+        sourceHeight - sourceY
+      );
+
+      const page = await browser.newPage({
+        viewport: {
+          width: sourceWidth,
+          height: currentHeight,
+        },
+      });
+
+      const dataUri =
+        `data:image/png;base64,${png.toString('base64')}`;
+
+      await page.setContent(
+        `<html><body style="margin:0;overflow:hidden;">
+          <img src="${dataUri}"
+               style="position:absolute;left:0;top:-${sourceY}px;width:${sourceWidth}px;height:${sourceHeight}px;max-width:none;">
+        </body></html>`,
+        { waitUntil: 'load' }
+      );
+
+      slices.push({
+        data: await page.screenshot({
+          type: 'png',
+          clip: {
+            x: 0,
+            y: 0,
+            width: sourceWidth,
+            height: currentHeight,
+          },
+        }),
+        sourceY,
+        sourceHeight: currentHeight,
+      });
+
+      await page.close();
+    }
+
+    return slices;
+  } finally {
+    await browser.close().catch(() => undefined);
+  }
+}
+
 async function htmlToDocxBuffer(
   html: string
 ): Promise<Buffer> {
   const rendered = await renderHtmlWithLinks(html);
 
+  // Single A4-style portrait page.
+  // Fit the complete rendered HTML proportionally inside the page.
+  const pageWidthPx = 690;
+  const pageHeightPx = 975;
+
+  const scale = Math.min(
+    pageWidthPx / rendered.width,
+    pageHeightPx / rendered.height
+  );
+
+  const targetWidth = Math.max(
+    1,
+    Math.round(rendered.width * scale)
+  );
+  const targetHeight = Math.max(
+    1,
+    Math.round(rendered.height * scale)
+  );
+
   const children: Paragraph[] = [
     new Paragraph({
+      alignment: 'center',
+      spacing: {
+        before: 0,
+        after: 0,
+      },
       children: [
         new ImageRun({
           data: rendered.png,
           transformation: {
-            width: 600,
-            height: 800,
+            width: targetWidth,
+            height: targetHeight,
           },
           type: 'png',
         }),
@@ -188,13 +350,17 @@ async function htmlToDocxBuffer(
     }),
   ];
 
-  // Word does not provide a robust transparent positional hyperlink overlay
-  // primitive through the docx library. Preserve the visual exactly as the
-  // rendered HTML image, then keep all discovered hyperlinks clickable in
-  // a compact link strip immediately below the rendered document.
+  // Keep detected hyperlinks available in the document.
+  // DOCX does not support reliable transparent positional overlays via this library,
+  // so clickable links remain as a compact strip below the rendered content when space allows.
   if (rendered.links.length) {
     children.push(
       new Paragraph({
+        alignment: 'center',
+        spacing: {
+          before: 80,
+          after: 0,
+        },
         children: rendered.links.map(
           (link, index) =>
             new ExternalHyperlink({
@@ -219,6 +385,18 @@ async function htmlToDocxBuffer(
       {
         properties: {
           type: SectionType.CONTINUOUS,
+          page: {
+            size: {
+              width: 11906,
+              height: 16838,
+            },
+            margin: {
+              top: 240,
+              right: 240,
+              bottom: 240,
+              left: 240,
+            },
+          },
         },
         children,
       },
@@ -234,25 +412,48 @@ async function htmlToPptxBuffer(
   const rendered = await renderHtmlWithLinks(html);
 
   const pptx = new PptxGenJS();
-  pptx.layout = 'LAYOUT_WIDE';
+
+  pptx.defineLayout({
+    name: 'A4_PORTRAIT',
+    width: 8.27,
+    height: 11.69,
+  });
+  pptx.layout = 'A4_PORTRAIT';
+
+  const slideW = 8.27;
+  const slideH = 11.69;
+
+  const scale = Math.min(
+    slideW / rendered.width,
+    slideH / rendered.height
+  );
+
+  const imageW = rendered.width * scale;
+  const imageH = rendered.height * scale;
+  const imageX = (slideW - imageW) / 2;
+  const imageY = (slideH - imageH) / 2;
 
   const slide = pptx.addSlide();
-  const slideW = 13.333;
-  const slideH = 7.5;
 
   slide.addImage({
-    data: `data:image/png;base64,${rendered.png.toString('base64')}`,
-    x: 0,
-    y: 0,
-    w: slideW,
-    h: slideH,
+    data:
+      `data:image/png;base64,${rendered.png.toString('base64')}`,
+    x: imageX,
+    y: imageY,
+    w: imageW,
+    h: imageH,
   });
 
+  // Preserve clickable positions relative to the fitted image.
   for (const link of rendered.links) {
-    const x = (link.x / rendered.width) * slideW;
-    const y = (link.y / rendered.height) * slideH;
-    const w = (link.width / rendered.width) * slideW;
-    const h = (link.height / rendered.height) * slideH;
+    const x =
+      imageX + (link.x / rendered.width) * imageW;
+    const y =
+      imageY + (link.y / rendered.height) * imageH;
+    const w =
+      (link.width / rendered.width) * imageW;
+    const h =
+      (link.height / rendered.height) * imageH;
 
     slide.addShape(pptx.ShapeType.rect, {
       x,
@@ -453,6 +654,7 @@ async function ensureAccessToken(
 function buildMimeMessage(args: {
   from: string;
   fromName?: string;
+  replyTo?: string;
   to: string;
   subject: string;
   body: string;
@@ -475,6 +677,9 @@ function buildMimeMessage(args: {
 
   const headers = [
     fromHeader,
+    ...(args.replyTo?.trim()
+      ? [`Reply-To: ${args.replyTo.trim().replace(/[\r\n]/g, '')}`]
+      : []),
     `To: ${args.to}`,
     `Subject: ${args.subject}`,
     'MIME-Version: 1.0',
@@ -530,6 +735,10 @@ export async function POST(request: NextRequest) {
 
     const fromName = String(
       formData.get('fromName') || ''
+    ).trim();
+
+    const replyTo = String(
+      formData.get('replyTo') || ''
     ).trim();
 
     const accountPlanRaw = String(
@@ -1013,6 +1222,7 @@ export async function POST(request: NextRequest) {
         const mime = buildMimeMessage({
           from: authorized.email,
           fromName,
+          replyTo,
           to: recipient,
           subject,
           body,
