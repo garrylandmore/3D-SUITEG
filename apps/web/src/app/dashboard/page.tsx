@@ -4016,6 +4016,9 @@ function GmailSenderPanel({
   const [bodyTemplate, setBodyTemplate] = React.useState(
     'Hello,\n\nPlease review the attached document.\n\nReference: {Random8}\nDate: {Date}'
   );
+  const [gmailMessageMode, setGmailMessageMode] = React.useState<
+    'text' | 'html'
+  >('text');
   const [attachmentNameTemplate, setAttachmentNameTemplate] =
     React.useState('{DomainName}-Document-{Random6}.{Ext}');
   const [attachment, setAttachment] = React.useState<File | null>(null);
@@ -4430,6 +4433,7 @@ function GmailSenderPanel({
       formData.append('recipients', JSON.stringify(recipients));
       formData.append('subjectTemplate', subjectTemplate);
       formData.append('bodyTemplate', bodyTemplate);
+      formData.append('messageMode', gmailMessageMode);
       formData.append('attachmentNameTemplate', attachmentNameTemplate);
       formData.append('fromName', gmailFromName.trim());
       formData.append(
@@ -5005,13 +5009,89 @@ function GmailSenderPanel({
             />
           </Field>
 
-          <Field label="Message">
-            <textarea
-              className="input min-h-36"
-              value={bodyTemplate}
-              onChange={(event) => setBodyTemplate(event.target.value)}
-            />
+          <Field label="Message format">
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                className={`rounded border px-3 py-2 text-sm ${
+                  gmailMessageMode === 'text'
+                    ? 'border-[#6C63FF] bg-violet-50 text-violet-700'
+                    : 'border-slate-300 bg-white text-slate-700'
+                }`}
+                onClick={() => setGmailMessageMode('text')}
+              >
+                Plain Text
+              </button>
+
+              <button
+                type="button"
+                className={`rounded border px-3 py-2 text-sm ${
+                  gmailMessageMode === 'html'
+                    ? 'border-[#6C63FF] bg-violet-50 text-violet-700'
+                    : 'border-slate-300 bg-white text-slate-700'
+                }`}
+                onClick={() => setGmailMessageMode('html')}
+              >
+                HTML
+              </button>
+            </div>
           </Field>
+
+          <div
+            className={`grid gap-3 ${
+              gmailMessageMode === 'html'
+                ? 'xl:grid-cols-2'
+                : 'grid-cols-1'
+            }`}
+          >
+            <Field
+              label={
+                gmailMessageMode === 'html'
+                  ? 'HTML message'
+                  : 'Message'
+              }
+            >
+              <textarea
+                className="input min-h-[320px] font-mono text-sm"
+                value={bodyTemplate}
+                onChange={(event) =>
+                  setBodyTemplate(event.target.value)
+                }
+                placeholder={
+                  gmailMessageMode === 'html'
+                    ? '<html><body><h2>Hello</h2><p>Your message...</p></body></html>'
+                    : 'Type your email message...'
+                }
+              />
+            </Field>
+
+            {gmailMessageMode === 'html' && (
+              <Field label="Live HTML preview">
+                <div className="overflow-hidden rounded border border-slate-300 bg-white">
+                  <iframe
+                    title="Gmail HTML preview"
+                    className="h-[320px] w-full bg-white"
+                    sandbox=""
+                    srcDoc={
+                      bodyTemplate.trim()
+                        ? bodyTemplate
+                        : '<html><body style="font-family:Arial,sans-serif;color:#64748b;padding:20px;">HTML preview will appear here.</body></html>'
+                    }
+                  />
+                </div>
+              </Field>
+            )}
+          </div>
+
+          {gmailMessageMode === 'html' && (
+            <div className="text-xs text-slate-500">
+              Preview updates as you type. Placeholders such as
+              {' '}<code>{'{Email}'}</code>,{' '}
+              <code>{'{DomainName}'}</code>,{' '}
+              <code>{'{Date}'}</code>, and{' '}
+              <code>{'{Random8}'}</code> are resolved per recipient when sending.
+            </div>
+          )}
 
           <Field label="Attachment">
             <input
