@@ -3993,6 +3993,7 @@ function GmailSenderPanel({
     Record<string, { enabled: boolean; maxSends: number }>
   >({});
   const [gmailFromName, setGmailFromName] = React.useState('');
+  const [gmailReplyTo, setGmailReplyTo] = React.useState('');
   const [extensionPath, setExtensionPath] = React.useState('');
   const [googleClientId, setGoogleClientId] = React.useState('');
   const [googleClientSecret, setGoogleClientSecret] = React.useState('');
@@ -4511,6 +4512,7 @@ function GmailSenderPanel({
       formData.append('attachmentMode', gmailAttachmentMode);
       formData.append('attachmentHtml', gmailAttachmentHtml);
       formData.append('fromName', gmailFromName.trim());
+      formData.append('replyTo', gmailReplyTo.trim());
       formData.append(
         'rotateAccounts',
         gmailRotateAccounts ? 'true' : 'false'
@@ -4955,16 +4957,34 @@ function GmailSenderPanel({
 
       <Panel title="Gmail Sender">
         <div className="space-y-3 text-sm">
-          <Field label="From name">
-            <input
-              className="input"
-              value={gmailFromName}
-              onChange={(event) =>
-                setGmailFromName(event.target.value)
-              }
-              placeholder="e.g. Accounts Department"
-            />
-          </Field>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="From name">
+              <input
+                className="input"
+                value={gmailFromName}
+                onChange={(event) =>
+                  setGmailFromName(event.target.value)
+                }
+                placeholder="e.g. Accounts Department"
+              />
+            </Field>
+
+            <Field label="Reply-To">
+              <input
+                type="email"
+                className="input"
+                value={gmailReplyTo}
+                onChange={(event) =>
+                  setGmailReplyTo(event.target.value)
+                }
+                placeholder="replies@example.com"
+              />
+            </Field>
+          </div>
+
+          <div className="text-xs text-slate-500">
+            Reply-To is optional. When filled, replies go to this address instead of the sending Gmail account.
+          </div>
 
           <label className="flex items-center gap-2 rounded border border-slate-200 p-3">
             <input
