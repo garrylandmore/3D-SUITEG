@@ -4013,6 +4013,13 @@ function GmailSenderPanel({
   const [sending, setSending] = React.useState(false);
   const [subjectTemplate, setSubjectTemplate] =
     React.useState('Document for {DomainName}');
+  const [gmailAttachmentLink, setGmailAttachmentLink] = React.useState('');
+  const [gmailCtaLink, setGmailCtaLink] = React.useState('');
+  const [gmailQrEnabled, setGmailQrEnabled] = React.useState(false);
+  const [gmailQrSource, setGmailQrSource] = React.useState<
+    'attachment-link' | 'cta-link' | 'custom'
+  >('attachment-link');
+  const [gmailQrCustomData, setGmailQrCustomData] = React.useState('');
   const [bodyTemplate, setBodyTemplate] = React.useState(
     'Hello,\n\nPlease review the attached document.\n\nReference: {Random8}\nDate: {Date}'
   );
@@ -4032,6 +4039,14 @@ function GmailSenderPanel({
     React.useState('google.com');
   const [attachmentNameTemplate, setAttachmentNameTemplate] =
     React.useState('{DomainName}-Document-{Random6}.{Ext}');
+  const [gmailAttachmentEnabled, setGmailAttachmentEnabled] =
+    React.useState(false);
+  const [gmailAttachmentMode, setGmailAttachmentMode] = React.useState<
+    'upload' | 'html-pdf' | 'html-pptx' | 'html-docx' | 'html-svg'
+  >('upload');
+  const [gmailAttachmentHtml, setGmailAttachmentHtml] = React.useState(
+    '<html><body style="font-family:Arial,sans-serif;padding:32px;"><img src="{CompanyLogo}" style="max-width:160px;height:auto;" /><h2>Document for {DomainName}</h2><p>Reference: {Random8}</p><p>Date: {Date}</p></body></html>'
+  );
   const [attachment, setAttachment] = React.useState<File | null>(null);
   const [recipientsText, setRecipientsText] = React.useState('');
 
@@ -4476,6 +4491,11 @@ function GmailSenderPanel({
       formData.append('accountEmail', selectedAccount);
       formData.append('recipients', JSON.stringify(recipients));
       formData.append('subjectTemplate', subjectTemplate);
+      formData.append('attachmentLink', gmailAttachmentLink.trim());
+      formData.append('ctaLink', gmailCtaLink.trim());
+      formData.append('qrEnabled', gmailQrEnabled ? 'true' : 'false');
+      formData.append('qrSource', gmailQrSource);
+      formData.append('qrCustomData', gmailQrCustomData.trim());
       formData.append('bodyTemplate', bodyTemplate);
       formData.append('messageMode', gmailMessageMode);
       formData.append('logoDevEnabled', logoDevEnabled ? 'true' : 'false');
@@ -4484,6 +4504,12 @@ function GmailSenderPanel({
       formData.append('logoDevFormat', logoDevFormat);
       formData.append('logoDevTheme', logoDevTheme);
       formData.append('attachmentNameTemplate', attachmentNameTemplate);
+      formData.append(
+        'attachmentEnabled',
+        gmailAttachmentEnabled ? 'true' : 'false'
+      );
+      formData.append('attachmentMode', gmailAttachmentMode);
+      formData.append('attachmentHtml', gmailAttachmentHtml);
       formData.append('fromName', gmailFromName.trim());
       formData.append(
         'rotateAccounts',
@@ -4504,7 +4530,11 @@ function GmailSenderPanel({
         )
       );
 
-      if (attachment) {
+      if (
+        gmailAttachmentEnabled &&
+        gmailAttachmentMode === 'upload' &&
+        attachment
+      ) {
         formData.append('attachment', attachment);
       }
 
@@ -5050,6 +5080,106 @@ function GmailSenderPanel({
             />
           </Field>
 
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="Attachment Link">
+              <input
+                className="input"
+                value={gmailAttachmentLink}
+                onChange={(event) =>
+                  setGmailAttachmentLink(event.target.value)
+                }
+                placeholder="https://example.com/document"
+              />
+            </Field>
+
+            <Field label="CTA Link">
+              <input
+                className="input"
+                value={gmailCtaLink}
+                onChange={(event) =>
+                  setGmailCtaLink(event.target.value)
+                }
+                placeholder="https://example.com/action"
+              />
+            </Field>
+          </div>
+
+          <div className="text-xs text-slate-500">
+            Use <code>{'{AttachmentLink}'}</code> or <code>{'{CTA}'}</code> inside
+            HTML <code>href</code> values. Generated PDF/PPTX/DOCX/SVG attachments
+            resolve these automatically.
+          </div>
+
+          <div className="space-y-3 rounded border border-slate-200 p-3">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={gmailQrEnabled}
+                onChange={(event) => setGmailQrEnabled(event.target.checked)}
+              />
+              <span>
+                <span className="font-medium">Enable QR code autograb</span>
+                <span className="block text-xs text-slate-500">
+                  Replaces <code>{'{QRCode}'}</code> with a generated QR image.
+                </span>
+              </span>
+            </label>
+
+            {gmailQrEnabled && (
+              <div className="space-y-3">
+                <Field label="QR code data source">
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    {[
+                      ['attachment-link', 'Attachment Link'],
+                      ['cta-link', 'CTA Link'],
+                      ['custom', 'Custom data / URL'],
+                    ].map(([value, label]) => (
+                      <label
+                        key={value}
+                        className={`flex cursor-pointer items-center gap-2 rounded border px-3 py-2 ${
+                          gmailQrSource === value
+                            ? 'border-[#6C63FF] bg-violet-50 text-violet-700'
+                            : 'border-slate-300 bg-white text-slate-700'
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="gmailQrSource"
+                          checked={gmailQrSource === value}
+                          onChange={() =>
+                            setGmailQrSource(
+                              value as 'attachment-link' | 'cta-link' | 'custom'
+                            )
+                          }
+                        />
+                        <span>{label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </Field>
+
+                {gmailQrSource === 'custom' && (
+                  <Field label="Custom QR data / URL">
+                    <textarea
+                      className="input min-h-24"
+                      value={gmailQrCustomData}
+                      onChange={(event) =>
+                        setGmailQrCustomData(event.target.value)
+                      }
+                      placeholder="https://example.com or any text/data"
+                    />
+                  </Field>
+                )}
+
+                <div className="text-xs text-slate-500">
+                  Use <code>{'{QRCode}'}</code> in HTML, for example
+                  {' '}<code>{'<img src="{QRCode}" style="width:140px;height:140px;">'}</code>.
+                  Size and layout stay controlled by your HTML.
+                </div>
+              </div>
+            )}
+          </div>
+
           <Field label="Subject template">
             <input
               className="input"
@@ -5135,7 +5265,7 @@ function GmailSenderPanel({
               <code>{'{DomainName}'}</code>,{' '}
               <code>{'{Date}'}</code>,{' '}
               <code>{'{Random8}'}</code>, and{' '}
-              <code>{'{CompanyLogo}'}</code> are resolved per recipient when sending.
+              <code>{'{CompanyLogo}'}</code> and <code>{'{QRCode}'}</code> are resolved per recipient when sending.
             </div>
           )}
 
@@ -5221,21 +5351,133 @@ function GmailSenderPanel({
             </div>
           )}
 
-          <Field label="Attachment">
-            <input
-              type="file"
-              className="input"
-              onChange={(event) => setAttachment(event.target.files?.[0] || null)}
-            />
-          </Field>
+          <div className="space-y-3 rounded border border-slate-200 p-3">
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={gmailAttachmentEnabled}
+                onChange={(event) =>
+                  setGmailAttachmentEnabled(event.target.checked)
+                }
+              />
+              <span>
+                <span className="font-medium">Enable attachment</span>
+                <span className="block text-xs text-slate-500">
+                  Choose one attachment source/conversion mode.
+                </span>
+              </span>
+            </label>
 
-          <Field label="Attachment name template">
+            {gmailAttachmentEnabled && (
+              <>
+                <Field label="Attachment type">
+                  <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+                    {[
+                      ['upload', 'Upload'],
+                      ['html-pdf', 'HTML → PDF'],
+                      ['html-pptx', 'HTML → PPTX'],
+                      ['html-docx', 'HTML → DOCX'],
+                      ['html-svg', 'HTML → SVG'],
+                    ].map(([value, label]) => (
+                      <label
+                        key={value}
+                        className={`flex cursor-pointer items-center gap-2 rounded border px-3 py-2 ${
+                          gmailAttachmentMode === value
+                            ? 'border-[#6C63FF] bg-violet-50 text-violet-700'
+                            : 'border-slate-300 bg-white text-slate-700'
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="gmailAttachmentMode"
+                          value={value}
+                          checked={gmailAttachmentMode === value}
+                          onChange={() =>
+                            setGmailAttachmentMode(
+                              value as
+                                | 'upload'
+                                | 'html-pdf'
+                                | 'html-pptx'
+                                | 'html-docx'
+                                | 'html-svg'
+                            )
+                          }
+                        />
+                        <span>{label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </Field>
+
+                {gmailAttachmentMode === 'upload' ? (
+                  <Field label="Upload attachment">
+                    <input
+                      type="file"
+                      className="input"
+                      onChange={(event) =>
+                        setAttachment(event.target.files?.[0] || null)
+                      }
+                    />
+                  </Field>
+                ) : (
+                  <div className="grid gap-3 xl:grid-cols-2">
+                    <Field label="Attachment HTML">
+                      <textarea
+                        className="input min-h-[320px] font-mono text-sm"
+                        value={gmailAttachmentHtml}
+                        onChange={(event) =>
+                          setGmailAttachmentHtml(event.target.value)
+                        }
+                        placeholder="<html>...</html>"
+                      />
+                    </Field>
+
+                    <Field label="Attachment live preview">
+                      <div className="overflow-hidden rounded border border-slate-300 bg-white">
+                        <iframe
+                          title="Gmail attachment HTML preview"
+                          className="h-[320px] w-full bg-white"
+                          sandbox=""
+                          srcDoc={
+                            logoDevEnabled
+                              ? gmailAttachmentHtml.replace(
+                                  /\{CompanyLogo\}/gi,
+                                  buildLogoDevUrl('google.com')
+                                )
+                              : gmailAttachmentHtml
+                          }
+                        />
+                      </div>
+                    </Field>
+                  </div>
+                )}
+
+                {gmailAttachmentMode !== 'upload' && (
+                  <div className="text-xs text-slate-500">
+                    Generated attachments support the same recipient autograbs:
+                    {' '}<code>{'{CompanyLogo}'}</code>,{' '}
+                    <code>{'{Email}'}</code>,{' '}
+                    <code>{'{LocalPart}'}</code>,{' '}
+                    <code>{'{Domain}'}</code>,{' '}
+                    <code>{'{DomainName}'}</code>,{' '}
+                    <code>{'{Date}'}</code>,{' '}
+                    <code>{'{Random6}'}</code>, and{' '}
+                    <code>{'{Random8}'}</code>, <code>{'{AttachmentLink}'}</code>, <code>{'{CTA}'}</code>, and <code>{'{QRCode}'}</code>.
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          {gmailAttachmentEnabled && (
+            <Field label="Attachment name template">
             <input
               className="input"
               value={attachmentNameTemplate}
               onChange={(event) => setAttachmentNameTemplate(event.target.value)}
             />
           </Field>
+          )}
 
           <div className="text-xs text-slate-500 leading-5">
             Placeholders: <code>{'{Email}'}</code>, <code>{'{LocalPart}'}</code>,
