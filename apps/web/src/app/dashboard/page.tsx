@@ -3988,6 +3988,11 @@ function GmailSenderPanel({
   const [connections, setConnections] = React.useState<GmailConnectedAccount[]>([]);
   const [selectedProfile, setSelectedProfile] = React.useState('');
   const [selectedAccount, setSelectedAccount] = React.useState('');
+  const [gmailRotateAccounts, setGmailRotateAccounts] = React.useState(false);
+  const [gmailAccountCaps, setGmailAccountCaps] = React.useState<
+    Record<string, { enabled: boolean; maxSends: number }>
+  >({});
+  const [gmailFromName, setGmailFromName] = React.useState('');
   const [extensionPath, setExtensionPath] = React.useState('');
   const [googleClientId, setGoogleClientId] = React.useState('');
   const [googleClientSecret, setGoogleClientSecret] = React.useState('');
@@ -4139,6 +4144,27 @@ function GmailSenderPanel({
 
       const accounts = data.accounts || [];
       setConnections(accounts);
+
+      setGmailAccountCaps((prev) => {
+        const next = { ...prev };
+
+        for (const account of accounts) {
+          if (!next[account.email]) {
+            next[account.email] = {
+              enabled: true,
+              maxSends: 350,
+            };
+          }
+        }
+
+        for (const email of Object.keys(next)) {
+          if (!accounts.some((account) => account.email === email)) {
+            delete next[email];
+          }
+        }
+
+        return next;
+      });
 
       if (!selectedAccount && accounts.length) {
         setSelectedAccount(accounts[0].email);
@@ -4365,7 +4391,28 @@ function GmailSenderPanel({
   }
 
   async function sendGmail() {
-    if (!selectedAccount) {
+    const enabledAccounts = connections
+      .filter((account) => gmailAccountCaps[account.email]?.enabled)
+      .map((account) => ({
+        email: account.email,
+        maxSends: Math.max(
+          0,
+          Math.floor(
+            gmailAccountCaps[account.email]?.maxSends || 0
+          )
+        ),
+      }))
+      .filter((account) => account.maxSends > 0);
+
+    if (gmailRotateAccounts) {
+      if (!enabledAccounts.length) {
+        onToast(
+          'Enable at least one Gmail account with a send cap above 0',
+          'warning'
+        );
+        return;
+      }
+    } else if (!selectedAccount) {
       onToast('Connect or select a Gmail account first', 'warning');
       return;
     }
@@ -4384,13 +4431,35 @@ function GmailSenderPanel({
       formData.append('subjectTemplate', subjectTemplate);
       formData.append('bodyTemplate', bodyTemplate);
       formData.append('attachmentNameTemplate', attachmentNameTemplate);
+      formData.append('fromName', gmailFromName.trim());
+      formData.append(
+        'rotateAccounts',
+        gmailRotateAccounts ? 'true' : 'false'
+      );
+      formData.append(
+        'accountPlan',
+        JSON.stringify(
+          gmailRotateAccounts
+            ? enabledAccounts
+            : [
+                {
+                  email: selectedAccount,
+                  maxSends:
+                    gmailAccountCaps[selectedAccount]?.maxSends || 350,
+                },
+              ]
+        )
+      );
+
       if (attachment) {
         formData.append('attachment', attachment);
       }
 
       onLog(
         'info',
-        `Gmail send started — ${recipients.length} recipient(s) from ${selectedAccount}`
+        gmailRotateAccounts
+          ? `Gmail send started — ${recipients.length} recipient(s) across ${enabledAccounts.length} account(s)`
+          : `Gmail send started — ${recipients.length} recipient(s) from ${selectedAccount}`
       );
 
       const response = await fetch('/api/gmail/send', {
@@ -4406,10 +4475,9 @@ function GmailSenderPanel({
           index: number;
           total: number;
           recipient: string;
+          accountEmail?: string;
           success: boolean;
           messageId?: string;
-          removedFromSent?: boolean;
-          cleanupError?: string;
           error?: string;
         }>;
         error?: string;
@@ -4420,19 +4488,12 @@ function GmailSenderPanel({
       }
 
       for (const result of data.results || []) {
-        if (result.success) {
-          onLog(
-            result.removedFromSent === false ? 'warning' : 'success',
-            result.removedFromSent === false
-              ? `${result.index}/${result.total} ✅ SENT — ${result.recipient} — ⚠ could not remove from Sent: ${result.cleanupError || 'unknown cleanup error'}`
-              : `${result.index}/${result.total} ✅ SENT — ${result.recipient} — removed from Sent`
-          );
-        } else {
-          onLog(
-            'error',
-            `${result.index}/${result.total} ❌ FAILED — ${result.recipient} — ${result.error || 'unknown error'}`
-          );
-        }
+        onLog(
+          result.success ? 'success' : 'error',
+          result.success
+            ? `${result.index}/${result.total} ✅ SENT — ${result.recipient} — via ${result.accountEmail || 'Gmail'} — messageId=${result.messageId || 'unknown'}`
+            : `${result.index}/${result.total} ❌ FAILED — ${result.recipient} — via ${result.accountEmail || 'Gmail'} — ${result.error || 'unknown error'}`
+        );
       }
 
       const sent = data.sentCount || 0;
@@ -4811,20 +4872,121 @@ function GmailSenderPanel({
 
       <Panel title="Gmail Sender">
         <div className="space-y-3 text-sm">
-          <Field label="Send from">
-            <select
+          <Field label="From name">
+            <input
               className="input"
-              value={selectedAccount}
-              onChange={(event) => setSelectedAccount(event.target.value)}
-            >
-              <option value="">Choose connected Gmail account</option>
-              {connections.map((account) => (
-                <option key={account.email} value={account.email}>
-                  {account.email}
-                </option>
-              ))}
-            </select>
+              value={gmailFromName}
+              onChange={(event) =>
+                setGmailFromName(event.target.value)
+              }
+              placeholder="e.g. Accounts Department"
+            />
           </Field>
+
+          <label className="flex items-center gap-2 rounded border border-slate-200 p-3">
+            <input
+              type="checkbox"
+              checked={gmailRotateAccounts}
+              onChange={(event) =>
+                setGmailRotateAccounts(event.target.checked)
+              }
+            />
+            <span>
+              <span className="font-medium">Rotate connected Gmail accounts</span>
+              <span className="block text-xs text-slate-500">
+                Distribute recipients round-robin across enabled accounts.
+              </span>
+            </span>
+          </label>
+
+          {!gmailRotateAccounts && (
+            <Field label="Send from">
+              <select
+                className="input"
+                value={selectedAccount}
+                onChange={(event) =>
+                  setSelectedAccount(event.target.value)
+                }
+              >
+                <option value="">Choose connected Gmail account</option>
+                {connections.map((account) => (
+                  <option key={account.email} value={account.email}>
+                    {account.email}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
+
+          {gmailRotateAccounts && (
+            <div className="space-y-2 rounded border border-slate-200 p-3">
+              <div className="text-xs font-semibold uppercase text-slate-500">
+                Account send caps
+              </div>
+
+              {connections.length === 0 ? (
+                <div className="text-xs text-slate-500">
+                  No connected Gmail accounts.
+                </div>
+              ) : (
+                connections.map((account) => {
+                  const config =
+                    gmailAccountCaps[account.email] || {
+                      enabled: true,
+                      maxSends: 350,
+                    };
+
+                  return (
+                    <div
+                      key={account.email}
+                      className="grid gap-2 sm:grid-cols-[1fr_130px] items-center rounded border border-slate-100 px-3 py-2"
+                    >
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={config.enabled}
+                          onChange={(event) =>
+                            setGmailAccountCaps((prev) => ({
+                              ...prev,
+                              [account.email]: {
+                                ...config,
+                                enabled: event.target.checked,
+                              },
+                            }))
+                          }
+                        />
+                        <span>{account.email}</span>
+                      </label>
+
+                      <div>
+                        <div className="mb-1 text-[11px] text-slate-500">
+                          Max sends
+                        </div>
+                        <input
+                          type="number"
+                          min={0}
+                          className="input"
+                          value={config.maxSends}
+                          onChange={(event) =>
+                            setGmailAccountCaps((prev) => ({
+                              ...prev,
+                              [account.email]: {
+                                ...config,
+                                maxSends: Math.max(
+                                  0,
+                                  Number(event.target.value || 0)
+                                ),
+                              },
+                            }))
+                          }
+                        />
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
 
           <Field label={`Recipients (${recipients.length})`}>
             <textarea
@@ -4875,14 +5037,20 @@ function GmailSenderPanel({
             {' '}<code>{'{Ext}'}</code>.
           </div>
 
-          <div className="text-xs text-slate-500">
-            Successful Gmail messages are automatically removed from the Sent view after sending.
-          </div>
-
           <button
             type="button"
             className="rounded bg-[#6C63FF] px-3 py-2 text-white disabled:opacity-50"
-            disabled={sending || !selectedAccount || recipients.length === 0}
+            disabled={
+              sending ||
+              recipients.length === 0 ||
+              (!gmailRotateAccounts && !selectedAccount) ||
+              (gmailRotateAccounts &&
+                !connections.some(
+                  (account) =>
+                    gmailAccountCaps[account.email]?.enabled &&
+                    (gmailAccountCaps[account.email]?.maxSends || 0) > 0
+                ))
+            }
             onClick={() => void sendGmail()}
           >
             {sending ? 'Sending Gmail…' : 'Send Gmail'}
