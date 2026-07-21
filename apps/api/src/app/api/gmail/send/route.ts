@@ -266,6 +266,8 @@ export async function POST(request: NextRequest) {
       recipient: string;
       success: boolean;
       messageId?: string;
+      removedFromSent?: boolean;
+      cleanupError?: string;
       error?: string;
     }> = [];
 
@@ -331,12 +333,64 @@ export async function POST(request: NextRequest) {
           );
         }
 
+        const messageId = String(data.id || '');
+
+        if (!messageId) {
+          throw new Error(
+            'Gmail reported a successful send but did not return a message ID.'
+          );
+        }
+
+        // Immediately remove Gmail's system SENT label so successful
+        // messages do not clutter the account's Sent view.
+        let removedFromSent = false;
+        let cleanupError: string | undefined;
+
+        try {
+          const modifyResponse = await fetch(
+            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(
+              messageId
+            )}/modify`,
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${authorized.accessToken}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                removeLabelIds: ['SENT'],
+              }),
+            }
+          );
+
+          const modifyText = await modifyResponse.text();
+          const modifyData = modifyText
+            ? JSON.parse(modifyText)
+            : {};
+
+          if (!modifyResponse.ok) {
+            throw new Error(
+              modifyData.error?.message ||
+                `Unable to remove message from Sent: HTTP ${modifyResponse.status}`
+            );
+          }
+
+          removedFromSent = true;
+        } catch (cleanupFailure) {
+          cleanupError =
+            cleanupFailure instanceof Error
+              ? cleanupFailure.message
+              : String(cleanupFailure);
+        }
+
         results.push({
           index: index + 1,
           total: recipients.length,
           recipient,
           success: true,
-          messageId: String(data.id || ''),
+          messageId,
+          removedFromSent,
+          cleanupError,
         });
       } catch (error) {
         results.push({
