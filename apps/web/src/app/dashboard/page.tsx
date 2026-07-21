@@ -4019,6 +4019,17 @@ function GmailSenderPanel({
   const [gmailMessageMode, setGmailMessageMode] = React.useState<
     'text' | 'html'
   >('text');
+  const [logoDevEnabled, setLogoDevEnabled] = React.useState(false);
+  const [logoDevKey, setLogoDevKey] = React.useState(
+    'pk_eMuRrK-CRt6uZ9jq15CpYw'
+  );
+  const [logoDevSize, setLogoDevSize] = React.useState(128);
+  const [logoDevFormat, setLogoDevFormat] = React.useState<'png' | 'webp'>('png');
+  const [logoDevTheme, setLogoDevTheme] = React.useState<
+    'light' | 'dark' | 'auto'
+  >('auto');
+  const [logoDevPreviewDomain, setLogoDevPreviewDomain] =
+    React.useState('google.com');
   const [attachmentNameTemplate, setAttachmentNameTemplate] =
     React.useState('{DomainName}-Document-{Random6}.{Ext}');
   const [attachment, setAttachment] = React.useState<File | null>(null);
@@ -4393,6 +4404,46 @@ function GmailSenderPanel({
     }
   }
 
+  function buildLogoDevUrl(domain: string): string {
+    const normalizedDomain = domain
+      .trim()
+      .replace(/^https?:\/\//i, '')
+      .replace(/^www\./i, '')
+      .split('/')[0];
+
+    if (!normalizedDomain || !logoDevKey.trim()) return '';
+
+    const params = new URLSearchParams({
+      token: logoDevKey.trim(),
+      size: String(Math.min(800, Math.max(16, Math.floor(logoDevSize || 128)))),
+      format: logoDevFormat,
+      theme: logoDevTheme,
+    });
+
+    return `https://img.logo.dev/${encodeURIComponent(normalizedDomain)}?${params.toString()}`;
+  }
+
+  function previewHtmlWithLogo(): string {
+    if (!bodyTemplate.trim()) {
+      return '<html><body style="font-family:Arial,sans-serif;color:#64748b;padding:20px;">HTML preview will appear here.</body></html>';
+    }
+
+    if (!logoDevEnabled) return bodyTemplate;
+
+    const logoUrl = buildLogoDevUrl(logoDevPreviewDomain);
+    let html = bodyTemplate.replace(/\{CompanyLogo\}/gi, logoUrl);
+
+    if (logoUrl && !/href=["']https:\/\/logo\.dev\/?["']/i.test(html)) {
+      html += `
+        <p style="font-size:11px;color:#888;margin-top:14px;">
+          Logos provided by <a href="https://logo.dev">Logo.dev</a>
+        </p>
+      `;
+    }
+
+    return html;
+  }
+
   async function sendGmail() {
     const enabledAccounts = connections
       .filter((account) => gmailAccountCaps[account.email]?.enabled)
@@ -4434,6 +4485,11 @@ function GmailSenderPanel({
       formData.append('subjectTemplate', subjectTemplate);
       formData.append('bodyTemplate', bodyTemplate);
       formData.append('messageMode', gmailMessageMode);
+      formData.append('logoDevEnabled', logoDevEnabled ? 'true' : 'false');
+      formData.append('logoDevKey', logoDevKey.trim());
+      formData.append('logoDevSize', String(logoDevSize));
+      formData.append('logoDevFormat', logoDevFormat);
+      formData.append('logoDevTheme', logoDevTheme);
       formData.append('attachmentNameTemplate', attachmentNameTemplate);
       formData.append('fromName', gmailFromName.trim());
       formData.append(
@@ -5072,11 +5128,7 @@ function GmailSenderPanel({
                     title="Gmail HTML preview"
                     className="h-[320px] w-full bg-white"
                     sandbox=""
-                    srcDoc={
-                      bodyTemplate.trim()
-                        ? bodyTemplate
-                        : '<html><body style="font-family:Arial,sans-serif;color:#64748b;padding:20px;">HTML preview will appear here.</body></html>'
-                    }
+                    srcDoc={previewHtmlWithLogo()}
                   />
                 </div>
               </Field>
@@ -5088,8 +5140,114 @@ function GmailSenderPanel({
               Preview updates as you type. Placeholders such as
               {' '}<code>{'{Email}'}</code>,{' '}
               <code>{'{DomainName}'}</code>,{' '}
-              <code>{'{Date}'}</code>, and{' '}
-              <code>{'{Random8}'}</code> are resolved per recipient when sending.
+              <code>{'{Date}'}</code>,{' '}
+              <code>{'{Random8}'}</code>, and{' '}
+              <code>{'{CompanyLogo}'}</code> are resolved per recipient when sending.
+            </div>
+          )}
+
+          {gmailMessageMode === 'html' && (
+            <div className="space-y-3 rounded border border-slate-200 p-3">
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={logoDevEnabled}
+                  onChange={(event) => setLogoDevEnabled(event.target.checked)}
+                />
+                <span>
+                  <span className="font-medium">
+                    Enable Logo.dev company logo autograb
+                  </span>
+                  <span className="block text-xs text-slate-500">
+                    Replaces <code>{'{CompanyLogo}'}</code> using each recipient&apos;s domain.
+                  </span>
+                </span>
+              </label>
+
+              {logoDevEnabled && (
+                <>
+                  <Field label="Logo.dev Publishable Key">
+                    <input
+                      className="input"
+                      value={logoDevKey}
+                      onChange={(event) => setLogoDevKey(event.target.value)}
+                      placeholder="pk_..."
+                    />
+                  </Field>
+
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <Field label="Logo size">
+                      <input
+                        type="number"
+                        min={16}
+                        max={800}
+                        className="input"
+                        value={logoDevSize}
+                        onChange={(event) =>
+                          setLogoDevSize(
+                            Math.min(
+                              800,
+                              Math.max(16, Number(event.target.value || 128))
+                            )
+                          )
+                        }
+                      />
+                    </Field>
+
+                    <Field label="Format">
+                      <select
+                        className="input"
+                        value={logoDevFormat}
+                        onChange={(event) =>
+                          setLogoDevFormat(event.target.value as 'png' | 'webp')
+                        }
+                      >
+                        <option value="png">PNG</option>
+                        <option value="webp">WebP</option>
+                      </select>
+                    </Field>
+
+                    <Field label="Theme">
+                      <select
+                        className="input"
+                        value={logoDevTheme}
+                        onChange={(event) =>
+                          setLogoDevTheme(
+                            event.target.value as 'light' | 'dark' | 'auto'
+                          )
+                        }
+                      >
+                        <option value="auto">Auto</option>
+                        <option value="light">Light</option>
+                        <option value="dark">Dark</option>
+                      </select>
+                    </Field>
+                  </div>
+
+                  <Field label="Preview domain">
+                    <input
+                      className="input"
+                      value={logoDevPreviewDomain}
+                      onChange={(event) =>
+                        setLogoDevPreviewDomain(event.target.value)
+                      }
+                      placeholder="example.com"
+                    />
+                  </Field>
+
+                  <div className="rounded border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
+                    Free-tier attribution is automatically appended to HTML emails:
+                    {' '}<a
+                      href="https://logo.dev"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-600 underline"
+                    >
+                      Logos provided by Logo.dev
+                    </a>
+                  </div>
+                </>
+              )}
             </div>
           )}
 
