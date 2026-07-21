@@ -4433,13 +4433,6 @@ function GmailSenderPanel({
     const logoUrl = buildLogoDevUrl(logoDevPreviewDomain);
     let html = bodyTemplate.replace(/\{CompanyLogo\}/gi, logoUrl);
 
-    if (logoUrl && !/href=["']https:\/\/logo\.dev\/?["']/i.test(html)) {
-      html += `
-        <p style="font-size:11px;color:#888;margin-top:14px;">
-          Logos provided by <a href="https://logo.dev">Logo.dev</a>
-        </p>
-      `;
-    }
 
     return html;
   }
@@ -5234,18 +5227,6 @@ function GmailSenderPanel({
                       placeholder="example.com"
                     />
                   </Field>
-
-                  <div className="rounded border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-                    Free-tier attribution is automatically appended to HTML emails:
-                    {' '}<a
-                      href="https://logo.dev"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-blue-600 underline"
-                    >
-                      Logos provided by Logo.dev
-                    </a>
-                  </div>
                 </>
               )}
             </div>
