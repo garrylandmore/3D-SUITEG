@@ -5216,17 +5216,6 @@ function GmailSenderPanel({
                       </select>
                     </Field>
                   </div>
-
-                  <Field label="Preview domain">
-                    <input
-                      className="input"
-                      value={logoDevPreviewDomain}
-                      onChange={(event) =>
-                        setLogoDevPreviewDomain(event.target.value)
-                      }
-                      placeholder="example.com"
-                    />
-                  </Field>
                 </>
               )}
             </div>
