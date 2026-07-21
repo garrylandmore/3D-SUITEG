@@ -53,14 +53,6 @@ function buildLogoDevUrl(args: {
   return `https://img.logo.dev/${encodeURIComponent(domain)}?${params.toString()}`;
 }
 
-function appendLogoDevAttribution(html: string): string {
-  if (/href=["']https:\/\/logo\.dev\/?["']/i.test(html)) return html;
-
-  return `${html}
-<p style="font-size:11px;color:#888;margin-top:14px;">
-  Logos provided by <a href="https://logo.dev">Logo.dev</a>
-</p>`;
-}
 
 function placeholders(
   template: string,
@@ -511,7 +503,6 @@ export async function POST(request: NextRequest) {
             companyLogoUrl
           );
 
-          bodySource = appendLogoDevAttribution(bodySource);
         }
 
         const body = placeholders(
