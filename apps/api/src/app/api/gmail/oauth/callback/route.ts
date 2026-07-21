@@ -84,8 +84,12 @@ async function completeGmailOAuthFromUrl(
       );
     }
 
+    // We intentionally do NOT call Gmail users.getProfile here.
+    // That endpoint does not accept gmail.send by itself.
+    // The OAuth request includes `openid email`, so use Google's
+    // OpenID userinfo endpoint only to identify the connected account.
     const profileResponse = await fetch(
-      'https://gmail.googleapis.com/gmail/v1/users/me/profile',
+      'https://openidconnect.googleapis.com/v1/userinfo',
       {
         headers: {
           Authorization: `Bearer ${token.access_token}`,
@@ -96,10 +100,11 @@ async function completeGmailOAuthFromUrl(
     const profileText = await profileResponse.text();
     const profile = profileText ? JSON.parse(profileText) : {};
 
-    if (!profileResponse.ok || !profile.emailAddress) {
+    if (!profileResponse.ok || !profile.email) {
       throw new Error(
-        profile.error?.message ||
-          `Unable to read Gmail profile: HTTP ${profileResponse.status}`
+        profile.error_description ||
+          profile.error ||
+          `Unable to identify connected Google account: HTTP ${profileResponse.status}`
       );
     }
 
@@ -111,7 +116,7 @@ async function completeGmailOAuthFromUrl(
       );
     }
 
-    const email = String(profile.emailAddress);
+    const email = String(profile.email);
 
     await upsertGmailConnection({
       email,
