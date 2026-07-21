@@ -132,6 +132,7 @@ async function ensureAccessToken(
 
 function buildMimeMessage(args: {
   from: string;
+  fromName?: string;
   to: string;
   subject: string;
   body: string;
@@ -143,8 +144,16 @@ function buildMimeMessage(args: {
 }): string {
   const boundary = `3d-suite-${crypto.randomUUID()}`;
 
+  const safeFromName = String(args.fromName || '')
+    .replace(/[\r\n"]/g, ' ')
+    .trim();
+
+  const fromHeader = safeFromName
+    ? `From: "${safeFromName}" <${args.from}>`
+    : `From: ${args.from}`;
+
   const headers = [
-    `From: ${args.from}`,
+    fromHeader,
     `To: ${args.to}`,
     `Subject: ${args.subject}`,
     'MIME-Version: 1.0',
@@ -190,6 +199,46 @@ export async function POST(request: NextRequest) {
       formData.get('accountEmail') || ''
     ).trim();
 
+    const rotateAccounts =
+      String(formData.get('rotateAccounts') || 'false') === 'true';
+
+    const fromName = String(
+      formData.get('fromName') || ''
+    ).trim();
+
+    const accountPlanRaw = String(
+      formData.get('accountPlan') || '[]'
+    );
+
+    let accountPlan: Array<{
+      email: string;
+      maxSends: number;
+    }> = [];
+
+    try {
+      const parsed = JSON.parse(accountPlanRaw) as unknown[];
+      accountPlan = parsed
+        .map((item) => {
+          const value = item as {
+            email?: unknown;
+            maxSends?: unknown;
+          };
+
+          return {
+            email: String(value.email || '').trim(),
+            maxSends: Math.max(
+              0,
+              Math.floor(Number(value.maxSends || 0))
+            ),
+          };
+        })
+        .filter(
+          (item) => item.email && item.maxSends > 0
+        );
+    } catch {
+      accountPlan = [];
+    }
+
     const recipients = Array.from(
       new Set(
         (JSON.parse(
@@ -215,13 +264,6 @@ export async function POST(request: NextRequest) {
     );
     const attachmentValue = formData.get('attachment');
 
-    if (!accountEmail) {
-      return NextResponse.json(
-        { success: false, error: 'Connected Gmail account is required.' },
-        { status: 400 }
-      );
-    }
-
     if (!recipients.length) {
       return NextResponse.json(
         { success: false, error: 'At least one recipient is required.' },
@@ -229,23 +271,69 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const connections = await readGmailConnections();
-    const connection = connections.find(
-      (item) =>
-        item.email.toLowerCase() === accountEmail.toLowerCase()
-    );
-
-    if (!connection) {
+    if (!rotateAccounts && !accountEmail) {
       return NextResponse.json(
-        {
-          success: false,
-          error: `Gmail account is not connected: ${accountEmail}`,
-        },
-        { status: 404 }
+        { success: false, error: 'Connected Gmail account is required.' },
+        { status: 400 }
       );
     }
 
-    const authorized = await ensureAccessToken(connection);
+    const connections = await readGmailConnections();
+
+    const requestedPlan = rotateAccounts
+      ? accountPlan
+      : [
+          {
+            email: accountEmail,
+            maxSends:
+              accountPlan.find(
+                (item) =>
+                  item.email.toLowerCase() ===
+                  accountEmail.toLowerCase()
+              )?.maxSends || recipients.length,
+          },
+        ];
+
+    if (!requestedPlan.length) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: 'No Gmail accounts are enabled for sending.',
+        },
+        { status: 400 }
+      );
+    }
+
+    const plan = requestedPlan.map((item) => {
+      const connection = connections.find(
+        (candidate) =>
+          candidate.email.toLowerCase() ===
+          item.email.toLowerCase()
+      );
+
+      if (!connection) {
+        throw new Error(
+          `Gmail account is not connected: ${item.email}`
+        );
+      }
+
+      return {
+        email: connection.email,
+        maxSends: item.maxSends,
+        used: 0,
+        connection,
+      };
+    });
+
+    const authorizedByEmail = new Map<string, GmailConnection>();
+
+    for (const item of plan) {
+      const authorized = await ensureAccessToken(item.connection);
+      authorizedByEmail.set(
+        item.email.toLowerCase(),
+        authorized
+      );
+    }
 
     let attachmentBytes: Buffer | null = null;
     let originalFilename = '';
@@ -264,15 +352,70 @@ export async function POST(request: NextRequest) {
       index: number;
       total: number;
       recipient: string;
+      accountEmail?: string;
       success: boolean;
       messageId?: string;
-      removedFromSent?: boolean;
-      cleanupError?: string;
       error?: string;
     }> = [];
 
+    let rotationCursor = 0;
+
+    function nextAccount() {
+      if (!plan.length) return null;
+
+      if (!rotateAccounts) {
+        const first = plan[0];
+        if (first.used >= first.maxSends) return null;
+        return first;
+      }
+
+      for (let attempt = 0; attempt < plan.length; attempt += 1) {
+        const candidate =
+          plan[rotationCursor % plan.length];
+        rotationCursor =
+          (rotationCursor + 1) % plan.length;
+
+        if (candidate.used < candidate.maxSends) {
+          return candidate;
+        }
+      }
+
+      return null;
+    }
+
     for (let index = 0; index < recipients.length; index += 1) {
       const recipient = recipients[index];
+      const account = nextAccount();
+
+      if (!account) {
+        results.push({
+          index: index + 1,
+          total: recipients.length,
+          recipient,
+          success: false,
+          error:
+            'All configured Gmail account send caps have been reached.',
+        });
+        continue;
+      }
+
+      const authorized = authorizedByEmail.get(
+        account.email.toLowerCase()
+      );
+
+      if (!authorized) {
+        results.push({
+          index: index + 1,
+          total: recipients.length,
+          recipient,
+          accountEmail: account.email,
+          success: false,
+          error: 'Authorized Gmail connection is unavailable.',
+        });
+        continue;
+      }
+
+      account.used += 1;
 
       try {
         const subject = placeholders(
@@ -303,6 +446,7 @@ export async function POST(request: NextRequest) {
 
         const mime = buildMimeMessage({
           from: authorized.email,
+          fromName,
           to: recipient,
           subject,
           body,
@@ -341,62 +485,20 @@ export async function POST(request: NextRequest) {
           );
         }
 
-        // Immediately remove Gmail's system SENT label so successful
-        // messages do not clutter the account's Sent view.
-        let removedFromSent = false;
-        let cleanupError: string | undefined;
-
-        try {
-          const modifyResponse = await fetch(
-            `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(
-              messageId
-            )}/modify`,
-            {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${authorized.accessToken}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                removeLabelIds: ['SENT'],
-              }),
-            }
-          );
-
-          const modifyText = await modifyResponse.text();
-          const modifyData = modifyText
-            ? JSON.parse(modifyText)
-            : {};
-
-          if (!modifyResponse.ok) {
-            throw new Error(
-              modifyData.error?.message ||
-                `Unable to remove message from Sent: HTTP ${modifyResponse.status}`
-            );
-          }
-
-          removedFromSent = true;
-        } catch (cleanupFailure) {
-          cleanupError =
-            cleanupFailure instanceof Error
-              ? cleanupFailure.message
-              : String(cleanupFailure);
-        }
-
         results.push({
           index: index + 1,
           total: recipients.length,
           recipient,
+          accountEmail: authorized.email,
           success: true,
           messageId,
-          removedFromSent,
-          cleanupError,
         });
       } catch (error) {
         results.push({
           index: index + 1,
           total: recipients.length,
           recipient,
+          accountEmail: authorized.email,
           success: false,
           error: error instanceof Error ? error.message : String(error),
         });
@@ -411,6 +513,11 @@ export async function POST(request: NextRequest) {
       sentCount,
       failedCount,
       results,
+      accountUsage: plan.map((item) => ({
+        email: item.email,
+        used: item.used,
+        maxSends: item.maxSends,
+      })),
     });
   } catch (error) {
     return NextResponse.json(
