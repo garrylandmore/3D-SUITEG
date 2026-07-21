@@ -111,6 +111,18 @@ export async function POST(request: NextRequest) {
     const requestedExecutablePath = String(
       body.chromiumExecutablePath || ''
     ).trim();
+    const requestedMode = String(
+      body.connectionMode || 'chromium'
+    )
+      .trim()
+      .toLowerCase();
+
+    const connectionMode =
+      requestedMode === 'manual'
+        ? 'manual'
+        : requestedMode === 'chromium-extension'
+          ? 'chromium-extension'
+          : 'chromium';
 
     if (!googleClientId) {
       return NextResponse.json(
@@ -139,14 +151,28 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (!profileDirectory) {
+    if (connectionMode !== 'manual' && !profileDirectory) {
       return NextResponse.json(
         { success: false, error: 'Chromium profile is required.' },
         { status: 400 }
       );
     }
 
-    if (extensionPath) {
+    if (
+      connectionMode === 'chromium-extension' &&
+      !extensionPath
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          error:
+            'Extension folder is required for Chromium profile + extension mode.',
+        },
+        { status: 400 }
+      );
+    }
+
+    if (connectionMode === 'chromium-extension' && extensionPath) {
       const manifestPath = path.join(extensionPath, 'manifest.json');
       try {
         await fs.access(manifestPath);
@@ -182,8 +208,12 @@ export async function POST(request: NextRequest) {
 
     gmailPendingStore().set(state, {
       state,
-      profileDirectory,
-      extensionPath: extensionPath || null,
+      profileDirectory:
+        connectionMode !== 'manual' ? profileDirectory : '',
+      extensionPath:
+        connectionMode === 'chromium-extension'
+          ? extensionPath || null
+          : null,
       googleClientId,
       googleClientSecret,
       googleRedirectUri,
@@ -193,6 +223,15 @@ export async function POST(request: NextRequest) {
         requestedExecutablePath || null,
       createdAt: Date.now(),
     });
+
+    if (connectionMode === 'manual') {
+      return NextResponse.json({
+        success: true,
+        mode: 'manual',
+        authorizationUrl,
+        state,
+      });
+    }
 
     const executable = await findChromiumExecutable(
       requestedExecutablePath
@@ -204,7 +243,10 @@ export async function POST(request: NextRequest) {
       `--profile-directory=${profileDirectory}`,
     ];
 
-    if (extensionPath) {
+    if (
+      connectionMode === 'chromium-extension' &&
+      extensionPath
+    ) {
       args.push(`--load-extension=${extensionPath}`);
     }
 
@@ -220,9 +262,11 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
+      mode: connectionMode,
       state,
       profileDirectory,
       extensionLoaded: Boolean(extensionPath),
+      authorizationUrl,
     });
   } catch (error) {
     return NextResponse.json(
