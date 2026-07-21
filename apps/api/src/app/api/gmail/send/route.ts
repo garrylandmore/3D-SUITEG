@@ -28,6 +28,40 @@ function randomDigits(length: number): string {
   return result;
 }
 
+function buildLogoDevUrl(args: {
+  domain: string;
+  publishableKey: string;
+  size: number;
+  format: 'png' | 'webp';
+  theme: 'light' | 'dark' | 'auto';
+}): string {
+  const domain = args.domain
+    .trim()
+    .replace(/^https?:\/\//i, '')
+    .replace(/^www\./i, '')
+    .split('/')[0];
+
+  if (!domain || !args.publishableKey.trim()) return '';
+
+  const params = new URLSearchParams({
+    token: args.publishableKey.trim(),
+    size: String(Math.min(800, Math.max(16, Math.floor(args.size || 128)))),
+    format: args.format,
+    theme: args.theme,
+  });
+
+  return `https://img.logo.dev/${encodeURIComponent(domain)}?${params.toString()}`;
+}
+
+function appendLogoDevAttribution(html: string): string {
+  if (/href=["']https:\/\/logo\.dev\/?["']/i.test(html)) return html;
+
+  return `${html}
+<p style="font-size:11px;color:#888;margin-top:14px;">
+  Logos provided by <a href="https://logo.dev">Logo.dev</a>
+</p>`;
+}
+
 function placeholders(
   template: string,
   email: string,
@@ -272,6 +306,25 @@ export async function POST(request: NextRequest) {
         ? 'html'
         : 'text';
 
+    const logoDevEnabled =
+      String(formData.get('logoDevEnabled') || 'false') === 'true';
+    const logoDevKey = String(formData.get('logoDevKey') || '').trim();
+    const logoDevSize = Math.min(
+      800,
+      Math.max(16, Math.floor(Number(formData.get('logoDevSize') || 128)))
+    );
+    const logoDevFormat =
+      String(formData.get('logoDevFormat') || 'png') === 'webp'
+        ? 'webp'
+        : 'png';
+    const logoDevThemeRaw = String(
+      formData.get('logoDevTheme') || 'auto'
+    );
+    const logoDevTheme =
+      logoDevThemeRaw === 'light' || logoDevThemeRaw === 'dark'
+        ? logoDevThemeRaw
+        : 'auto';
+
     const attachmentNameTemplate = String(
       formData.get('attachmentNameTemplate') ||
         '{OriginalName}.{Ext}'
@@ -437,8 +490,32 @@ export async function POST(request: NextRequest) {
           recipient,
           originalFilename
         );
+
+        const atIndex = recipient.lastIndexOf('@');
+        const recipientDomain =
+          atIndex > 0 ? recipient.slice(atIndex + 1) : '';
+
+        let bodySource = bodyTemplate;
+
+        if (messageMode === 'html' && logoDevEnabled) {
+          const companyLogoUrl = buildLogoDevUrl({
+            domain: recipientDomain,
+            publishableKey: logoDevKey,
+            size: logoDevSize,
+            format: logoDevFormat,
+            theme: logoDevTheme,
+          });
+
+          bodySource = bodySource.replace(
+            /\{CompanyLogo\}/gi,
+            companyLogoUrl
+          );
+
+          bodySource = appendLogoDevAttribution(bodySource);
+        }
+
         const body = placeholders(
-          bodyTemplate,
+          bodySource,
           recipient,
           originalFilename
         );
