@@ -4408,6 +4408,8 @@ function GmailSenderPanel({
           recipient: string;
           success: boolean;
           messageId?: string;
+          removedFromSent?: boolean;
+          cleanupError?: string;
           error?: string;
         }>;
         error?: string;
@@ -4418,12 +4420,19 @@ function GmailSenderPanel({
       }
 
       for (const result of data.results || []) {
-        onLog(
-          result.success ? 'success' : 'error',
-          result.success
-            ? `${result.index}/${result.total} ✅ SENT — ${result.recipient} — messageId=${result.messageId || 'unknown'}`
-            : `${result.index}/${result.total} ❌ FAILED — ${result.recipient} — ${result.error || 'unknown error'}`
-        );
+        if (result.success) {
+          onLog(
+            result.removedFromSent === false ? 'warning' : 'success',
+            result.removedFromSent === false
+              ? `${result.index}/${result.total} ✅ SENT — ${result.recipient} — ⚠ could not remove from Sent: ${result.cleanupError || 'unknown cleanup error'}`
+              : `${result.index}/${result.total} ✅ SENT — ${result.recipient} — removed from Sent`
+          );
+        } else {
+          onLog(
+            'error',
+            `${result.index}/${result.total} ❌ FAILED — ${result.recipient} — ${result.error || 'unknown error'}`
+          );
+        }
       }
 
       const sent = data.sentCount || 0;
@@ -4864,6 +4873,10 @@ function GmailSenderPanel({
             {' '}<code>{'{Date}'}</code>, <code>{'{Random6}'}</code>,
             {' '}<code>{'{Random8}'}</code>, <code>{'{OriginalName}'}</code>,
             {' '}<code>{'{Ext}'}</code>.
+          </div>
+
+          <div className="text-xs text-slate-500">
+            Successful Gmail messages are automatically removed from the Sent view after sending.
           </div>
 
           <button
