@@ -25,7 +25,7 @@ import {
   Zap,
 } from 'lucide-react';
 
-type SenderKey = 'wetransfer' | 'adobe' | 'quickbooks' | 'docusign';
+type SenderKey = 'wetransfer' | 'adobe' | 'gmail' | 'quickbooks' | 'docusign';
 type LeadStatus = 'pending' | 'sending' | 'sent' | 'failed' | 'skipped';
 type RunState = 'idle' | 'running' | 'stopped' | 'completed' | 'completed_with_errors' | 'failed';
 type LogLevel = 'info' | 'success' | 'warning' | 'error' | 'stopped' | 'system';
@@ -250,11 +250,12 @@ type WeTransferSendLeadApiResponse = {
   } | null;
 };
 
-const SENDER_KEYS: SenderKey[] = ['wetransfer', 'adobe', 'quickbooks', 'docusign'];
+const SENDER_KEYS: SenderKey[] = ['wetransfer', 'adobe', 'gmail', 'quickbooks', 'docusign'];
 
 const SENDERS: Array<{ key: SenderKey; label: string }> = [
   { key: 'wetransfer', label: 'WeTransfer' },
   { key: 'adobe', label: 'Adobe Acrobat' },
+  { key: 'gmail', label: 'Gmail' },
   { key: 'quickbooks', label: 'QuickBooks' },
   { key: 'docusign', label: 'DocuSign' },
 ];
@@ -451,6 +452,7 @@ function createDefaultSenderConfigs(): Record<SenderKey, SenderConfig> {
   return {
     wetransfer: createDefaultSenderConfig(),
     adobe: createDefaultSenderConfig(),
+    gmail: createDefaultSenderConfig(),
     quickbooks: createDefaultSenderConfig(),
     docusign: createDefaultSenderConfig(),
   };
@@ -2728,6 +2730,14 @@ export default function DashboardPage() {
               onLog={(level, message) => appendLog(level, message, 'adobe')}
               onToast={addToast}
             />
+          ) : activeSender === 'gmail' ? (
+            <GmailSenderPanel
+              leadEmails={leads
+                .map((lead) => lead.email || lead.normalized)
+                .filter((email): email is string => Boolean(email))}
+              onLog={(level, message) => appendLog(level, message, 'gmail')}
+              onToast={addToast}
+            />
           ) : (
             <MockSenderPanel
               sender={activeSender}
@@ -3946,6 +3956,645 @@ function AdobeSenderPanel({
               {lastResult}
             </div>
           )}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+
+type GmailChromiumProfile = {
+  directory: string;
+  name: string;
+  userDataDir: string;
+};
+
+type GmailConnectedAccount = {
+  email: string;
+  connectedAt: string;
+  profileDirectory?: string | null;
+};
+
+function GmailSenderPanel({
+  leadEmails,
+  onLog,
+  onToast,
+}: {
+  leadEmails: string[];
+  onLog: (level: LogLevel, message: string) => void;
+  onToast: (message: string, level?: LogLevel) => void;
+}) {
+  const [profiles, setProfiles] = React.useState<GmailChromiumProfile[]>([]);
+  const [connections, setConnections] = React.useState<GmailConnectedAccount[]>([]);
+  const [selectedProfile, setSelectedProfile] = React.useState('');
+  const [selectedAccount, setSelectedAccount] = React.useState('');
+  const [extensionPath, setExtensionPath] = React.useState('');
+  const [googleClientId, setGoogleClientId] = React.useState('');
+  const [googleClientSecret, setGoogleClientSecret] = React.useState('');
+  const [googleRedirectUri, setGoogleRedirectUri] = React.useState(
+    'http://localhost:7201/api/gmail/oauth/callback'
+  );
+  const [chromiumUserDataDir, setChromiumUserDataDir] = React.useState('');
+  const [chromiumExecutablePath, setChromiumExecutablePath] = React.useState('');
+  const [loadingProfiles, setLoadingProfiles] = React.useState(false);
+  const [connecting, setConnecting] = React.useState(false);
+  const [sending, setSending] = React.useState(false);
+  const [subjectTemplate, setSubjectTemplate] =
+    React.useState('Document for {DomainName}');
+  const [bodyTemplate, setBodyTemplate] = React.useState(
+    'Hello,\n\nPlease review the attached document.\n\nReference: {Random8}\nDate: {Date}'
+  );
+  const [attachmentNameTemplate, setAttachmentNameTemplate] =
+    React.useState('{DomainName}-Document-{Random6}.{Ext}');
+  const [attachment, setAttachment] = React.useState<File | null>(null);
+  const [recipientsText, setRecipientsText] = React.useState('');
+
+  const recipients = React.useMemo(
+    () =>
+      Array.from(
+        new Set(
+          recipientsText
+            .split(/[\n,;\s]+/)
+            .map((value) => value.trim().toLowerCase())
+            .filter((value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value))
+        )
+      ),
+    [recipientsText]
+  );
+
+  React.useEffect(() => {
+    if (!recipientsText.trim() && leadEmails.length) {
+      setRecipientsText(leadEmails.join('\n'));
+    }
+  }, [leadEmails, recipientsText]);
+
+  React.useEffect(() => {
+    try {
+      const raw = window.sessionStorage.getItem('3d-suite-gmail-config');
+      if (!raw) return;
+
+      const saved = JSON.parse(raw) as {
+        clientId?: string;
+        clientSecret?: string;
+        redirectUri?: string;
+        chromiumUserDataDir?: string;
+        chromiumExecutablePath?: string;
+        extensionPath?: string;
+      };
+
+      setGoogleClientId(String(saved.clientId || ''));
+      setGoogleClientSecret(String(saved.clientSecret || ''));
+      setGoogleRedirectUri(
+        String(
+          saved.redirectUri ||
+            'http://localhost:7201/api/gmail/oauth/callback'
+        )
+      );
+      setChromiumUserDataDir(
+        String(saved.chromiumUserDataDir || '')
+      );
+      setChromiumExecutablePath(
+        String(saved.chromiumExecutablePath || '')
+      );
+      setExtensionPath(String(saved.extensionPath || ''));
+    } catch {}
+  }, []);
+
+  function saveGmailConfigToSession() {
+    if (!googleClientId.trim() || !googleClientSecret.trim()) {
+      onToast(
+        'Google Client ID and Client Secret are required',
+        'warning'
+      );
+      return;
+    }
+
+    try {
+      window.sessionStorage.setItem(
+        '3d-suite-gmail-config',
+        JSON.stringify({
+          clientId: googleClientId.trim(),
+          clientSecret: googleClientSecret.trim(),
+          redirectUri:
+            googleRedirectUri.trim() ||
+            'http://localhost:7201/api/gmail/oauth/callback',
+          chromiumUserDataDir: chromiumUserDataDir.trim(),
+          chromiumExecutablePath:
+            chromiumExecutablePath.trim(),
+          extensionPath: extensionPath.trim(),
+        })
+      );
+
+      onToast('Gmail settings saved to session', 'success');
+    } catch {
+      onToast('Unable to save Gmail settings to session', 'error');
+    }
+  }
+
+  function clearGmailConfigFromSession() {
+    try {
+      window.sessionStorage.removeItem('3d-suite-gmail-config');
+    } catch {}
+
+    setGoogleClientId('');
+    setGoogleClientSecret('');
+    setGoogleRedirectUri(
+      'http://localhost:7201/api/gmail/oauth/callback'
+    );
+    setChromiumUserDataDir('');
+    setChromiumExecutablePath('');
+    setExtensionPath('');
+    onToast('Gmail session settings cleared', 'success');
+  }
+
+  const refreshConnections = React.useCallback(async () => {
+    try {
+      const response = await fetch('/api/gmail/oauth/status', { cache: 'no-store' });
+      const data = await parseApiJson<{
+        accounts?: GmailConnectedAccount[];
+        error?: string;
+      }>(response);
+
+      if (!response.ok) {
+        throw new Error(data.error || `Gmail status failed (HTTP ${response.status})`);
+      }
+
+      const accounts = data.accounts || [];
+      setConnections(accounts);
+
+      if (!selectedAccount && accounts.length) {
+        setSelectedAccount(accounts[0].email);
+      }
+    } catch (error) {
+      onLog(
+        'error',
+        `Gmail status failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }, [onLog, selectedAccount]);
+
+  const loadProfiles = React.useCallback(async () => {
+    setLoadingProfiles(true);
+    try {
+      const profileUrl = chromiumUserDataDir.trim()
+        ? `/api/gmail/chromium-profiles?userDataDir=${encodeURIComponent(
+            chromiumUserDataDir.trim()
+          )}`
+        : '/api/gmail/chromium-profiles';
+
+      const response = await fetch(profileUrl, {
+        cache: 'no-store',
+      });
+      const data = await parseApiJson<{
+        profiles?: GmailChromiumProfile[];
+        error?: string;
+      }>(response);
+
+      if (!response.ok) {
+        throw new Error(data.error || `Profile discovery failed (HTTP ${response.status})`);
+      }
+
+      const list = data.profiles || [];
+      setProfiles(list);
+
+      if (!selectedProfile && list.length) {
+        setSelectedProfile(list[0].directory);
+      }
+
+      onLog('info', `Chromium profiles discovered: ${list.length}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      onLog('error', `Chromium profile discovery failed: ${message}`);
+      onToast(message, 'error');
+    } finally {
+      setLoadingProfiles(false);
+    }
+  }, [
+    chromiumUserDataDir,
+    onLog,
+    onToast,
+    selectedProfile,
+  ]);
+
+  React.useEffect(() => {
+    void loadProfiles();
+    void refreshConnections();
+
+    const timer = window.setInterval(() => {
+      void refreshConnections();
+    }, 5000);
+
+    return () => window.clearInterval(timer);
+  }, [loadProfiles, refreshConnections]);
+
+  async function connectGmail() {
+    if (!googleClientId.trim()) {
+      onToast('Google Client ID is required', 'warning');
+      return;
+    }
+
+    if (!googleClientSecret.trim()) {
+      onToast('Google Client Secret is required', 'warning');
+      return;
+    }
+
+    if (!googleRedirectUri.trim()) {
+      onToast('OAuth Redirect URI is required', 'warning');
+      return;
+    }
+
+    if (!selectedProfile) {
+      onToast('Choose a Chromium profile first', 'warning');
+      return;
+    }
+
+    setConnecting(true);
+    try {
+      const response = await fetch('/api/gmail/oauth/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          profileDirectory: selectedProfile,
+          extensionPath: extensionPath.trim() || undefined,
+          googleClientId: googleClientId.trim(),
+          googleClientSecret: googleClientSecret.trim(),
+          googleRedirectUri: googleRedirectUri.trim(),
+          chromiumUserDataDir:
+            chromiumUserDataDir.trim() || undefined,
+          chromiumExecutablePath:
+            chromiumExecutablePath.trim() || undefined,
+        }),
+      });
+
+      const data = await parseApiJson<{
+        success?: boolean;
+        error?: string;
+      }>(response);
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || `Gmail connection failed (HTTP ${response.status})`);
+      }
+
+      onLog(
+        'info',
+        `Google OAuth opened in Chromium profile "${selectedProfile}"${
+          extensionPath.trim() ? ' with unpacked extension loaded' : ''
+        }.`
+      );
+      onToast('Google OAuth opened in Chromium', 'success');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      onLog('error', `Gmail connection failed: ${message}`);
+      onToast(message, 'error');
+    } finally {
+      setConnecting(false);
+    }
+  }
+
+  async function disconnectAccount(email: string) {
+    try {
+      const response = await fetch('/api/gmail/oauth/status', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      const data = await parseApiJson<{ success?: boolean; error?: string }>(response);
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || 'Gmail disconnect failed');
+      }
+      onLog('info', `Gmail disconnected: ${email}`);
+      onToast('Gmail disconnected', 'success');
+      await refreshConnections();
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : String(error), 'error');
+    }
+  }
+
+  async function sendGmail() {
+    if (!selectedAccount) {
+      onToast('Connect or select a Gmail account first', 'warning');
+      return;
+    }
+
+    if (!recipients.length) {
+      onToast('Add at least one valid recipient', 'warning');
+      return;
+    }
+
+    setSending(true);
+
+    try {
+      const formData = new FormData();
+      formData.append('accountEmail', selectedAccount);
+      formData.append('recipients', JSON.stringify(recipients));
+      formData.append('subjectTemplate', subjectTemplate);
+      formData.append('bodyTemplate', bodyTemplate);
+      formData.append('attachmentNameTemplate', attachmentNameTemplate);
+      if (attachment) {
+        formData.append('attachment', attachment);
+      }
+
+      onLog(
+        'info',
+        `Gmail send started — ${recipients.length} recipient(s) from ${selectedAccount}`
+      );
+
+      const response = await fetch('/api/gmail/send', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await parseApiJson<{
+        success?: boolean;
+        sentCount?: number;
+        failedCount?: number;
+        results?: Array<{
+          index: number;
+          total: number;
+          recipient: string;
+          success: boolean;
+          messageId?: string;
+          error?: string;
+        }>;
+        error?: string;
+      }>(response);
+
+      if (!response.ok && !data.results) {
+        throw new Error(data.error || `Gmail send failed (HTTP ${response.status})`);
+      }
+
+      for (const result of data.results || []) {
+        onLog(
+          result.success ? 'success' : 'error',
+          result.success
+            ? `${result.index}/${result.total} ✅ SENT — ${result.recipient} — messageId=${result.messageId || 'unknown'}`
+            : `${result.index}/${result.total} ❌ FAILED — ${result.recipient} — ${result.error || 'unknown error'}`
+        );
+      }
+
+      const sent = data.sentCount || 0;
+      const failed = data.failedCount || 0;
+      onLog(
+        failed ? 'warning' : 'success',
+        `Gmail complete — ${sent} sent, ${failed} failed, ${recipients.length} total`
+      );
+      onToast(
+        failed ? `Gmail completed with ${failed} failure(s)` : 'Gmail send completed',
+        failed ? 'warning' : 'success'
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      onLog('error', `Gmail send failed: ${message}`);
+      onToast(message, 'error');
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <div className="grid xl:grid-cols-2 gap-4">
+      <Panel title="Gmail Connection">
+        <div className="space-y-3 text-sm">
+          <div className="rounded border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
+            Gmail uses Google OAuth. Client ID and Client Secret are required.
+            The redirect URI is required and is pre-filled for your local API.
+            Chromium paths and the extension folder are optional.
+          </div>
+
+          <Field label="Google Client ID — required">
+            <input
+              className="input"
+              value={googleClientId}
+              onChange={(event) =>
+                setGoogleClientId(event.target.value)
+              }
+              placeholder="xxxxxxxx.apps.googleusercontent.com"
+            />
+          </Field>
+
+          <Field label="Google Client Secret — required">
+            <input
+              type="password"
+              className="input"
+              value={googleClientSecret}
+              onChange={(event) =>
+                setGoogleClientSecret(event.target.value)
+              }
+              placeholder="Google OAuth client secret"
+            />
+          </Field>
+
+          <Field label="OAuth Redirect URI — required">
+            <input
+              className="input"
+              value={googleRedirectUri}
+              onChange={(event) =>
+                setGoogleRedirectUri(event.target.value)
+              }
+            />
+          </Field>
+
+          <div className="text-xs text-slate-500">
+            Add this exact redirect URI to the Authorized redirect URIs
+            for your Google OAuth client.
+          </div>
+
+          <Field label="Chromium User Data directory — optional">
+            <input
+              className="input"
+              value={chromiumUserDataDir}
+              onChange={(event) =>
+                setChromiumUserDataDir(event.target.value)
+              }
+              placeholder="Auto-detected, or C:\Users\Vergio\AppData\Local\Chromium\User Data"
+            />
+          </Field>
+
+          <Field label="Chromium executable path — optional">
+            <input
+              className="input"
+              value={chromiumExecutablePath}
+              onChange={(event) =>
+                setChromiumExecutablePath(event.target.value)
+              }
+              placeholder="Auto-detected, or C:\path\to\chromium\chrome.exe"
+            />
+          </Field>
+
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="rounded bg-emerald-600 px-3 py-2 text-xs text-white"
+              onClick={saveGmailConfigToSession}
+            >
+              Save settings to session
+            </button>
+            <button
+              type="button"
+              className="rounded border border-red-300 px-3 py-2 text-xs text-red-600"
+              onClick={clearGmailConfigFromSession}
+            >
+              Clear settings
+            </button>
+            <button
+              type="button"
+              className="rounded border px-3 py-2 text-xs"
+              onClick={() => void loadProfiles()}
+              disabled={loadingProfiles}
+            >
+              {loadingProfiles ? 'Scanning…' : 'Rescan profiles'}
+            </button>
+          </div>
+
+          <Field label="Chromium profile">
+            <select
+              className="input"
+              value={selectedProfile}
+              onChange={(event) => setSelectedProfile(event.target.value)}
+            >
+              <option value="">Choose Chromium profile</option>
+              {profiles.map((profile) => (
+                <option key={profile.directory} value={profile.directory}>
+                  {profile.name} ({profile.directory})
+                </option>
+              ))}
+            </select>
+          </Field>
+
+          <Field label="Optional unpacked extension folder">
+            <input
+              className="input"
+              value={extensionPath}
+              onChange={(event) => setExtensionPath(event.target.value)}
+              placeholder="C:\path\to\extension"
+            />
+          </Field>
+
+          <div className="text-xs text-slate-500">
+            The extension folder must contain <code>manifest.json</code>. It is loaded only
+            inside the selected Chromium profile.
+          </div>
+
+          <button
+            type="button"
+            className="rounded bg-[#6C63FF] px-3 py-2 text-white disabled:opacity-50"
+            disabled={connecting || !selectedProfile}
+            onClick={() => void connectGmail()}
+          >
+            {connecting ? 'Opening Google OAuth…' : 'Connect Gmail'}
+          </button>
+
+          <div className="border-t pt-3">
+            <div className="mb-2 text-xs font-semibold uppercase text-slate-500">
+              Connected Gmail accounts
+            </div>
+
+            {connections.length === 0 ? (
+              <div className="text-xs text-slate-500">No Gmail accounts connected yet.</div>
+            ) : (
+              <div className="space-y-2">
+                {connections.map((account) => (
+                  <div
+                    key={account.email}
+                    className="flex items-center justify-between gap-3 rounded border border-slate-200 px-3 py-2"
+                  >
+                    <div>
+                      <div className="font-medium text-slate-800">{account.email}</div>
+                      {account.profileDirectory && (
+                        <div className="text-xs text-slate-500">
+                          Chromium: {account.profileDirectory}
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      className="text-xs text-red-600"
+                      onClick={() => void disconnectAccount(account.email)}
+                    >
+                      Disconnect
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </Panel>
+
+      <Panel title="Gmail Sender">
+        <div className="space-y-3 text-sm">
+          <Field label="Send from">
+            <select
+              className="input"
+              value={selectedAccount}
+              onChange={(event) => setSelectedAccount(event.target.value)}
+            >
+              <option value="">Choose connected Gmail account</option>
+              {connections.map((account) => (
+                <option key={account.email} value={account.email}>
+                  {account.email}
+                </option>
+              ))}
+            </select>
+          </Field>
+
+          <Field label={`Recipients (${recipients.length})`}>
+            <textarea
+              className="input min-h-36"
+              value={recipientsText}
+              onChange={(event) => setRecipientsText(event.target.value)}
+              placeholder="user1@example.com&#10;user2@example.com"
+            />
+          </Field>
+
+          <Field label="Subject template">
+            <input
+              className="input"
+              value={subjectTemplate}
+              onChange={(event) => setSubjectTemplate(event.target.value)}
+            />
+          </Field>
+
+          <Field label="Message">
+            <textarea
+              className="input min-h-36"
+              value={bodyTemplate}
+              onChange={(event) => setBodyTemplate(event.target.value)}
+            />
+          </Field>
+
+          <Field label="Attachment">
+            <input
+              type="file"
+              className="input"
+              onChange={(event) => setAttachment(event.target.files?.[0] || null)}
+            />
+          </Field>
+
+          <Field label="Attachment name template">
+            <input
+              className="input"
+              value={attachmentNameTemplate}
+              onChange={(event) => setAttachmentNameTemplate(event.target.value)}
+            />
+          </Field>
+
+          <div className="text-xs text-slate-500 leading-5">
+            Placeholders: <code>{'{Email}'}</code>, <code>{'{LocalPart}'}</code>,
+            {' '}<code>{'{Domain}'}</code>, <code>{'{DomainName}'}</code>,
+            {' '}<code>{'{Date}'}</code>, <code>{'{Random6}'}</code>,
+            {' '}<code>{'{Random8}'}</code>, <code>{'{OriginalName}'}</code>,
+            {' '}<code>{'{Ext}'}</code>.
+          </div>
+
+          <button
+            type="button"
+            className="rounded bg-[#6C63FF] px-3 py-2 text-white disabled:opacity-50"
+            disabled={sending || !selectedAccount || recipients.length === 0}
+            onClick={() => void sendGmail()}
+          >
+            {sending ? 'Sending Gmail…' : 'Send Gmail'}
+          </button>
         </div>
       </Panel>
     </div>
