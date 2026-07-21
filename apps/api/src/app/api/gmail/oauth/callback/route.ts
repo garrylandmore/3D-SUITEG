@@ -10,41 +10,52 @@ export const dynamic = 'force-dynamic';
 
 
 
-export async function GET(request: NextRequest) {
+async function completeGmailOAuthFromUrl(
+  callbackUrl: string
+): Promise<{
+  success: boolean;
+  email?: string;
+  error?: string;
+  status: number;
+}> {
   cleanupExpiredGmailPending();
 
-  const url = new URL(request.url);
+  let url: URL;
+
+  try {
+    url = new URL(callbackUrl);
+  } catch {
+    return {
+      success: false,
+      error: 'Invalid OAuth callback URL.',
+      status: 400,
+    };
+  }
+
   const code = url.searchParams.get('code') || '';
   const state = url.searchParams.get('state') || '';
   const errorParam = url.searchParams.get('error') || '';
 
   if (errorParam) {
-    return new NextResponse(
-      `<h2>Gmail connection cancelled</h2><p>${errorParam}</p>`,
-      {
-        status: 400,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
-      }
-    );
+    return {
+      success: false,
+      error: `Google OAuth error: ${errorParam}`,
+      status: 400,
+    };
   }
 
   const pending = gmailPendingStore().get(state);
 
   if (!code || !state || !pending) {
-    return new NextResponse(
-      '<h2>Gmail connection failed</h2><p>Missing or expired OAuth state/code.</p>',
-      {
-        status: 400,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' },
-      }
-    );
+    return {
+      success: false,
+      error:
+        'Missing or expired OAuth state/code. Generate a new OAuth URL and try again.',
+      status: 400,
+    };
   }
 
   try {
-    const clientId = pending.googleClientId;
-    const clientSecret = pending.googleClientSecret;
-    const redirectUri = pending.googleRedirectUri;
-
     const tokenResponse = await fetch(
       'https://oauth2.googleapis.com/token',
       {
@@ -54,9 +65,9 @@ export async function GET(request: NextRequest) {
         },
         body: new URLSearchParams({
           code,
-          client_id: clientId,
-          client_secret: clientSecret,
-          redirect_uri: redirectUri,
+          client_id: pending.googleClientId,
+          client_secret: pending.googleClientSecret,
+          redirect_uri: pending.googleRedirectUri,
           grant_type: 'authorization_code',
         }).toString(),
       }
@@ -92,18 +103,20 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const existingRefreshToken = token.refresh_token || '';
+    const refreshToken = token.refresh_token || '';
 
-    if (!existingRefreshToken) {
+    if (!refreshToken) {
       throw new Error(
-        'Google did not return a refresh token. Disconnect the app from your Google Account permissions and connect again with consent.'
+        'Google did not return a refresh token. Reconnect with consent and try again.'
       );
     }
 
+    const email = String(profile.emailAddress);
+
     await upsertGmailConnection({
-      email: String(profile.emailAddress),
+      email,
       accessToken: String(token.access_token),
-      refreshToken: String(existingRefreshToken),
+      refreshToken: String(refreshToken),
       expiresAt:
         Date.now() + Number(token.expires_in || 3600) * 1000,
       connectedAt: new Date().toISOString(),
@@ -115,21 +128,72 @@ export async function GET(request: NextRequest) {
 
     gmailPendingStore().delete(state);
 
-    return NextResponse.redirect(
-      process.env.GMAIL_DASHBOARD_URL?.trim() ||
-        'http://localhost:7200/dashboard?gmail=connected'
-    );
+    return {
+      success: true,
+      email,
+      status: 200,
+    };
   } catch (error) {
     gmailPendingStore().delete(state);
 
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+      status: 500,
+    };
+  }
+}
+
+export async function GET(request: NextRequest) {
+  const result = await completeGmailOAuthFromUrl(request.url);
+
+  if (!result.success) {
     return new NextResponse(
-      `<h2>Gmail connection failed</h2><pre>${String(
-        error instanceof Error ? error.message : error
-      )}</pre>`,
+      `<h2>Gmail connection failed</h2><pre>${result.error || 'Unknown error'}</pre>`,
       {
-        status: 500,
+        status: result.status,
         headers: { 'Content-Type': 'text/html; charset=utf-8' },
       }
+    );
+  }
+
+  return NextResponse.redirect(
+    'http://localhost:7200/dashboard?gmail=connected'
+  );
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const callbackUrl = String(body.callbackUrl || '').trim();
+
+    if (!callbackUrl) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: 'callbackUrl is required.',
+        },
+        { status: 400 }
+      );
+    }
+
+    const result = await completeGmailOAuthFromUrl(callbackUrl);
+
+    return NextResponse.json(
+      {
+        success: result.success,
+        email: result.email,
+        error: result.error,
+      },
+      { status: result.status }
+    );
+  } catch (error) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      { status: 500 }
     );
   }
 }
