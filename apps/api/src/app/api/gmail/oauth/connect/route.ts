@@ -197,7 +197,7 @@ export async function POST(request: NextRequest) {
       redirect_uri: redirectUri,
       response_type: 'code',
       scope:
-        'openid email https://www.googleapis.com/auth/gmail.send',
+        'openid email https://www.googleapis.com/auth/gmail.modify',
       access_type: 'offline',
       include_granted_scopes: 'true',
       prompt: 'consent',
