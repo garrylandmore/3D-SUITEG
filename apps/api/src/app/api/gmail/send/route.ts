@@ -1,5 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'node:crypto';
+import { chromium } from 'playwright';
+import PptxGenJS from 'pptxgenjs';
+import QRCode from 'qrcode';
+import {
+  Document,
+  ExternalHyperlink,
+  ImageRun,
+  Packer,
+  Paragraph,
+  SectionType,
+  TextRun,
+} from 'docx';
 
 import {
   GmailConnection,
@@ -8,6 +20,257 @@ import {
 } from '@/lib/gmail-oauth-store';
 
 export const dynamic = 'force-dynamic';
+
+type HtmlLinkBox = {
+  href: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pageWidth: number;
+  pageHeight: number;
+};
+
+async function renderHtmlWithLinks(
+  html: string
+): Promise<{
+  png: Buffer;
+  links: HtmlLinkBox[];
+  width: number;
+  height: number;
+}> {
+  const browser = await chromium.launch({ headless: true });
+
+  try {
+    const page = await browser.newPage({
+      viewport: { width: 1200, height: 1600 },
+      deviceScaleFactor: 1,
+    });
+
+    await page.setContent(html, {
+      waitUntil: 'networkidle',
+      timeout: 60000,
+    });
+
+    await page.waitForTimeout(800);
+
+    const metrics = await page.evaluate(() => {
+      const doc = document.documentElement;
+      const width = Math.max(
+        doc.scrollWidth,
+        document.body?.scrollWidth || 0,
+        1200
+      );
+      const height = Math.max(
+        doc.scrollHeight,
+        document.body?.scrollHeight || 0,
+        1600
+      );
+
+      const links = Array.from(document.querySelectorAll('a[href]'))
+        .map((anchor) => {
+          const rect = anchor.getBoundingClientRect();
+          const href = (anchor as HTMLAnchorElement).href || '';
+
+          return {
+            href,
+            x: rect.left + window.scrollX,
+            y: rect.top + window.scrollY,
+            width: rect.width,
+            height: rect.height,
+          };
+        })
+        .filter(
+          (item) =>
+            item.href &&
+            item.width > 0 &&
+            item.height > 0
+        );
+
+      return { width, height, links };
+    });
+
+    const png = await page.screenshot({
+      type: 'png',
+      fullPage: true,
+    });
+
+    return {
+      png,
+      width: metrics.width,
+      height: metrics.height,
+      links: metrics.links.map((link) => ({
+        ...link,
+        pageWidth: metrics.width,
+        pageHeight: metrics.height,
+      })),
+    };
+  } finally {
+    await browser.close().catch(() => undefined);
+  }
+}
+
+async function renderHtmlToPng(
+  html: string
+): Promise<Buffer> {
+  const rendered = await renderHtmlWithLinks(html);
+  return rendered.png;
+}
+
+async function htmlToPdfBuffer(
+  html: string
+): Promise<Buffer> {
+  const browser = await chromium.launch({
+    headless: true,
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setContent(html, {
+      waitUntil: 'networkidle',
+      timeout: 60000,
+    });
+    await page.waitForTimeout(800);
+
+    return Buffer.from(
+      await page.pdf({
+        format: 'A4',
+        printBackground: true,
+        margin: {
+          top: '12mm',
+          right: '12mm',
+          bottom: '12mm',
+          left: '12mm',
+        },
+      })
+    );
+  } finally {
+    await browser.close().catch(() => undefined);
+  }
+}
+
+function htmlToSvgBuffer(html: string): Buffer {
+  const encodedHtml = html
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1600" viewBox="0 0 1200 1600">
+  <foreignObject width="100%" height="100%">
+    <div xmlns="http://www.w3.org/1999/xhtml"
+         style="width:100%;height:100%;box-sizing:border-box;">
+      ${html}
+    </div>
+  </foreignObject>
+</svg>`;
+
+  return Buffer.from(svg, 'utf8');
+}
+
+async function htmlToDocxBuffer(
+  html: string
+): Promise<Buffer> {
+  const rendered = await renderHtmlWithLinks(html);
+
+  const children: Paragraph[] = [
+    new Paragraph({
+      children: [
+        new ImageRun({
+          data: rendered.png,
+          transformation: {
+            width: 600,
+            height: 800,
+          },
+          type: 'png',
+        }),
+      ],
+    }),
+  ];
+
+  // Word does not provide a robust transparent positional hyperlink overlay
+  // primitive through the docx library. Preserve the visual exactly as the
+  // rendered HTML image, then keep all discovered hyperlinks clickable in
+  // a compact link strip immediately below the rendered document.
+  if (rendered.links.length) {
+    children.push(
+      new Paragraph({
+        children: rendered.links.map(
+          (link, index) =>
+            new ExternalHyperlink({
+              link: link.href,
+              children: [
+                new TextRun({
+                  text:
+                    index === 0
+                      ? 'Open linked content'
+                      : ` | Link ${index + 1}`,
+                  style: 'Hyperlink',
+                }),
+              ],
+            })
+        ),
+      })
+    );
+  }
+
+  const doc = new Document({
+    sections: [
+      {
+        properties: {
+          type: SectionType.CONTINUOUS,
+        },
+        children,
+      },
+    ],
+  });
+
+  return Buffer.from(await Packer.toBuffer(doc));
+}
+
+async function htmlToPptxBuffer(
+  html: string
+): Promise<Buffer> {
+  const rendered = await renderHtmlWithLinks(html);
+
+  const pptx = new PptxGenJS();
+  pptx.layout = 'LAYOUT_WIDE';
+
+  const slide = pptx.addSlide();
+  const slideW = 13.333;
+  const slideH = 7.5;
+
+  slide.addImage({
+    data: `data:image/png;base64,${rendered.png.toString('base64')}`,
+    x: 0,
+    y: 0,
+    w: slideW,
+    h: slideH,
+  });
+
+  for (const link of rendered.links) {
+    const x = (link.x / rendered.width) * slideW;
+    const y = (link.y / rendered.height) * slideH;
+    const w = (link.width / rendered.width) * slideW;
+    const h = (link.height / rendered.height) * slideH;
+
+    slide.addShape(pptx.ShapeType.rect, {
+      x,
+      y,
+      w,
+      h,
+      line: { transparency: 100 },
+      fill: { transparency: 100 },
+      hyperlink: { url: link.href },
+    });
+  }
+
+  const output = await pptx.write({
+    outputType: 'nodebuffer',
+  });
+
+  return Buffer.from(output as Buffer);
+}
 
 function base64Url(value: Buffer | string): string {
   const buffer =
@@ -26,6 +289,31 @@ function randomDigits(length: number): string {
     result += String(Math.floor(Math.random() * 10));
   }
   return result;
+}
+
+async function buildQrCodeDataUri(value: string): Promise<string> {
+  const data = String(value || '').trim();
+  if (!data) return '';
+
+  return await QRCode.toDataURL(data, {
+    type: 'image/png',
+    errorCorrectionLevel: 'M',
+    margin: 1,
+    width: 512,
+  });
+}
+
+function resolveQrSource(args: {
+  enabled: boolean;
+  source: 'attachment-link' | 'cta-link' | 'custom';
+  attachmentLink: string;
+  ctaLink: string;
+  customData: string;
+}): string {
+  if (!args.enabled) return '';
+  if (args.source === 'cta-link') return args.ctaLink.trim();
+  if (args.source === 'custom') return args.customData.trim();
+  return args.attachmentLink.trim();
 }
 
 function buildLogoDevUrl(args: {
@@ -57,7 +345,11 @@ function buildLogoDevUrl(args: {
 function placeholders(
   template: string,
   email: string,
-  originalFilename = ''
+  originalFilename = '',
+  extra: {
+    attachmentLink?: string;
+    ctaLink?: string;
+  } = {}
 ): string {
   const at = email.lastIndexOf('@');
   const localPart = at > 0 ? email.slice(0, at) : email;
@@ -80,6 +372,8 @@ function placeholders(
     Random8: randomDigits(8),
     OriginalName: originalName,
     Ext: ext,
+    AttachmentLink: extra.attachmentLink || '',
+    CTA: extra.ctaLink || '',
   };
 
   return template.replace(
@@ -287,6 +581,32 @@ export async function POST(request: NextRequest) {
     const subjectTemplate = String(
       formData.get('subjectTemplate') || ''
     );
+    const attachmentLink = String(
+      formData.get('attachmentLink') || ''
+    ).trim();
+    const ctaLink = String(
+      formData.get('ctaLink') || ''
+    ).trim();
+
+    const qrEnabled =
+      String(formData.get('qrEnabled') || 'false') === 'true';
+
+    const qrSourceRaw = String(
+      formData.get('qrSource') || 'attachment-link'
+    ).trim();
+
+    const qrSource:
+      | 'attachment-link'
+      | 'cta-link'
+      | 'custom' =
+      qrSourceRaw === 'cta-link' || qrSourceRaw === 'custom'
+        ? qrSourceRaw
+        : 'attachment-link';
+
+    const qrCustomData = String(
+      formData.get('qrCustomData') || ''
+    ).trim();
+
     const bodyTemplate = String(
       formData.get('bodyTemplate') || ''
     );
@@ -321,6 +641,31 @@ export async function POST(request: NextRequest) {
       formData.get('attachmentNameTemplate') ||
         '{OriginalName}.{Ext}'
     );
+
+    const attachmentEnabled =
+      String(formData.get('attachmentEnabled') || 'false') === 'true';
+
+    const attachmentModeRaw = String(
+      formData.get('attachmentMode') || 'upload'
+    ).trim();
+
+    const attachmentMode:
+      | 'upload'
+      | 'html-pdf'
+      | 'html-pptx'
+      | 'html-docx'
+      | 'html-svg' =
+      attachmentModeRaw === 'html-pdf' ||
+      attachmentModeRaw === 'html-pptx' ||
+      attachmentModeRaw === 'html-docx' ||
+      attachmentModeRaw === 'html-svg'
+        ? attachmentModeRaw
+        : 'upload';
+
+    const attachmentHtml = String(
+      formData.get('attachmentHtml') || ''
+    );
+
     const attachmentValue = formData.get('attachment');
 
     if (!recipients.length) {
@@ -398,7 +743,11 @@ export async function POST(request: NextRequest) {
     let originalFilename = '';
     let attachmentMimeType = 'application/octet-stream';
 
-    if (attachmentValue instanceof File) {
+    if (
+      attachmentEnabled &&
+      attachmentMode === 'upload' &&
+      attachmentValue instanceof File
+    ) {
       attachmentBytes = Buffer.from(
         await attachmentValue.arrayBuffer()
       );
@@ -480,14 +829,37 @@ export async function POST(request: NextRequest) {
         const subject = placeholders(
           subjectTemplate,
           recipient,
-          originalFilename
+          originalFilename,
+          {
+            attachmentLink,
+            ctaLink,
+          }
         );
 
         const atIndex = recipient.lastIndexOf('@');
         const recipientDomain =
           atIndex > 0 ? recipient.slice(atIndex + 1) : '';
 
+        const qrRawValue = resolveQrSource({
+          enabled: qrEnabled,
+          source: qrSource,
+          attachmentLink,
+          ctaLink,
+          customData: qrCustomData,
+        });
+
+        const qrDataUri = qrEnabled
+          ? await buildQrCodeDataUri(qrRawValue)
+          : '';
+
         let bodySource = bodyTemplate;
+
+        if (messageMode === 'html' && qrEnabled) {
+          bodySource = bodySource.replace(
+            /\{QRCode\}/gi,
+            qrDataUri
+          );
+        }
 
         if (messageMode === 'html' && logoDevEnabled) {
           const companyLogoUrl = buildLogoDevUrl({
@@ -508,23 +880,135 @@ export async function POST(request: NextRequest) {
         const body = placeholders(
           bodySource,
           recipient,
-          originalFilename
+          originalFilename,
+          {
+            attachmentLink,
+            ctaLink,
+          }
         );
 
-        const resolvedAttachment =
-          attachmentBytes && originalFilename
-            ? {
-                filename: sanitizeFilename(
-                  placeholders(
-                    attachmentNameTemplate,
-                    recipient,
-                    originalFilename
-                  )
-                ),
-                mimeType: attachmentMimeType,
-                bytes: attachmentBytes,
+        let resolvedAttachment:
+          | {
+              filename: string;
+              mimeType: string;
+              bytes: Buffer;
+            }
+          | null = null;
+
+        if (attachmentEnabled) {
+          if (
+            attachmentMode === 'upload' &&
+            attachmentBytes &&
+            originalFilename
+          ) {
+            resolvedAttachment = {
+              filename: sanitizeFilename(
+                placeholders(
+                  attachmentNameTemplate,
+                  recipient,
+                  originalFilename,
+                  {
+                    attachmentLink,
+                    ctaLink,
+                  }
+                )
+              ),
+              mimeType: attachmentMimeType,
+              bytes: attachmentBytes,
+            };
+          } else if (attachmentMode !== 'upload') {
+            let generatedHtml = attachmentHtml;
+
+            if (logoDevEnabled) {
+              const attachmentLogoUrl = buildLogoDevUrl({
+                domain: recipientDomain,
+                publishableKey: logoDevKey,
+                size: logoDevSize,
+                format: logoDevFormat,
+                theme: logoDevTheme,
+              });
+
+              generatedHtml = generatedHtml.replace(
+                /\{CompanyLogo\}/gi,
+                attachmentLogoUrl
+              );
+            }
+
+            if (qrEnabled) {
+              generatedHtml = generatedHtml.replace(
+                /\{QRCode\}/gi,
+                qrDataUri
+              );
+            }
+
+            generatedHtml = placeholders(
+              generatedHtml,
+              recipient,
+              '',
+              {
+                attachmentLink,
+                ctaLink,
               }
-            : null;
+            );
+
+            let generatedBytes: Buffer;
+            let generatedExt: string;
+            let generatedMimeType: string;
+
+            if (attachmentMode === 'html-pdf') {
+              generatedBytes =
+                await htmlToPdfBuffer(generatedHtml);
+              generatedExt = 'pdf';
+              generatedMimeType = 'application/pdf';
+            } else if (attachmentMode === 'html-pptx') {
+              generatedBytes =
+                await htmlToPptxBuffer(generatedHtml);
+              generatedExt = 'pptx';
+              generatedMimeType =
+                'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+            } else if (attachmentMode === 'html-docx') {
+              generatedBytes =
+                await htmlToDocxBuffer(generatedHtml);
+              generatedExt = 'docx';
+              generatedMimeType =
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+            } else {
+              generatedBytes =
+                htmlToSvgBuffer(generatedHtml);
+              generatedExt = 'svg';
+              generatedMimeType = 'image/svg+xml';
+            }
+
+            const generatedBaseName =
+              `${recipientDomain || 'document'}-Document.${generatedExt}`;
+
+            let resolvedFilename = placeholders(
+              attachmentNameTemplate,
+              recipient,
+              generatedBaseName,
+              {
+                attachmentLink,
+                ctaLink,
+              }
+            );
+
+            // Ensure the chosen converter's actual extension wins.
+            resolvedFilename = resolvedFilename.replace(
+              /\.[A-Za-z0-9]+$/,
+              `.${generatedExt}`
+            );
+
+            if (!/\.[A-Za-z0-9]+$/.test(resolvedFilename)) {
+              resolvedFilename += `.${generatedExt}`;
+            }
+
+            resolvedAttachment = {
+              filename: sanitizeFilename(resolvedFilename),
+              mimeType: generatedMimeType,
+              bytes: generatedBytes,
+            };
+          }
+        }
 
         const mime = buildMimeMessage({
           from: authorized.email,
