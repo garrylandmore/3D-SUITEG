@@ -136,6 +136,7 @@ function buildMimeMessage(args: {
   to: string;
   subject: string;
   body: string;
+  messageMode?: 'text' | 'html';
   attachment?: {
     filename: string;
     mimeType: string;
@@ -159,10 +160,15 @@ function buildMimeMessage(args: {
     'MIME-Version: 1.0',
   ];
 
+  const bodyContentType =
+    args.messageMode === 'html'
+      ? 'text/html; charset="UTF-8"'
+      : 'text/plain; charset="UTF-8"';
+
   if (!args.attachment) {
     return [
       ...headers,
-      'Content-Type: text/plain; charset="UTF-8"',
+      `Content-Type: ${bodyContentType}`,
       'Content-Transfer-Encoding: 8bit',
       '',
       args.body,
@@ -174,7 +180,7 @@ function buildMimeMessage(args: {
     `Content-Type: multipart/mixed; boundary="${boundary}"`,
     '',
     `--${boundary}`,
-    'Content-Type: text/plain; charset="UTF-8"',
+    `Content-Type: ${bodyContentType}`,
     'Content-Transfer-Encoding: 8bit',
     '',
     args.body,
@@ -258,6 +264,14 @@ export async function POST(request: NextRequest) {
     const bodyTemplate = String(
       formData.get('bodyTemplate') || ''
     );
+
+    const messageMode =
+      String(formData.get('messageMode') || 'text')
+        .trim()
+        .toLowerCase() === 'html'
+        ? 'html'
+        : 'text';
+
     const attachmentNameTemplate = String(
       formData.get('attachmentNameTemplate') ||
         '{OriginalName}.{Ext}'
@@ -450,6 +464,7 @@ export async function POST(request: NextRequest) {
           to: recipient,
           subject,
           body,
+          messageMode,
           attachment: resolvedAttachment,
         });
 
