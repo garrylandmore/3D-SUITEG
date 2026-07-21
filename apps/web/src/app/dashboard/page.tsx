@@ -4144,12 +4144,12 @@ function GmailSenderPanel({
         setSelectedAccount(accounts[0].email);
       }
     } catch (error) {
-      onLog(
-        'error',
-        `Gmail status failed: ${error instanceof Error ? error.message : String(error)}`
+      console.warn(
+        'Gmail status refresh failed:',
+        error instanceof Error ? error.message : String(error)
       );
     }
-  }, [onLog, selectedAccount]);
+  }, [selectedAccount]);
 
   const loadProfiles = React.useCallback(async () => {
     setLoadingProfiles(true);
@@ -4195,14 +4195,13 @@ function GmailSenderPanel({
   ]);
 
   React.useEffect(() => {
+    // Check once when the Gmail panel is opened.
+    // Further refreshes happen explicitly after connect/disconnect
+    // or from the Refresh accounts button.
     void refreshConnections();
-
-    const timer = window.setInterval(() => {
-      void refreshConnections();
-    }, 5000);
-
-    return () => window.clearInterval(timer);
-  }, [refreshConnections]);
+    // Intentionally run once for this mounted Gmail panel.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function connectGmail() {
     if (!googleClientId.trim()) {
@@ -4755,8 +4754,18 @@ function GmailSenderPanel({
           )}
 
           <div className="border-t pt-3">
-            <div className="mb-2 text-xs font-semibold uppercase text-slate-500">
-              Connected Gmail accounts
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="text-xs font-semibold uppercase text-slate-500">
+                Connected Gmail accounts
+              </div>
+
+              <button
+                type="button"
+                className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-600"
+                onClick={() => void refreshConnections()}
+              >
+                Refresh accounts
+              </button>
             </div>
 
             {connections.length === 0 ? (
