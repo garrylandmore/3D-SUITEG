@@ -39,12 +39,24 @@ async function renderHtmlWithLinks(
   width: number;
   height: number;
 }> {
-  const browser = await chromium.launch({ headless: true });
+  // Exact A4 portrait aspect ratio at a high-resolution CSS canvas.
+  // deviceScaleFactor=2 makes the screenshot 2480 x 3508 pixels,
+  // which is sharp enough for Word/PowerPoint while retaining browser rendering.
+  const pageWidth = 1240;
+  const pageHeight = 1754;
+  const safeMargin = 28;
+
+  const browser = await chromium.launch({
+    headless: true,
+  });
 
   try {
     const page = await browser.newPage({
-      viewport: { width: 1240, height: 1754 },
-      deviceScaleFactor: 1,
+      viewport: {
+        width: pageWidth,
+        height: pageHeight,
+      },
+      deviceScaleFactor: 2,
     });
 
     await page.setContent(html, {
@@ -54,61 +66,137 @@ async function renderHtmlWithLinks(
 
     await page.waitForTimeout(900);
 
-    const metrics = await page.evaluate(() => {
-      const doc = document.documentElement;
-      const body = document.body;
+    await page.evaluate(
+      ({ pageWidth, pageHeight, safeMargin }) => {
+        const body = document.body;
+        const htmlElement = document.documentElement;
 
-      const width = Math.max(
-        doc.scrollWidth,
-        body?.scrollWidth || 0,
-        1240
-      );
+        if (!body) return;
 
-      const height = Math.max(
-        doc.scrollHeight,
-        body?.scrollHeight || 0,
-        1754
-      );
+        // Create one wrapper around all original body content so we can
+        // uniformly scale the completed HTML without stretching it.
+        let wrapper = document.getElementById('__3d_suite_a4_content');
 
-      const links = Array.from(
-        document.querySelectorAll('a[href]')
-      )
-        .map((anchor) => {
-          const rect = anchor.getBoundingClientRect();
-          const href = (anchor as HTMLAnchorElement).href || '';
+        if (!wrapper) {
+          wrapper = document.createElement('div');
+          wrapper.id = '__3d_suite_a4_content';
 
-          return {
-            href,
-            x: rect.left + window.scrollX,
-            y: rect.top + window.scrollY,
-            width: rect.width,
-            height: rect.height,
-          };
-        })
-        .filter(
-          (item) =>
-            item.href &&
-            item.width > 0 &&
-            item.height > 0
+          while (body.firstChild) {
+            wrapper.appendChild(body.firstChild);
+          }
+
+          body.appendChild(wrapper);
+        }
+
+        htmlElement.style.margin = '0';
+        htmlElement.style.padding = '0';
+        htmlElement.style.width = `${pageWidth}px`;
+        htmlElement.style.minWidth = `${pageWidth}px`;
+        htmlElement.style.height = `${pageHeight}px`;
+        htmlElement.style.minHeight = `${pageHeight}px`;
+        htmlElement.style.overflow = 'hidden';
+
+        body.style.margin = '0';
+        body.style.padding = '0';
+        body.style.width = `${pageWidth}px`;
+        body.style.minWidth = `${pageWidth}px`;
+        body.style.height = `${pageHeight}px`;
+        body.style.minHeight = `${pageHeight}px`;
+        body.style.overflow = 'hidden';
+        body.style.position = 'relative';
+
+        wrapper.style.position = 'absolute';
+        wrapper.style.left = '0';
+        wrapper.style.top = '0';
+        wrapper.style.transformOrigin = 'top left';
+        wrapper.style.transform = 'none';
+        wrapper.style.width = 'max-content';
+        wrapper.style.maxWidth = 'none';
+
+        // Measure the natural rendered content.
+        const rect = wrapper.getBoundingClientRect();
+
+        const contentWidth = Math.max(
+          rect.width,
+          wrapper.scrollWidth,
+          1
         );
 
-      return { width, height, links };
-    });
+        const contentHeight = Math.max(
+          rect.height,
+          wrapper.scrollHeight,
+          1
+        );
+
+        const usableWidth = pageWidth - safeMargin * 2;
+        const usableHeight = pageHeight - safeMargin * 2;
+
+        // Scale both UP and DOWN. This is the key difference from the
+        // previous version, which often left small HTML designs tiny.
+        const scale = Math.min(
+          usableWidth / contentWidth,
+          usableHeight / contentHeight
+        );
+
+        const finalWidth = contentWidth * scale;
+        const finalHeight = contentHeight * scale;
+
+        const offsetX =
+          safeMargin + Math.max(0, (usableWidth - finalWidth) / 2);
+
+        const offsetY =
+          safeMargin + Math.max(0, (usableHeight - finalHeight) / 2);
+
+        wrapper.style.left = `${offsetX}px`;
+        wrapper.style.top = `${offsetY}px`;
+        wrapper.style.transform = `scale(${scale})`;
+      },
+      { pageWidth, pageHeight, safeMargin }
+    );
+
+    await page.waitForTimeout(250);
+
+    const links = await page.evaluate(
+      ({ pageWidth, pageHeight }) =>
+        Array.from(document.querySelectorAll('a[href]'))
+          .map((anchor) => {
+            const rect = anchor.getBoundingClientRect();
+            const href = (anchor as HTMLAnchorElement).href || '';
+
+            return {
+              href,
+              x: rect.left,
+              y: rect.top,
+              width: rect.width,
+              height: rect.height,
+              pageWidth,
+              pageHeight,
+            };
+          })
+          .filter(
+            (item) =>
+              item.href &&
+              item.width > 0 &&
+              item.height > 0
+          ),
+      { pageWidth, pageHeight }
+    );
 
     const png = await page.screenshot({
       type: 'png',
-      fullPage: true,
+      clip: {
+        x: 0,
+        y: 0,
+        width: pageWidth,
+        height: pageHeight,
+      },
     });
 
     return {
       png,
-      width: metrics.width,
-      height: metrics.height,
-      links: metrics.links.map((link) => ({
-        ...link,
-        pageWidth: metrics.width,
-        pageHeight: metrics.height,
-      })),
+      links,
+      width: pageWidth,
+      height: pageHeight,
     };
   } finally {
     await browser.close().catch(() => undefined);
@@ -129,12 +217,17 @@ async function htmlToPdfBuffer(
     headless: true,
   });
 
+  const pageWidth = 1240;
+  const pageHeight = 1754;
+  const safeMargin = 20;
+
   try {
     const page = await browser.newPage({
       viewport: {
-        width: 1240,
-        height: 1754,
+        width: pageWidth,
+        height: pageHeight,
       },
+      deviceScaleFactor: 1,
     });
 
     await page.setContent(html, {
@@ -144,65 +237,112 @@ async function htmlToPdfBuffer(
 
     await page.waitForTimeout(900);
 
-    // Measure the natural HTML size and scale the whole document to one A4 page.
-    const dimensions = await page.evaluate(() => {
-      const doc = document.documentElement;
-      const body = document.body;
+    await page.evaluate(
+      ({ pageWidth, pageHeight, safeMargin }) => {
+        const body = document.body;
+        const htmlElement = document.documentElement;
 
-      return {
-        width: Math.max(
-          doc.scrollWidth,
-          body?.scrollWidth || 0,
+        if (!body) return;
+
+        let wrapper = document.getElementById('__3d_suite_a4_pdf');
+
+        if (!wrapper) {
+          wrapper = document.createElement('div');
+          wrapper.id = '__3d_suite_a4_pdf';
+
+          while (body.firstChild) {
+            wrapper.appendChild(body.firstChild);
+          }
+
+          body.appendChild(wrapper);
+        }
+
+        htmlElement.style.margin = '0';
+        htmlElement.style.padding = '0';
+
+        body.style.margin = '0';
+        body.style.padding = '0';
+        body.style.width = `${pageWidth}px`;
+        body.style.height = `${pageHeight}px`;
+        body.style.position = 'relative';
+        body.style.overflow = 'hidden';
+
+        wrapper.style.position = 'absolute';
+        wrapper.style.left = '0';
+        wrapper.style.top = '0';
+        wrapper.style.transformOrigin = 'top left';
+        wrapper.style.transform = 'none';
+        wrapper.style.width = 'max-content';
+        wrapper.style.maxWidth = 'none';
+
+        const rect = wrapper.getBoundingClientRect();
+
+        const contentWidth = Math.max(
+          rect.width,
+          wrapper.scrollWidth,
           1
-        ),
-        height: Math.max(
-          doc.scrollHeight,
-          body?.scrollHeight || 0,
+        );
+
+        const contentHeight = Math.max(
+          rect.height,
+          wrapper.scrollHeight,
           1
-        ),
-      };
-    });
+        );
 
-    const a4WidthPx = 794;
-    const a4HeightPx = 1123;
+        const usableWidth = pageWidth - safeMargin * 2;
+        const usableHeight = pageHeight - safeMargin * 2;
 
-    const fitScale = Math.min(
-      1,
-      a4WidthPx / dimensions.width,
-      a4HeightPx / dimensions.height
+        const scale = Math.min(
+          usableWidth / contentWidth,
+          usableHeight / contentHeight
+        );
+
+        const finalWidth = contentWidth * scale;
+        const finalHeight = contentHeight * scale;
+
+        wrapper.style.left = `${
+          safeMargin + Math.max(0, (usableWidth - finalWidth) / 2)
+        }px`;
+
+        wrapper.style.top = `${
+          safeMargin + Math.max(0, (usableHeight - finalHeight) / 2)
+        }px`;
+
+        wrapper.style.transform = `scale(${scale})`;
+      },
+      { pageWidth, pageHeight, safeMargin }
     );
 
     await page.addStyleTag({
       content: `
         @page {
           size: A4 portrait;
-          margin: 8mm;
+          margin: 0;
         }
 
-        html, body {
+        html,
+        body {
+          width: 210mm !important;
+          height: 297mm !important;
           margin: 0 !important;
           padding: 0 !important;
-        }
-
-        body {
-          transform: scale(${fitScale});
-          transform-origin: top left;
-          width: ${100 / fitScale}%;
+          overflow: hidden !important;
         }
       `,
     });
 
     return Buffer.from(
       await page.pdf({
-        format: 'A4',
+        width: '210mm',
+        height: '297mm',
         printBackground: true,
         preferCSSPageSize: true,
         pageRanges: '1',
         margin: {
-          top: '8mm',
-          right: '8mm',
-          bottom: '8mm',
-          left: '8mm',
+          top: '0mm',
+          right: '0mm',
+          bottom: '0mm',
+          left: '0mm',
         },
       })
     );
@@ -311,23 +451,12 @@ async function htmlToDocxBuffer(
 ): Promise<Buffer> {
   const rendered = await renderHtmlWithLinks(html);
 
-  // Single A4-style portrait page.
-  // Fit the complete rendered HTML proportionally inside the page.
-  const pageWidthPx = 690;
-  const pageHeightPx = 975;
-
-  const scale = Math.min(
-    pageWidthPx / rendered.width,
-    pageHeightPx / rendered.height
-  );
-
-  const targetWidth = Math.max(
-    1,
-    Math.round(rendered.width * scale)
-  );
-  const targetHeight = Math.max(
-    1,
-    Math.round(rendered.height * scale)
+  // A4 page with very small margins.
+  // The source PNG is already exactly A4-shaped and high resolution,
+  // so use nearly the entire Word page without another fit calculation.
+  const imageWidth = 780;
+  const imageHeight = Math.round(
+    imageWidth * (rendered.height / rendered.width)
   );
 
   const children: Paragraph[] = [
@@ -336,49 +465,20 @@ async function htmlToDocxBuffer(
       spacing: {
         before: 0,
         after: 0,
+        line: 1,
       },
       children: [
         new ImageRun({
           data: rendered.png,
           transformation: {
-            width: targetWidth,
-            height: targetHeight,
+            width: imageWidth,
+            height: imageHeight,
           },
           type: 'png',
         }),
       ],
     }),
   ];
-
-  // Keep detected hyperlinks available in the document.
-  // DOCX does not support reliable transparent positional overlays via this library,
-  // so clickable links remain as a compact strip below the rendered content when space allows.
-  if (rendered.links.length) {
-    children.push(
-      new Paragraph({
-        alignment: 'center',
-        spacing: {
-          before: 80,
-          after: 0,
-        },
-        children: rendered.links.map(
-          (link, index) =>
-            new ExternalHyperlink({
-              link: link.href,
-              children: [
-                new TextRun({
-                  text:
-                    index === 0
-                      ? 'Open linked content'
-                      : ` | Link ${index + 1}`,
-                  style: 'Hyperlink',
-                }),
-              ],
-            })
-        ),
-      })
-    );
-  }
 
   const doc = new Document({
     sections: [
@@ -391,10 +491,10 @@ async function htmlToDocxBuffer(
               height: 16838,
             },
             margin: {
-              top: 240,
-              right: 240,
-              bottom: 240,
-              left: 240,
+              top: 80,
+              right: 80,
+              bottom: 80,
+              left: 80,
             },
           },
         },
@@ -423,46 +523,47 @@ async function htmlToPptxBuffer(
   const slideW = 8.27;
   const slideH = 11.69;
 
-  const scale = Math.min(
-    slideW / rendered.width,
-    slideH / rendered.height
-  );
-
-  const imageW = rendered.width * scale;
-  const imageH = rendered.height * scale;
-  const imageX = (slideW - imageW) / 2;
-  const imageY = (slideH - imageH) / 2;
-
   const slide = pptx.addSlide();
 
+  // The rendered PNG already has the exact A4 aspect ratio.
+  // Fill the full portrait slide without any extra letterboxing.
   slide.addImage({
     data:
       `data:image/png;base64,${rendered.png.toString('base64')}`,
-    x: imageX,
-    y: imageY,
-    w: imageW,
-    h: imageH,
+    x: 0,
+    y: 0,
+    w: slideW,
+    h: slideH,
   });
 
-  // Preserve clickable positions relative to the fitted image.
+  // Link bounds are already measured after the A4 scaling.
   for (const link of rendered.links) {
     const x =
-      imageX + (link.x / rendered.width) * imageW;
+      (link.x / rendered.width) * slideW;
+
     const y =
-      imageY + (link.y / rendered.height) * imageH;
+      (link.y / rendered.height) * slideH;
+
     const w =
-      (link.width / rendered.width) * imageW;
+      (link.width / rendered.width) * slideW;
+
     const h =
-      (link.height / rendered.height) * imageH;
+      (link.height / rendered.height) * slideH;
 
     slide.addShape(pptx.ShapeType.rect, {
       x,
       y,
       w,
       h,
-      line: { transparency: 100 },
-      fill: { transparency: 100 },
-      hyperlink: { url: link.href },
+      line: {
+        transparency: 100,
+      },
+      fill: {
+        transparency: 100,
+      },
+      hyperlink: {
+        url: link.href,
+      },
     });
   }
 
