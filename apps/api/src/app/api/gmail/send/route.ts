@@ -213,123 +213,103 @@ async function renderHtmlToPng(
 async function htmlToPdfBuffer(
   html: string
 ): Promise<Buffer> {
+  // Reuse the exact same A4 high-resolution render used by PPTX/DOCX.
+  // This guarantees that the PDF shows the full document both vertically
+  // and horizontally instead of applying a second independent scale.
+  const rendered = await renderHtmlWithLinks(html);
+
   const browser = await chromium.launch({
     headless: true,
   });
 
-  const pageWidth = 1240;
-  const pageHeight = 1754;
-  const safeMargin = 20;
-
   try {
     const page = await browser.newPage({
       viewport: {
-        width: pageWidth,
-        height: pageHeight,
+        width: rendered.width,
+        height: rendered.height,
       },
       deviceScaleFactor: 1,
     });
 
-    await page.setContent(html, {
-      waitUntil: 'networkidle',
-      timeout: 60000,
-    });
+    const imageDataUri =
+      `data:image/png;base64,${rendered.png.toString('base64')}`;
 
-    await page.waitForTimeout(900);
+    const linkOverlays = rendered.links
+      .map((link) => {
+        const safeHref = link.href
+          .replace(/&/g, '&amp;')
+          .replace(/"/g, '&quot;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;');
 
-    await page.evaluate(
-      ({ pageWidth, pageHeight, safeMargin }) => {
-        const body = document.body;
-        const htmlElement = document.documentElement;
+        return `
+          <a
+            href="${safeHref}"
+            style="
+              position:absolute;
+              left:${link.x}px;
+              top:${link.y}px;
+              width:${link.width}px;
+              height:${link.height}px;
+              display:block;
+              opacity:0.001;
+              z-index:10;
+              text-decoration:none;
+            "
+          >&nbsp;</a>
+        `;
+      })
+      .join('\n');
 
-        if (!body) return;
+    await page.setContent(
+      `
+      <html>
+        <head>
+          <style>
+            @page {
+              size: A4 portrait;
+              margin: 0;
+            }
 
-        let wrapper = document.getElementById('__3d_suite_a4_pdf');
+            html,
+            body {
+              margin: 0;
+              padding: 0;
+              width: ${rendered.width}px;
+              height: ${rendered.height}px;
+              overflow: hidden;
+              background: white;
+            }
 
-        if (!wrapper) {
-          wrapper = document.createElement('div');
-          wrapper.id = '__3d_suite_a4_pdf';
+            #page {
+              position: relative;
+              width: ${rendered.width}px;
+              height: ${rendered.height}px;
+            }
 
-          while (body.firstChild) {
-            wrapper.appendChild(body.firstChild);
-          }
-
-          body.appendChild(wrapper);
-        }
-
-        htmlElement.style.margin = '0';
-        htmlElement.style.padding = '0';
-
-        body.style.margin = '0';
-        body.style.padding = '0';
-        body.style.width = `${pageWidth}px`;
-        body.style.height = `${pageHeight}px`;
-        body.style.position = 'relative';
-        body.style.overflow = 'hidden';
-
-        wrapper.style.position = 'absolute';
-        wrapper.style.left = '0';
-        wrapper.style.top = '0';
-        wrapper.style.transformOrigin = 'top left';
-        wrapper.style.transform = 'none';
-        wrapper.style.width = 'max-content';
-        wrapper.style.maxWidth = 'none';
-
-        const rect = wrapper.getBoundingClientRect();
-
-        const contentWidth = Math.max(
-          rect.width,
-          wrapper.scrollWidth,
-          1
-        );
-
-        const contentHeight = Math.max(
-          rect.height,
-          wrapper.scrollHeight,
-          1
-        );
-
-        const usableWidth = pageWidth - safeMargin * 2;
-        const usableHeight = pageHeight - safeMargin * 2;
-
-        const scale = Math.min(
-          usableWidth / contentWidth,
-          usableHeight / contentHeight
-        );
-
-        const finalWidth = contentWidth * scale;
-        const finalHeight = contentHeight * scale;
-
-        wrapper.style.left = `${
-          safeMargin + Math.max(0, (usableWidth - finalWidth) / 2)
-        }px`;
-
-        wrapper.style.top = `${
-          safeMargin + Math.max(0, (usableHeight - finalHeight) / 2)
-        }px`;
-
-        wrapper.style.transform = `scale(${scale})`;
-      },
-      { pageWidth, pageHeight, safeMargin }
+            #page-image {
+              position: absolute;
+              inset: 0;
+              width: ${rendered.width}px;
+              height: ${rendered.height}px;
+              display: block;
+            }
+          </style>
+        </head>
+        <body>
+          <div id="page">
+            <img id="page-image" src="${imageDataUri}" />
+            ${linkOverlays}
+          </div>
+        </body>
+      </html>
+      `,
+      {
+        waitUntil: 'load',
+      }
     );
 
-    await page.addStyleTag({
-      content: `
-        @page {
-          size: A4 portrait;
-          margin: 0;
-        }
-
-        html,
-        body {
-          width: 210mm !important;
-          height: 297mm !important;
-          margin: 0 !important;
-          padding: 0 !important;
-          overflow: hidden !important;
-        }
-      `,
-    });
+    await page.waitForTimeout(200);
 
     return Buffer.from(
       await page.pdf({
