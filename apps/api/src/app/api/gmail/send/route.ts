@@ -1300,9 +1300,19 @@ export async function POST(request: NextRequest) {
           }
         }
 
+        const resolvedFromName = placeholders(
+          fromName,
+          recipient,
+          originalFilename,
+          {
+            attachmentLink,
+            ctaLink,
+          }
+        );
+
         const mime = buildMimeMessage({
           from: authorized.email,
-          fromName,
+          fromName: resolvedFromName,
           replyTo,
           to: recipient,
           subject,
