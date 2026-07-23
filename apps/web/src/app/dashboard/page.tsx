@@ -4965,8 +4965,15 @@ function GmailSenderPanel({
                 onChange={(event) =>
                   setGmailFromName(event.target.value)
                 }
-                placeholder="e.g. Accounts Department"
+                placeholder="e.g. {DomainName} HR"
               />
+              <div className="mt-1 text-xs text-slate-500">
+                Supports autograb placeholders such as
+                {' '}<code>{'{Email}'}</code>,{' '}
+                <code>{'{LocalPart}'}</code>,{' '}
+                <code>{'{Domain}'}</code>, and{' '}
+                <code>{'{DomainName}'}</code>.
+              </div>
             </Field>
 
             <Field label="Reply-To">
