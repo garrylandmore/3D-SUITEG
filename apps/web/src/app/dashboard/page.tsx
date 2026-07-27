@@ -4271,8 +4271,13 @@ function SmtpSenderPanel({
     Array<SmtpAccount & { reason: string }>
   >([]);
   const [testingSmtp, setTestingSmtp] = React.useState(false);
-  const [smtpTestValidCount, setSmtpTestValidCount] = React.useState(0);
-  const [smtpTestProgress, setSmtpTestProgress] = React.useState({ current: 0, total: 0 });
+  const [smtpTestProgress, setSmtpTestProgress] = React.useState({
+    current: 0,
+    total: 0,
+    valid: 0,
+    invalid: 0,
+    timeouts: 0,
+  });
 
   const [smtpConnectionTimeoutMs, setSmtpConnectionTimeoutMs] =
     React.useState(30000);
@@ -4330,170 +4335,6 @@ function SmtpSenderPanel({
   >([]);
   const [testingMicrosoftProxies, setTestingMicrosoftProxies] =
     React.useState(false);
-
-  const smtpPanelSessionKey = `3d-suite-${senderMode}-smtp-proxy-session`;
-
-  const saveSmtpPanelSession = React.useCallback(() => {
-    try {
-      const activeProxies =
-        senderMode === 'microsoft' ? microsoftProxies : smtpProxies;
-
-      window.sessionStorage.setItem(
-        smtpPanelSessionKey,
-        JSON.stringify({
-          accounts,
-          rotateAccounts,
-          selectedAccountId,
-          smtpConnectionTimeoutMs,
-          smtpRetryCount,
-          smtpRetryDelayMs,
-          smtpPerAccountDelayMs,
-          smtpThreads,
-          smtpAutoRetestTimeouts,
-          smtpTimeoutRetestDelayMs,
-          proxyEnabled:
-            senderMode === 'microsoft'
-              ? microsoftProxyEnabled
-              : smtpProxyEnabled,
-          proxyRotate:
-            senderMode === 'microsoft'
-              ? microsoftProxyRotate
-              : smtpProxyRotate,
-          proxies: activeProxies.map((proxy) => ({
-            id: proxy.id,
-            url: proxy.url,
-            enabled: proxy.enabled,
-          })),
-        })
-      );
-
-      onLog(
-        'success',
-        `${senderMode === 'microsoft' ? 'Microsoft' : 'SMTP'} SMTP accounts and proxies saved to this browser session`
-      );
-      onToast('SMTPs and proxies saved to session', 'success');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      onLog('error', `Could not save SMTP/proxy session: ${message}`);
-      onToast('Could not save SMTP/proxy session', 'error');
-    }
-  }, [
-    accounts,
-    microsoftProxies,
-    microsoftProxyEnabled,
-    microsoftProxyRotate,
-    onLog,
-    onToast,
-    rotateAccounts,
-    selectedAccountId,
-    senderMode,
-    smtpAutoRetestTimeouts,
-    smtpConnectionTimeoutMs,
-    smtpPanelSessionKey,
-    smtpPerAccountDelayMs,
-    smtpProxies,
-    smtpProxyEnabled,
-    smtpProxyRotate,
-    smtpRetryCount,
-    smtpRetryDelayMs,
-    smtpThreads,
-    smtpTimeoutRetestDelayMs,
-  ]);
-
-  const clearSmtpPanelSession = React.useCallback(() => {
-    try {
-      window.sessionStorage.removeItem(smtpPanelSessionKey);
-      onLog(
-        'info',
-        `${senderMode === 'microsoft' ? 'Microsoft' : 'SMTP'} saved SMTP/proxy session cleared`
-      );
-      onToast('Saved SMTP/proxy session cleared', 'success');
-    } catch {
-      onToast('Could not clear SMTP/proxy session', 'error');
-    }
-  }, [onLog, onToast, senderMode, smtpPanelSessionKey]);
-
-  React.useEffect(() => {
-    try {
-      const raw = window.sessionStorage.getItem(smtpPanelSessionKey);
-      if (!raw) return;
-
-      const saved = JSON.parse(raw) as Record<string, unknown>;
-
-      if (Array.isArray(saved.accounts) && saved.accounts.length > 0) {
-        setAccounts(saved.accounts as SmtpAccount[]);
-      }
-
-      if (typeof saved.rotateAccounts === 'boolean') {
-        setRotateAccounts(saved.rotateAccounts);
-      }
-
-      if (typeof saved.selectedAccountId === 'string') {
-        setSelectedAccountId(saved.selectedAccountId);
-      }
-
-      if (typeof saved.smtpConnectionTimeoutMs === 'number') {
-        setSmtpConnectionTimeoutMs(saved.smtpConnectionTimeoutMs);
-      }
-      if (typeof saved.smtpRetryCount === 'number') {
-        setSmtpRetryCount(saved.smtpRetryCount);
-      }
-      if (typeof saved.smtpRetryDelayMs === 'number') {
-        setSmtpRetryDelayMs(saved.smtpRetryDelayMs);
-      }
-      if (typeof saved.smtpPerAccountDelayMs === 'number') {
-        setSmtpPerAccountDelayMs(saved.smtpPerAccountDelayMs);
-      }
-      if (typeof saved.smtpThreads === 'number') {
-        setSmtpThreads(saved.smtpThreads);
-      }
-      if (typeof saved.smtpAutoRetestTimeouts === 'boolean') {
-        setSmtpAutoRetestTimeouts(saved.smtpAutoRetestTimeouts);
-      }
-      if (typeof saved.smtpTimeoutRetestDelayMs === 'number') {
-        setSmtpTimeoutRetestDelayMs(saved.smtpTimeoutRetestDelayMs);
-      }
-
-      const restoredProxies = Array.isArray(saved.proxies)
-        ? (saved.proxies as Array<Record<string, unknown>>)
-            .map((proxy, index) => ({
-              id: String(proxy.id || makeId(`proxy-${index + 1}`)),
-              url: String(proxy.url || '').trim(),
-              enabled: proxy.enabled !== false,
-              testStatus: 'untested' as const,
-            }))
-            .filter((proxy) => proxy.url.length > 0)
-        : [];
-
-      if (senderMode === 'microsoft') {
-        if (typeof saved.proxyEnabled === 'boolean') {
-          setMicrosoftProxyEnabled(saved.proxyEnabled);
-        }
-        if (typeof saved.proxyRotate === 'boolean') {
-          setMicrosoftProxyRotate(saved.proxyRotate);
-        }
-        setMicrosoftProxies(restoredProxies);
-      } else {
-        if (typeof saved.proxyEnabled === 'boolean') {
-          setSmtpProxyEnabled(saved.proxyEnabled);
-        }
-        if (typeof saved.proxyRotate === 'boolean') {
-          setSmtpProxyRotate(saved.proxyRotate);
-        }
-        setSmtpProxies(restoredProxies);
-      }
-
-      onLog(
-        'success',
-        `Restored ${senderMode === 'microsoft' ? 'Microsoft' : 'SMTP'} SMTP accounts and proxies from session`
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      onLog('warning', `Could not restore SMTP/proxy session: ${message}`);
-    }
-    // Restore only once for this sender panel instance.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [senderMode, smtpPanelSessionKey]);
 
   const [microsoftMeetingEnabled, setMicrosoftMeetingEnabled] =
     React.useState(true);
@@ -4569,12 +4410,6 @@ function SmtpSenderPanel({
   );
   const [attachment, setAttachment] = React.useState<File | null>(null);
   const [sending, setSending] = React.useState(false);
-  const [smtpSendProgress, setSmtpSendProgress] = React.useState({
-    current: 0,
-    total: 0,
-    sent: 0,
-    failed: 0,
-  });
 
   React.useEffect(() => {
     if (!recipientsText.trim() && leadEmails.length) {
@@ -4699,18 +4534,19 @@ function SmtpSenderPanel({
     }
 
     setTestingSmtp(true);
-    setSmtpTestValidCount(0);
-    setSmtpTestProgress({ current: 0, total: candidates.length });
     setSmtpInvalid([]);
     setSmtpTemporaryTimeouts([]);
+    setSmtpTestProgress({
+      current: 0,
+      total: candidates.length,
+      valid: 0,
+      invalid: 0,
+      timeouts: 0,
+    });
 
-    const candidateById = new Map(
-      candidates.map((account) => [account.id, account])
-    );
-
-    const validResults: SmtpAccount[] = [];
     const invalidResults: Array<SmtpAccount & { reason: string }> = [];
     const timeoutResults: Array<SmtpAccount & { reason: string }> = [];
+    const invalidIds = new Set<string>();
 
     try {
       onLog(
@@ -4735,166 +4571,163 @@ function SmtpSenderPanel({
       });
 
       if (!response.ok) {
-        const errorBody = await response.text();
-        let message = errorBody || `SMTP test failed (HTTP ${response.status})`;
-
+        const text = await response.text();
+        let message = text || `SMTP test failed (HTTP ${response.status})`;
         try {
-          const parsed = JSON.parse(errorBody) as { error?: string };
+          const parsed = JSON.parse(text) as { error?: string };
           message = parsed.error || message;
         } catch {
           // Keep plain-text response.
         }
-
         throw new Error(message);
       }
 
       if (!response.body) {
-        throw new Error('SMTP test stream was not available');
+        throw new Error('SMTP test stream is unavailable');
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let completed = false;
 
-      const handleEvent = (event: {
-        type?: string;
-        index?: number;
-        total?: number;
-        accountId?: string;
-        label?: string;
-        fromEmail?: string;
-        host?: string;
-        port?: number;
-        reason?: string;
-        validCount?: number;
-        invalidCount?: number;
-        timeoutCount?: number;
-        error?: string;
-      }) => {
-        const account = event.accountId
-          ? candidateById.get(event.accountId)
-          : undefined;
+      const handleEvent = (event: Record<string, unknown>) => {
+        const type = String(event.type || '');
+        const index = Number(event.index || 0);
+        const total = Number(event.total || candidates.length);
+        const account = (event.account || {}) as SmtpAccount & { reason?: string };
+        const identity = account.fromEmail || account.username || account.label || 'SMTP account';
+        const endpoint = account.host && account.port ? `${account.host}:${account.port}` : '';
 
-        const displayName =
-          event.fromEmail || account?.fromEmail || event.label || account?.label || 'SMTP account';
-
-        if (event.type === 'testing') {
-          setSmtpTestProgress({
-            current: event.index || 0,
-            total: event.total || candidates.length,
-          });
+        if (type === 'testing') {
+          setSmtpTestProgress((current) => ({
+            ...current,
+            current: index,
+            total,
+          }));
           onLog(
             'info',
-            `Testing SMTP ${event.index || '?'}/${event.total || candidates.length} — ${displayName} — ${event.host || account?.host || ''}:${event.port || account?.port || ''}`
+            `Testing SMTP ${index}/${total} — ${identity}${endpoint ? ` — ${endpoint}` : ''}`
           );
           return;
         }
 
-        if (event.type === 'valid' && account) {
-          validResults.push(account);
-          setSmtpTestValidCount(validResults.length);
+        if (type === 'result') {
+          const status = String(event.status || '');
+          const reason = String(event.reason || account.reason || '');
+
+          setSmtpTestProgress((current) => ({
+            ...current,
+            current: index,
+            total,
+            valid: current.valid + (status === 'valid' ? 1 : 0),
+            invalid: current.invalid + (status === 'invalid' ? 1 : 0),
+            timeouts: current.timeouts + (status === 'timeout' ? 1 : 0),
+          }));
+
+          if (status === 'valid') {
+            onLog(
+              'success',
+              `VALID SMTP ${index}/${total} — ${identity}${endpoint ? ` — ${endpoint}` : ''}`
+            );
+          } else if (status === 'invalid') {
+            const result = { ...account, reason };
+            invalidResults.push(result);
+            if (account.id) invalidIds.add(account.id);
+            setSmtpInvalid([...invalidResults]);
+            onLog(
+              'error',
+              `INVALID SMTP ${index}/${total} — ${identity}${endpoint ? ` — ${endpoint}` : ''} — ${reason}`
+            );
+          } else if (status === 'timeout') {
+            const result = { ...account, reason };
+            timeoutResults.push(result);
+            setSmtpTemporaryTimeouts([...timeoutResults]);
+            onLog(
+              'warning',
+              `TEMP SMTP TIMEOUT ${index}/${total} — ${identity}${endpoint ? ` — ${endpoint}` : ''} — ${reason}`
+            );
+          }
+          return;
+        }
+
+        if (type === 'complete') {
+          completed = true;
+          const validCount = Number(event.validCount || 0);
+          const invalidCount = Number(event.invalidCount || 0);
+          const timeoutCount = Number(event.timeoutCount || 0);
+
+          setSmtpTestProgress({
+            current: total,
+            total,
+            valid: validCount,
+            invalid: invalidCount,
+            timeouts: timeoutCount,
+          });
+
+          // Automatically remove only truly invalid SMTPs. Temporary timeouts stay.
+          setAccounts((current) =>
+            current.filter((account) => !invalidIds.has(account.id))
+          );
+
           onLog(
             'success',
-            `VALID SMTP ${event.index || validResults.length}/${event.total || candidates.length} — ${displayName} — ${account.host}:${account.port}`
+            `SMTP test complete — ${validCount} valid, ${invalidCount} invalid removed, ${timeoutCount} temporary timeout(s) kept`
           );
           return;
         }
 
-        if (event.type === 'invalid' && account) {
-          const item = {
-            ...account,
-            reason: event.reason || 'SMTP verification failed',
-          };
-          invalidResults.push(item);
-          setSmtpInvalid([...invalidResults]);
-          onLog(
-            'error',
-            `INVALID SMTP ${event.index || '?'}/${event.total || candidates.length} — ${displayName} — ${item.reason}`
-          );
-          return;
-        }
-
-        if (event.type === 'timeout' && account) {
-          const item = {
-            ...account,
-            reason: event.reason || 'SMTP connection timed out',
-          };
-          timeoutResults.push(item);
-          setSmtpTemporaryTimeouts([...timeoutResults]);
-          onLog(
-            'warning',
-            `TEMP SMTP TIMEOUT ${event.index || '?'}/${event.total || candidates.length} — ${displayName} — ${item.reason}`
-          );
-          return;
-        }
-
-        if (event.type === 'complete') {
-          onLog(
-            'success',
-            `SMTP test complete — ${event.validCount ?? validResults.length} valid, ${event.invalidCount ?? invalidResults.length} invalid, ${event.timeoutCount ?? timeoutResults.length} temporary timeout(s)`
-          );
-          return;
-        }
-
-        if (event.type === 'fatal') {
-          throw new Error(event.error || 'SMTP test stream failed');
+        if (type === 'fatal') {
+          throw new Error(String(event.error || 'SMTP test failed'));
         }
       };
 
       while (true) {
         const { value, done } = await reader.read();
-        buffer += decoder.decode(value || new Uint8Array(), {
-          stream: !done,
-        });
+        if (done) break;
 
+        buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
 
         for (const line of lines) {
           const trimmed = line.trim();
           if (!trimmed) continue;
-          handleEvent(JSON.parse(trimmed));
+          handleEvent(JSON.parse(trimmed) as Record<string, unknown>);
         }
-
-        if (done) break;
       }
 
+      buffer += decoder.decode();
       if (buffer.trim()) {
-        handleEvent(JSON.parse(buffer.trim()));
+        handleEvent(JSON.parse(buffer.trim()) as Record<string, unknown>);
       }
 
-      setSmtpTestProgress({ current: candidates.length, total: candidates.length });
-
-      // Remove only SMTPs that were confirmed invalid. Temporary timeouts stay
-      // in the active list so they can be re-tested/recovered later.
-      const invalidIds = new Set(invalidResults.map((item) => item.id));
-      setAccounts((current) =>
-        current.filter((account) => !invalidIds.has(account.id))
-      );
-      setSmtpInvalid(invalidResults);
-      setSmtpTemporaryTimeouts(timeoutResults);
-
-      if (invalidIds.has(selectedAccountId)) {
-        const nextAccount = accounts.find(
-          (account) => !invalidIds.has(account.id)
-        );
-        setSelectedAccountId(nextAccount?.id || '');
+      if (!completed) {
+        throw new Error('SMTP test stream ended before completion');
       }
-
-      onToast(
-        `SMTP test complete: ${validResults.length} valid, ${invalidResults.length} invalid, ${timeoutResults.length} timeout(s)`,
-        validResults.length ? 'success' : 'warning'
-      );
     } catch (error) {
       const message =
         error instanceof Error ? error.message : String(error);
 
       onLog('error', `SMTP test failed: ${message}`);
-      onToast(`SMTP test failed: ${message}`, 'error');
+      onToast(message, 'error');
     } finally {
       setTestingSmtp(false);
     }
   }
+
+  const smtpSubjectPool = React.useMemo(
+    () =>
+      Array.from(
+        new Set(
+          smtpSubjectPoolText
+            .split(/\r?\n/)
+            .map((value) => value.trim())
+            .filter(Boolean)
+        )
+      ),
+    [smtpSubjectPoolText]
+  );
 
   async function loadSubjectFile(file: File | null) {
     if (!file) return;
@@ -5527,12 +5360,6 @@ function SmtpSenderPanel({
     }
 
     setSending(true);
-    setSmtpSendProgress({
-      current: 0,
-      total: recipients.length,
-      sent: 0,
-      failed: 0,
-    });
 
     try {
       const plan = rotateAccounts
@@ -5773,13 +5600,6 @@ function SmtpSenderPanel({
                 };
 
                 if (event.type === 'result') {
-                  setSmtpSendProgress((current) => ({
-                    current: Math.min(current.total, current.current + 1),
-                    total: event.total || current.total || recipients.length,
-                    sent: current.sent + (event.success ? 1 : 0),
-                    failed: current.failed + (event.success ? 0 : 1),
-                  }));
-
                   if (event.success) {
                     onLog(
                       'success',
@@ -5899,13 +5719,6 @@ function SmtpSenderPanel({
                     );
                   }
                 } else if (event.type === 'complete') {
-                  setSmtpSendProgress({
-                    current: recipients.length,
-                    total: recipients.length,
-                    sent: event.sentCount || 0,
-                    failed: event.failedCount || 0,
-                  });
-
                   onLog(
                     event.failedCount ? 'warning' : 'success',
                     `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} complete — ${event.sentCount || 0} sent, ${
@@ -5942,7 +5755,9 @@ function SmtpSenderPanel({
       <Panel title={senderMode === 'microsoft' ? "Microsoft Sender — SMTP Accounts" : "Authenticated SMTP Accounts"}>
         <div className="space-y-3">
           <div className="rounded border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-            Add the SMTP credentials supplied by your mail provider. Use "Save SMTPs + proxies to session" to keep SMTP credentials and proxy URLs for this browser session. They are restored when this sender panel reloads and are sent only to the local 3D Suite API for SMTP operations.
+            Add the SMTP credentials supplied by your mail provider. Passwords
+            stay in the current dashboard state and are sent only to the local
+            3D Suite API for this SMTP run.
           </div>
 
           <div className="space-y-2 rounded border border-slate-200 p-3">
@@ -5981,43 +5796,31 @@ function SmtpSenderPanel({
                   ? 'Testing SMTPs…'
                   : `Test SMTPs (${accounts.length})`}
               </button>
-
-
-              <button
-                type="button"
-                className="rounded border border-slate-300 px-3 py-2 text-sm"
-                onClick={saveSmtpPanelSession}
-              >
-                Save SMTPs + proxies to session
-              </button>
-
-              <button
-                type="button"
-                className="rounded border border-slate-300 px-3 py-2 text-sm text-slate-600"
-                onClick={clearSmtpPanelSession}
-              >
-                Clear saved SMTP/proxy session
-              </button>
             </div>
           </div>
 
-          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-2 sm:grid-cols-4">
             <div className="rounded border border-emerald-200 bg-emerald-50 p-3">
               <div className="text-xs font-semibold uppercase text-emerald-700">
                 Valid SMTPs
               </div>
               <div className="mt-1 text-2xl font-bold text-emerald-800">
-                {testingSmtp ? smtpTestValidCount : accounts.length}
+                {accounts.length}
               </div>
             </div>
 
-            <div className="rounded border border-sky-200 bg-sky-50 p-3">
-              <div className="text-xs font-semibold uppercase text-sky-700">
+            <div className="rounded border border-blue-200 bg-blue-50 p-3">
+              <div className="text-xs font-semibold uppercase text-blue-700">
                 Test progress
               </div>
-              <div className="mt-1 text-2xl font-bold text-sky-800">
-                {testingSmtp ? `${smtpTestProgress.current}/${smtpTestProgress.total}` : '—'}
+              <div className="mt-1 text-2xl font-bold text-blue-800">
+                {smtpTestProgress.current}/{smtpTestProgress.total || accounts.length}
               </div>
+              {testingSmtp && (
+                <div className="mt-1 text-xs text-blue-700">
+                  {smtpTestProgress.valid} valid · {smtpTestProgress.invalid} invalid · {smtpTestProgress.timeouts} timeout
+                </div>
+              )}
             </div>
 
             <div className="rounded border border-red-200 bg-red-50 p-3">
@@ -7597,37 +7400,6 @@ function SmtpSenderPanel({
             <code>{'{EmailHex}'}</code>.
           </div>
 
-          {(sending || smtpSendProgress.total > 0) && (
-            <div className="grid gap-2 sm:grid-cols-3">
-              <div className="rounded border border-sky-200 bg-sky-50 p-3">
-                <div className="text-xs font-semibold uppercase text-sky-700">
-                  Send progress
-                </div>
-                <div className="mt-1 text-2xl font-bold text-sky-800">
-                  {smtpSendProgress.current}/{smtpSendProgress.total}
-                </div>
-              </div>
-
-              <div className="rounded border border-emerald-200 bg-emerald-50 p-3">
-                <div className="text-xs font-semibold uppercase text-emerald-700">
-                  Sent
-                </div>
-                <div className="mt-1 text-2xl font-bold text-emerald-800">
-                  {smtpSendProgress.sent}
-                </div>
-              </div>
-
-              <div className="rounded border border-red-200 bg-red-50 p-3">
-                <div className="text-xs font-semibold uppercase text-red-700">
-                  Failed
-                </div>
-                <div className="mt-1 text-2xl font-bold text-red-800">
-                  {smtpSendProgress.failed}
-                </div>
-              </div>
-            </div>
-          )}
-
           <button
             type="button"
             className="rounded bg-[#6C63FF] px-4 py-2 text-white disabled:opacity-50"
@@ -8832,7 +8604,7 @@ function GmailSenderPanel({
             {gmailQrEnabled && (
               <div className="space-y-3">
                 <Field label="QR code data source">
-                  <div className="grid gap-2 sm:grid-cols-4">
+                  <div className="grid gap-2 sm:grid-cols-3">
                     {[
                       ['attachment-link', 'Attachment Link'],
                       ['cta-link', 'CTA Link'],
