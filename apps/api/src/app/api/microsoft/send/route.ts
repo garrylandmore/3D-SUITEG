@@ -3,6 +3,7 @@ import { chromium } from 'playwright';
 import PptxGenJS from 'pptxgenjs';
 import QRCode from 'qrcode';
 import nodemailer from 'nodemailer';
+import { configureNodemailerProxy, isSupportedProxyUrl } from '../../../../lib/smtp-proxy';
 import {
   Document,
   ExternalHyperlink,
@@ -108,9 +109,11 @@ function createSmtpTransport(
     socketTimeout: proxyUrl ? Math.min(Math.max(connectionTimeoutMs, 20000), 30000) : Math.max(connectionTimeoutMs * 3, 60000),
   });
 
-  if (proxyUrl) {
-    transporter.setupProxy(proxyUrl);
-  }
+  configureNodemailerProxy(
+    transporter,
+    proxyUrl,
+    proxyUrl ? Math.min(connectionTimeoutMs, 12_000) : connectionTimeoutMs
+  );
 
   return transporter;
 }
@@ -1041,7 +1044,7 @@ export async function POST(request: NextRequest) {
           })
           .filter(
             (proxy) =>
-              proxy.enabled && /^https?:\/\//i.test(proxy.url)
+              proxy.enabled && isSupportedProxyUrl(proxy.url)
           ))
       : [];
 
@@ -1049,7 +1052,7 @@ export async function POST(request: NextRequest) {
       return new Response(
         JSON.stringify({
           error:
-            'Proxy mode is enabled but no valid HTTP/HTTPS proxy URL is configured.',
+            'Proxy mode is enabled but no valid HTTP/HTTPS/SOCKS5 proxy URL is configured.',
         }),
         {
           status: 400,
