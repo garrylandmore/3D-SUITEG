@@ -1209,9 +1209,52 @@ export async function POST(request: NextRequest) {
       String(formData.get('onBehalfEnabled') || 'false') ===
       'true';
 
-    const onBehalfFromEmail = String(
-      formData.get('onBehalfFromEmail') || ''
-    ).trim();
+    const onBehalfRandomize =
+      String(formData.get('onBehalfRandomize') || 'false') ===
+      'true';
+
+    const parseStringList = (raw: FormDataEntryValue | null) => {
+      try {
+        const parsed = JSON.parse(String(raw || '[]')) as unknown[];
+        return Array.from(
+          new Set(
+            parsed
+              .map((item) => String(item || '').trim())
+              .filter(Boolean)
+          )
+        );
+      } catch {
+        return [];
+      }
+    };
+
+    const onBehalfDisplayNames = parseStringList(
+      formData.get('onBehalfDisplayNames')
+    );
+
+    const onBehalfPrefixes = parseStringList(
+      formData.get('onBehalfPrefixes')
+    )
+      .map((prefix) => prefix.replace(/^@+/, ''))
+      .filter((prefix) =>
+        /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(prefix)
+      );
+
+    if (
+      onBehalfEnabled &&
+      (!onBehalfDisplayNames.length || !onBehalfPrefixes.length)
+    ) {
+      return new Response(
+        JSON.stringify({
+          error:
+            'Send on behalf is enabled but no valid display name/prefix is configured.',
+        }),
+        {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+    }
 
     const subjectTemplate = String(
       formData.get('subjectTemplate') || ''
@@ -1769,14 +1812,78 @@ export async function POST(request: NextRequest) {
               );
 
               let finalFromEmail = account.fromEmail;
+              let finalFromName = resolvedFromName;
 
               if (onBehalfEnabled) {
+                const authenticatedDomain =
+                  account.fromEmail
+                    .split('@')[1]
+                    ?.trim()
+                    .toLowerCase() || '';
+
+                if (!authenticatedDomain) {
+                  throw new Error(
+                    `${account.label}: authenticated From address has no valid domain.`
+                  );
+                }
+
+                const displayNameTemplate = onBehalfRandomize
+                  ? onBehalfDisplayNames[
+                      Math.floor(
+                        Math.random() * onBehalfDisplayNames.length
+                      )
+                    ]
+                  : onBehalfDisplayNames[0];
+
+                const prefixTemplate = onBehalfRandomize
+                  ? onBehalfPrefixes[
+                      Math.floor(Math.random() * onBehalfPrefixes.length)
+                    ]
+                  : onBehalfPrefixes[0];
+
+                const resolvedOnBehalfDisplayName = placeholders(
+                  displayNameTemplate,
+                  recipient,
+                  originalFilename,
+                  {
+                    attachmentLink: resolvedAttachmentLink,
+                    ctaLink: resolvedCtaLink,
+                  }
+                ).trim();
+
+                const resolvedPrefix = placeholders(
+                  prefixTemplate,
+                  recipient,
+                  originalFilename,
+                  {
+                    attachmentLink: resolvedAttachmentLink,
+                    ctaLink: resolvedCtaLink,
+                  }
+                )
+                  .trim()
+                  .replace(/^@+/, '');
+
+                if (
+                  !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(
+                    resolvedPrefix
+                  )
+                ) {
+                  throw new Error(
+                    `Invalid on-behalf prefix "${resolvedPrefix}".`
+                  );
+                }
+
+                const generatedAlias =
+                  `${resolvedPrefix}@${authenticatedDomain}`;
+
                 validateOnBehalfAlias(
                   account.fromEmail,
-                  onBehalfFromEmail
+                  generatedAlias
                 );
 
-                finalFromEmail = onBehalfFromEmail;
+                finalFromEmail = generatedAlias;
+                finalFromName =
+                  resolvedOnBehalfDisplayName || resolvedFromName;
               }
 
               const resolvedMeetingTitle = placeholders(
@@ -2093,9 +2200,9 @@ export async function POST(request: NextRequest) {
               );
 
               const info = await transporter.sendMail({
-                from: resolvedFromName
+                from: finalFromName
                   ? {
-                      name: resolvedFromName,
+                      name: finalFromName,
                       address: finalFromEmail,
                     }
                   : finalFromEmail,
