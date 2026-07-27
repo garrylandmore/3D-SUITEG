@@ -62,8 +62,8 @@ function classifyError(error: unknown): {
   };
 }
 
-function createTransport(account: SmtpAccount) {
-  return nodemailer.createTransport({
+function createTransport(account: SmtpAccount, proxyUrl?: string) {
+  const transporter = nodemailer.createTransport({
     host: account.host,
     port: account.port,
     secure: account.security === 'ssl',
@@ -77,6 +77,12 @@ function createTransport(account: SmtpAccount) {
     greetingTimeout: 20_000,
     socketTimeout: 30_000,
   });
+
+  if (proxyUrl) {
+    transporter.setupProxy(proxyUrl);
+  }
+
+  return transporter;
 }
 
 export async function POST(request: NextRequest) {
@@ -85,6 +91,11 @@ export async function POST(request: NextRequest) {
     const accounts = Array.isArray(body.accounts)
       ? (body.accounts as SmtpAccount[])
       : [];
+    const proxyUrl =
+      typeof body.proxyUrl === 'string' &&
+      /^https?:\/\//i.test(body.proxyUrl)
+        ? body.proxyUrl
+        : undefined;
 
     const valid: SmtpAccount[] = [];
     const invalid: Array<SmtpAccount & { reason: string }> = [];
@@ -93,7 +104,7 @@ export async function POST(request: NextRequest) {
     > = [];
 
     for (const account of accounts) {
-      const transporter = createTransport(account);
+      const transporter = createTransport(account, proxyUrl);
 
       try {
         await transporter.verify();
