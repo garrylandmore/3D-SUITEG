@@ -4958,6 +4958,19 @@ function SmtpSenderPanel({
     }
   }
 
+  const smtpSubjectPool = React.useMemo(
+    () =>
+      Array.from(
+        new Set(
+          smtpSubjectPoolText
+            .split(/\r?\n/)
+            .map((value) => value.trim())
+            .filter(Boolean)
+        )
+      ),
+    [smtpSubjectPoolText]
+  );
+
   const smtpAttachmentLinkPool = React.useMemo(
     () =>
       Array.from(
