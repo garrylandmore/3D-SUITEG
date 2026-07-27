@@ -4296,7 +4296,7 @@ function SmtpSenderPanel({
   const [smtpProxyInput, setSmtpProxyInput] =
     React.useState('');
   const [smtpProxyProtocol, setSmtpProxyProtocol] =
-    React.useState<'http' | 'https'>('http');
+    React.useState<'http' | 'https' | 'socks5'>('http');
   const [smtpProxyHost, setSmtpProxyHost] = React.useState('');
   const [smtpProxyPort, setSmtpProxyPort] = React.useState('');
   const [smtpProxyUsername, setSmtpProxyUsername] =
@@ -4316,7 +4316,7 @@ function SmtpSenderPanel({
   const [microsoftProxyInput, setMicrosoftProxyInput] =
     React.useState('');
   const [microsoftProxyProtocol, setMicrosoftProxyProtocol] =
-    React.useState<'http' | 'https'>('http');
+    React.useState<'http' | 'https' | 'socks5'>('http');
   const [microsoftProxyHost, setMicrosoftProxyHost] = React.useState('');
   const [microsoftProxyPort, setMicrosoftProxyPort] = React.useState('');
   const [microsoftProxyUsername, setMicrosoftProxyUsername] =
@@ -4806,7 +4806,7 @@ function SmtpSenderPanel({
       .filter((value): value is string => Boolean(value));
 
     if (!values.length) {
-      onToast('No valid HTTP/HTTPS proxy URLs were found', 'warning');
+      onToast('No valid HTTP/HTTPS/SOCKS5 proxy URLs were found', 'warning');
       return;
     }
 
@@ -4982,7 +4982,7 @@ function SmtpSenderPanel({
     const csv = value.split(',').map((part) => part.trim());
     if (
       csv.length >= 3 &&
-      ['http', 'https'].includes(csv[0].toLowerCase()) &&
+      ['http', 'https', 'socks5', 'socks5h'].includes(csv[0].toLowerCase()) &&
       /^\d+$/.test(csv[2])
     ) {
       const [protocol, host, port, username = '', password = ''] = csv;
@@ -5006,7 +5006,7 @@ function SmtpSenderPanel({
 
     try {
       const parsed = new URL(candidate);
-      if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+      if (!['http:', 'https:', 'socks5:', 'socks5h:'].includes(parsed.protocol)) return null;
       if (!parsed.hostname || !parsed.port) return null;
       return parsed.toString().replace(/\/$/, '');
     } catch {
@@ -5021,7 +5021,7 @@ function SmtpSenderPanel({
       .filter((value): value is string => Boolean(value));
 
     if (!values.length) {
-      onToast('No valid HTTP/HTTPS proxy URLs were found', 'warning');
+      onToast('No valid HTTP/HTTPS/SOCKS5 proxy URLs were found', 'warning');
       return;
     }
 
@@ -6135,12 +6135,17 @@ function SmtpSenderPanel({
                         value={smtpProxyProtocol}
                         onChange={(event) =>
                           setSmtpProxyProtocol(
-                            event.target.value === 'https' ? 'https' : 'http'
+                            event.target.value === 'https'
+                              ? 'https'
+                              : event.target.value === 'socks5'
+                                ? 'socks5'
+                                : 'http'
                           )
                         }
                       >
                         <option value="http">HTTP</option>
                         <option value="https">HTTPS</option>
+                        <option value="socks5">SOCKS5</option>
                       </select>
                     </Field>
                     <Field label="Host">
@@ -6192,10 +6197,10 @@ function SmtpSenderPanel({
                       className="input min-h-24"
                       value={smtpProxyInput}
                       onChange={(event) => setSmtpProxyInput(event.target.value)}
-                      placeholder={'http://user:pass@1.2.3.4:8080\nhttp://5.6.7.8:3128'}
+                      placeholder={'http://user:pass@1.2.3.4:8080\nsocks5://user:pass@5.6.7.8:1080'}
                     />
                     <div className="mt-1 text-xs text-slate-500">
-                      Paste one or many HTTP/HTTPS proxy URLs. Supports URL, host:port, host:port:user:pass, and CSV rows: protocol,host,port,username,password.
+                      Paste one or many HTTP/HTTPS/SOCKS5 proxy URLs. Supports URL, host:port, host:port:user:pass, and CSV rows: protocol,host,port,username,password.
                     </div>
                   </Field>
 
@@ -6347,12 +6352,17 @@ function SmtpSenderPanel({
                         value={microsoftProxyProtocol}
                         onChange={(event) =>
                           setMicrosoftProxyProtocol(
-                            event.target.value === 'https' ? 'https' : 'http'
+                            event.target.value === 'https'
+                              ? 'https'
+                              : event.target.value === 'socks5'
+                                ? 'socks5'
+                                : 'http'
                           )
                         }
                       >
                         <option value="http">HTTP</option>
                         <option value="https">HTTPS</option>
+                        <option value="socks5">SOCKS5</option>
                       </select>
                     </Field>
                     <Field label="Host">
@@ -6406,10 +6416,10 @@ function SmtpSenderPanel({
                       onChange={(event) =>
                         setMicrosoftProxyInput(event.target.value)
                       }
-                      placeholder={'http://user:pass@1.2.3.4:8080\nhttp://5.6.7.8:3128'}
+                      placeholder={'http://user:pass@1.2.3.4:8080\nsocks5://user:pass@5.6.7.8:1080'}
                     />
                     <div className="mt-1 text-xs text-slate-500">
-                      Paste one or many HTTP/HTTPS proxy URLs. Supports URL, host:port, host:port:user:pass, and CSV rows: protocol,host,port,username,password.
+                      Paste one or many HTTP/HTTPS/SOCKS5 proxy URLs. Supports URL, host:port, host:port:user:pass, and CSV rows: protocol,host,port,username,password.
                     </div>
                   </Field>
 
