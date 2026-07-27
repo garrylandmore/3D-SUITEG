@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import nodemailer from 'nodemailer';
-import axios from 'axios';
-import net from 'node:net';
-import tls from 'node:tls';
-import type { Socket } from 'node:net';
+import {
+  configureNodemailerProxy,
+  createProxyTunnelSocket,
+  fetchIpWhoIsThroughProxy,
+  isSupportedProxyUrl,
+} from '../../../../lib/smtp-proxy';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -34,88 +36,6 @@ type ProxyTestResult = {
   smtpReason?: string;
 };
 
-function proxyAxiosConfig(proxyUrl: string) {
-  const parsed = new URL(proxyUrl);
-
-  if (!['http:', 'https:'].includes(parsed.protocol)) {
-    throw new Error('Only HTTP/HTTPS proxies are supported');
-  }
-
-  return {
-    protocol: parsed.protocol.replace(':', ''),
-    host: parsed.hostname,
-    port: Number(parsed.port),
-    ...(parsed.username
-      ? {
-          auth: {
-            username: decodeURIComponent(parsed.username),
-            password: decodeURIComponent(parsed.password),
-          },
-        }
-      : {}),
-  };
-}
-
-function proxyAuthorizationHeader(parsed: URL): string | undefined {
-  if (!parsed.username) return undefined;
-
-  const username = decodeURIComponent(parsed.username);
-  const password = decodeURIComponent(parsed.password || '');
-  const encoded = Buffer.from(`${username}:${password}`, 'utf8').toString('base64');
-  return `Basic ${encoded}`;
-}
-
-async function openProxySocket(parsed: URL, timeoutMs: number): Promise<Socket> {
-  const port = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
-
-  if (!parsed.hostname || !port) {
-    throw new Error('Proxy URL is missing host or port');
-  }
-
-  return await new Promise<Socket>((resolve, reject) => {
-    let settled = false;
-    let socket: Socket;
-
-    const fail = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      socket?.destroy();
-      reject(error);
-    };
-
-    const succeed = () => {
-      if (settled) return;
-      settled = true;
-      socket.setTimeout(0);
-      socket.removeListener('error', onError);
-      socket.removeListener('timeout', onTimeout);
-      resolve(socket);
-    };
-
-    const onError = (error: Error) => fail(error);
-    const onTimeout = () => fail(new Error(`Proxy connection timed out after ${timeoutMs} ms`));
-
-    if (parsed.protocol === 'https:') {
-      socket = tls.connect({
-        host: parsed.hostname,
-        port,
-        servername: parsed.hostname,
-      });
-      socket.once('secureConnect', succeed);
-    } else {
-      socket = net.connect({
-        host: parsed.hostname,
-        port,
-      });
-      socket.once('connect', succeed);
-    }
-
-    socket.setTimeout(timeoutMs);
-    socket.once('error', onError);
-    socket.once('timeout', onTimeout);
-  });
-}
-
 async function testSmtpTunnel(
   proxyUrl: string,
   smtpHost: string,
@@ -123,95 +43,15 @@ async function testSmtpTunnel(
   timeoutMs = 10_000
 ): Promise<{ ok: boolean; latencyMs: number; reason?: string }> {
   const started = Date.now();
-  let socket: Socket | undefined;
+  let socket: import('node:net').Socket | undefined;
 
   try {
-    const parsed = new URL(proxyUrl);
-
-    if (!['http:', 'https:'].includes(parsed.protocol)) {
-      throw new Error('Only HTTP/HTTPS proxies are supported');
-    }
-
-    socket = await openProxySocket(parsed, timeoutMs);
-
-    const authHeader = proxyAuthorizationHeader(parsed);
-    const requestLines = [
-      `CONNECT ${smtpHost}:${smtpPort} HTTP/1.1`,
-      `Host: ${smtpHost}:${smtpPort}`,
-      'Proxy-Connection: Keep-Alive',
-      'Connection: Keep-Alive',
-      ...(authHeader ? [`Proxy-Authorization: ${authHeader}`] : []),
-      '',
-      '',
-    ];
-
-    const statusLinePromise = new Promise<string>((resolve, reject) => {
-      let buffer = '';
-      let finished = false;
-
-      const hardTimer = setTimeout(() => {
-        finishError(new Error(`SMTP CONNECT hard timeout after ${timeoutMs} ms`));
-        socket?.destroy();
-      }, timeoutMs + 250);
-
-      const cleanup = () => {
-        clearTimeout(hardTimer);
-        socket?.removeListener('data', onData);
-        socket?.removeListener('error', onError);
-        socket?.removeListener('timeout', onTimeout);
-        socket?.removeListener('close', onClose);
-      };
-
-      const finishError = (error: Error) => {
-        if (finished) return;
-        finished = true;
-        cleanup();
-        reject(error);
-      };
-
-      const onError = (error: Error) => finishError(error);
-      const onTimeout = () =>
-        finishError(new Error(`SMTP CONNECT timed out after ${timeoutMs} ms`));
-      const onClose = () =>
-        finishError(new Error('Proxy closed the CONNECT tunnel before replying'));
-
-      const onData = (chunk: Buffer) => {
-        buffer += chunk.toString('latin1');
-
-        if (buffer.length > 32_768) {
-          finishError(new Error('Proxy returned an oversized CONNECT response'));
-          return;
-        }
-
-        if (!buffer.includes('\r\n\r\n')) return;
-
-        const line = buffer.split('\r\n', 1)[0] || '';
-        finished = true;
-        cleanup();
-        resolve(line);
-      };
-
-      // Attach every listener BEFORE sending CONNECT. Some proxies reply immediately.
-      socket?.setTimeout(timeoutMs);
-      socket?.on('data', onData);
-      socket?.once('error', onError);
-      socket?.once('timeout', onTimeout);
-      socket?.once('close', onClose);
-    });
-
-    socket.write(requestLines.join('\r\n'));
-    const statusLine = await statusLinePromise;
-
-    const match = statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})\b/i);
-    const statusCode = match ? Number(match[1]) : 0;
-
-    if (statusCode !== 200) {
-      throw new Error(
-        statusCode
-          ? `Proxy denied SMTP CONNECT: ${statusLine}`
-          : `Invalid CONNECT response: ${statusLine || 'empty response'}`
-      );
-    }
+    socket = await createProxyTunnelSocket(
+      proxyUrl,
+      smtpHost,
+      smtpPort,
+      timeoutMs
+    );
 
     return {
       ok: true,
@@ -268,21 +108,10 @@ async function testOneProxy(
   } = { ok: false };
 
   try {
-    const proxyConfig = proxyAxiosConfig(proxy.url);
-    const response = await axios.get('https://ipwho.is/', {
-      proxy: proxyConfig,
-      timeout: 12_000,
-      validateStatus: (status) => status >= 200 && status < 500,
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': '3D-SUITEG-Proxy-Test/1.0',
-      },
-    });
+    const data = await fetchIpWhoIsThroughProxy(proxy.url, 12_000);
 
-    const data = (response.data || {}) as Record<string, unknown>;
-
-    if (response.status >= 400 || data.success === false || !data.ip) {
-      const message = String(data.message || `HTTP ${response.status}`);
+    if (data.success === false || !data.ip) {
+      const message = String(data.message || 'IP lookup failed');
       throw new Error(message);
     }
 
@@ -303,11 +132,9 @@ async function testOneProxy(
 
     const code = String(value?.code || '').trim();
     const message = String(value?.message || error || 'Proxy web test failed');
-    const status = value?.response?.status;
-
     webResult = {
       ok: false,
-      reason: `${code ? `${code}: ` : ''}${message}${status ? ` (HTTP ${status})` : ''}`,
+      reason: `${code ? `${code}: ` : ''}${message}`,
     };
   }
 
@@ -455,9 +282,7 @@ function createTransport(account: SmtpAccount, proxyUrl?: string) {
     socketTimeout,
   });
 
-  if (proxyUrl) {
-    transporter.setupProxy(proxyUrl);
-  }
+  configureNodemailerProxy(transporter, proxyUrl, connectionTimeout); 
 
   return transporter;
 }
@@ -476,12 +301,12 @@ export async function POST(request: NextRequest) {
                 url: String(value.url || '').trim(),
               };
             })
-            .filter((proxy) => /^https?:\/\//i.test(proxy.url))
+            .filter((proxy) => isSupportedProxyUrl(proxy.url))
         : [];
 
       if (!proxies.length) {
         return NextResponse.json(
-          { success: false, error: 'No valid HTTP/HTTPS proxies supplied' },
+          { success: false, error: 'No valid HTTP/HTTPS/SOCKS5 proxies supplied' },
           { status: 400 }
         );
       }
@@ -512,7 +337,7 @@ export async function POST(request: NextRequest) {
       : [];
 
     const proxyUrl =
-      typeof body.proxyUrl === 'string' && /^https?:\/\//i.test(body.proxyUrl)
+      typeof body.proxyUrl === 'string' && isSupportedProxyUrl(body.proxyUrl)
         ? body.proxyUrl
         : undefined;
 
