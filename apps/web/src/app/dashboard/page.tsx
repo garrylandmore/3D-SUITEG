@@ -4208,6 +4208,14 @@ type MicrosoftProxyEntry = {
   id: string;
   url: string;
   enabled: boolean;
+  testStatus?: 'untested' | 'testing' | 'working' | 'failed';
+  latencyMs?: number;
+  ip?: string;
+  country?: string;
+  countryCode?: string;
+  region?: string;
+  city?: string;
+  testError?: string;
 };
 
 type SmtpAccount = {
@@ -4292,6 +4300,8 @@ function SmtpSenderPanel({
   const [microsoftProxies, setMicrosoftProxies] = React.useState<
     MicrosoftProxyEntry[]
   >([]);
+  const [testingMicrosoftProxies, setTestingMicrosoftProxies] =
+    React.useState(false);
 
   const [microsoftMeetingEnabled, setMicrosoftMeetingEnabled] =
     React.useState(true);
@@ -4855,6 +4865,114 @@ function SmtpSenderPanel({
       const message = error instanceof Error ? error.message : String(error);
       onLog('error', `Could not read proxy file: ${message}`);
       onToast('Could not read proxy file', 'error');
+    }
+  }
+
+  function countryFlagEmoji(countryCode?: string): string {
+    const code = String(countryCode || '').trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(code)) return '🌐';
+    return String.fromCodePoint(
+      ...code.split('').map((character) => 127397 + character.charCodeAt(0))
+    );
+  }
+
+  async function testMicrosoftProxies() {
+    const candidates = microsoftProxies.filter((proxy) => proxy.enabled);
+    if (!candidates.length) {
+      onToast('Add at least one enabled proxy to test', 'warning');
+      return;
+    }
+
+    setTestingMicrosoftProxies(true);
+    setMicrosoftProxies((current) =>
+      current.map((proxy) =>
+        proxy.enabled
+          ? {
+              ...proxy,
+              testStatus: 'testing',
+              latencyMs: undefined,
+              ip: undefined,
+              country: undefined,
+              countryCode: undefined,
+              region: undefined,
+              city: undefined,
+              testError: undefined,
+            }
+          : proxy
+      )
+    );
+
+    try {
+      onLog('info', `Testing ${candidates.length} Microsoft proxy/proxies…`);
+
+      const response = await fetch('/api/smtp/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'testProxies',
+          proxies: candidates.map((proxy) => ({ id: proxy.id, url: proxy.url })),
+        }),
+      });
+
+      const data = (await response.json()) as {
+        success?: boolean;
+        working?: number;
+        failed?: number;
+        error?: string;
+        results?: Array<{
+          id: string;
+          url: string;
+          ok: boolean;
+          latencyMs: number;
+          ip?: string;
+          country?: string;
+          countryCode?: string;
+          region?: string;
+          city?: string;
+          reason?: string;
+        }>;
+      };
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || `Proxy test failed (HTTP ${response.status})`);
+      }
+
+      const byId = new Map((data.results || []).map((result) => [result.id, result]));
+      setMicrosoftProxies((current) =>
+        current.map((proxy) => {
+          const result = byId.get(proxy.id);
+          if (!result) return proxy;
+          return {
+            ...proxy,
+            testStatus: result.ok ? 'working' : 'failed',
+            latencyMs: result.latencyMs,
+            ip: result.ip,
+            country: result.country,
+            countryCode: result.countryCode,
+            region: result.region,
+            city: result.city,
+            testError: result.reason,
+          };
+        })
+      );
+
+      const working = data.working || 0;
+      const failed = data.failed || 0;
+      onLog('success', `Proxy test complete — ${working} working, ${failed} failed`);
+      onToast(`Proxy test complete: ${working} working, ${failed} failed`, failed ? 'warning' : 'success');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setMicrosoftProxies((current) =>
+        current.map((proxy) =>
+          proxy.testStatus === 'testing'
+            ? { ...proxy, testStatus: 'failed', testError: message }
+            : proxy
+        )
+      );
+      onLog('error', `Proxy test failed: ${message}`);
+      onToast(`Proxy test failed: ${message}`, 'error');
+    } finally {
+      setTestingMicrosoftProxies(false);
     }
   }
 
@@ -5857,6 +5975,17 @@ function SmtpSenderPanel({
                         }}
                       />
                     </label>
+                    <button
+                      type="button"
+                      className="px-3 py-2 rounded border border-slate-300 disabled:opacity-50"
+                      disabled={
+                        testingMicrosoftProxies ||
+                        microsoftProxies.filter((proxy) => proxy.enabled).length === 0
+                      }
+                      onClick={() => void testMicrosoftProxies()}
+                    >
+                      {testingMicrosoftProxies ? 'Testing proxies…' : 'Test Proxies'}
+                    </button>
                   </div>
 
                   {microsoftProxies.length > 0 && (
@@ -5880,9 +6009,27 @@ function SmtpSenderPanel({
                                 )
                               }
                             />
-                            <code className="min-w-0 flex-1 break-all text-xs">
-                              {proxy.url}
-                            </code>
+                            <div className="min-w-0 flex-1">
+                              <code className="block break-all text-xs">{proxy.url}</code>
+                              <div className="mt-1 text-xs text-slate-500">
+                                {proxy.testStatus === 'testing' && 'Testing…'}
+                                {proxy.testStatus === 'working' && (
+                                  <span>
+                                    ✅ {countryFlagEmoji(proxy.countryCode)} {proxy.country || 'Unknown country'}
+                                    {proxy.city ? ` · ${proxy.city}` : ''}
+                                    {proxy.region ? `, ${proxy.region}` : ''}
+                                    {proxy.ip ? ` · ${proxy.ip}` : ''}
+                                    {typeof proxy.latencyMs === 'number' ? ` · ${proxy.latencyMs} ms` : ''}
+                                  </span>
+                                )}
+                                {proxy.testStatus === 'failed' && (
+                                  <span className="text-red-600">
+                                    ❌ Failed{proxy.testError ? ` · ${proxy.testError}` : ''}
+                                  </span>
+                                )}
+                                {!proxy.testStatus || proxy.testStatus === 'untested' ? 'Not tested' : null}
+                              </div>
+                            </div>
                             <button
                               type="button"
                               className="text-xs text-red-600"
