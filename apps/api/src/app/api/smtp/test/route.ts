@@ -145,16 +145,21 @@ async function testSmtpTunnel(
       '',
     ];
 
-    socket.write(requestLines.join('\r\n'));
-
-    const statusLine = await new Promise<string>((resolve, reject) => {
+    const statusLinePromise = new Promise<string>((resolve, reject) => {
       let buffer = '';
       let finished = false;
 
+      const hardTimer = setTimeout(() => {
+        finishError(new Error(`SMTP CONNECT hard timeout after ${timeoutMs} ms`));
+        socket?.destroy();
+      }, timeoutMs + 250);
+
       const cleanup = () => {
+        clearTimeout(hardTimer);
         socket?.removeListener('data', onData);
         socket?.removeListener('error', onError);
         socket?.removeListener('timeout', onTimeout);
+        socket?.removeListener('close', onClose);
       };
 
       const finishError = (error: Error) => {
@@ -167,6 +172,8 @@ async function testSmtpTunnel(
       const onError = (error: Error) => finishError(error);
       const onTimeout = () =>
         finishError(new Error(`SMTP CONNECT timed out after ${timeoutMs} ms`));
+      const onClose = () =>
+        finishError(new Error('Proxy closed the CONNECT tunnel before replying'));
 
       const onData = (chunk: Buffer) => {
         buffer += chunk.toString('latin1');
@@ -184,11 +191,16 @@ async function testSmtpTunnel(
         resolve(line);
       };
 
+      // Attach every listener BEFORE sending CONNECT. Some proxies reply immediately.
       socket?.setTimeout(timeoutMs);
       socket?.on('data', onData);
       socket?.once('error', onError);
       socket?.once('timeout', onTimeout);
+      socket?.once('close', onClose);
     });
+
+    socket.write(requestLines.join('\r\n'));
+    const statusLine = await statusLinePromise;
 
     const match = statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})\b/i);
     const statusCode = match ? Number(match[1]) : 0;
@@ -213,6 +225,28 @@ async function testSmtpTunnel(
     };
   } finally {
     socket?.destroy();
+  }
+}
+
+async function withHardTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} hard timeout after ${timeoutMs} ms`)),
+          timeoutMs
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -321,7 +355,26 @@ async function testProxyPool(
       while (true) {
         const index = cursor++;
         if (index >= proxies.length) return;
-        results[index] = await testOneProxy(proxies[index], smtpHost, smtpPort);
+        try {
+          results[index] = await withHardTimeout(
+            testOneProxy(proxies[index], smtpHost, smtpPort),
+            20_000,
+            `Proxy ${index + 1} test`
+          );
+        } catch (error) {
+          results[index] = {
+            id: proxies[index].id,
+            url: proxies[index].url,
+            ok: false,
+            webOk: false,
+            smtpOk: false,
+            latencyMs: 20_000,
+            smtpHost,
+            smtpPort,
+            reason: error instanceof Error ? error.message : String(error),
+            smtpReason: error instanceof Error ? error.message : String(error),
+          };
+        }
       }
     })
   );
