@@ -4216,6 +4216,12 @@ type MicrosoftProxyEntry = {
   region?: string;
   city?: string;
   testError?: string;
+  webOk?: boolean;
+  smtpOk?: boolean;
+  smtpLatencyMs?: number;
+  smtpHost?: string;
+  smtpPort?: number;
+  smtpReason?: string;
 };
 
 type SmtpAccount = {
@@ -4282,6 +4288,26 @@ function SmtpSenderPanel({
   const [selectedAccountId, setSelectedAccountId] = React.useState('');
   const [fromName, setFromName] = React.useState('{DomainName}');
   const [replyTo, setReplyTo] = React.useState('');
+
+  const [smtpProxyEnabled, setSmtpProxyEnabled] =
+    React.useState(false);
+  const [smtpProxyRotate, setSmtpProxyRotate] =
+    React.useState(false);
+  const [smtpProxyInput, setSmtpProxyInput] =
+    React.useState('');
+  const [smtpProxyProtocol, setSmtpProxyProtocol] =
+    React.useState<'http' | 'https'>('http');
+  const [smtpProxyHost, setSmtpProxyHost] = React.useState('');
+  const [smtpProxyPort, setSmtpProxyPort] = React.useState('');
+  const [smtpProxyUsername, setSmtpProxyUsername] =
+    React.useState('');
+  const [smtpProxyPassword, setSmtpProxyPassword] =
+    React.useState('');
+  const [smtpProxies, setSmtpProxies] = React.useState<
+    MicrosoftProxyEntry[]
+  >([]);
+  const [testingSmtpProxies, setTestingSmtpProxies] =
+    React.useState(false);
 
   const [microsoftProxyEnabled, setMicrosoftProxyEnabled] =
     React.useState(false);
@@ -4518,7 +4544,9 @@ function SmtpSenderPanel({
           proxyUrl:
             senderMode === 'microsoft' && microsoftProxyEnabled
               ? microsoftProxies.find((proxy) => proxy.enabled)?.url || null
-              : null,
+              : senderMode === 'smtp' && smtpProxyEnabled
+                ? smtpProxies.find((proxy) => proxy.enabled)?.url || null
+                : null,
         }),
       });
 
@@ -4771,6 +4799,182 @@ function SmtpSenderPanel({
     return html;
   }
 
+  function addSmtpProxyLines(raw: string) {
+    const values = raw
+      .split(/\r?\n|;/)
+      .map((value) => normalizeMicrosoftProxyUrl(value))
+      .filter((value): value is string => Boolean(value));
+
+    if (!values.length) {
+      onToast('No valid HTTP/HTTPS proxy URLs were found', 'warning');
+      return;
+    }
+
+    setSmtpProxies((current) => {
+      const existing = new Set(current.map((item) => item.url));
+      const added = values
+        .filter((url) => !existing.has(url))
+        .map((url) => ({
+          id: makeId('proxy'),
+          url,
+          enabled: true,
+          testStatus: 'untested' as const,
+        }));
+
+      return [...current, ...added];
+    });
+
+    setSmtpProxyInput('');
+    onLog('success', `Loaded ${values.length} SMTP proxy URL(s)`);
+  }
+
+  function addManualSmtpProxy() {
+    const host = smtpProxyHost.trim();
+    const port = Number(smtpProxyPort);
+
+    if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+      onToast('Enter a valid proxy host and port', 'warning');
+      return;
+    }
+
+    const auth = smtpProxyUsername.trim()
+      ? `${encodeURIComponent(smtpProxyUsername.trim())}:${encodeURIComponent(smtpProxyPassword)}@`
+      : '';
+
+    const url = `${smtpProxyProtocol}://${auth}${host}:${port}`;
+    addSmtpProxyLines(url);
+
+    setSmtpProxyHost('');
+    setSmtpProxyPort('');
+    setSmtpProxyUsername('');
+    setSmtpProxyPassword('');
+  }
+
+  async function loadSmtpProxyFile(file: File | null) {
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      addSmtpProxyLines(text);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      onLog('error', `Could not read SMTP proxy file: ${message}`);
+      onToast('Could not read proxy file', 'error');
+    }
+  }
+
+  async function testSmtpProxies() {
+    const candidates = smtpProxies.filter((proxy) => proxy.enabled);
+
+    if (!candidates.length) {
+      onToast('No enabled SMTP proxies to test', 'warning');
+      return;
+    }
+
+    setTestingSmtpProxies(true);
+    setSmtpProxies((current) =>
+      current.map((proxy) =>
+        proxy.enabled
+          ? {
+              ...proxy,
+              testStatus: 'testing',
+              testError: undefined,
+            }
+          : proxy
+      )
+    );
+
+    try {
+      const response = await fetch('/api/smtp/test', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          action: 'testProxies',
+          proxies: candidates.map((proxy) => ({
+            id: proxy.id,
+            url: proxy.url,
+          })),
+          smtpHost: accounts.find((account) => account.enabled)?.host || '',
+          smtpPort: accounts.find((account) => account.enabled)?.port || 0,
+        }),
+      });
+
+      const data = (await response.json()) as {
+        results?: Array<{
+          id: string;
+          url: string;
+          ok: boolean;
+          latencyMs: number;
+          ip?: string;
+          country?: string;
+          countryCode?: string;
+          region?: string;
+          city?: string;
+          reason?: string;
+          webOk?: boolean;
+          smtpOk?: boolean;
+          smtpLatencyMs?: number;
+          smtpHost?: string;
+          smtpPort?: number;
+          smtpReason?: string;
+        }>;
+        error?: string;
+      };
+
+      if (!response.ok) {
+        throw new Error(data.error || `Proxy test failed (HTTP ${response.status})`);
+      }
+
+      const byId = new Map((data.results || []).map((result) => [result.id, result]));
+
+      setSmtpProxies((current) =>
+        current.map((proxy) => {
+          const result = byId.get(proxy.id);
+          if (!result) return proxy;
+
+          return {
+            ...proxy,
+            testStatus: result.ok ? 'working' : 'failed',
+            latencyMs: result.latencyMs,
+            ip: result.ip,
+            country: result.country,
+            countryCode: result.countryCode,
+            region: result.region,
+            city: result.city,
+            testError: result.reason,
+            webOk: result.webOk,
+            smtpOk: result.smtpOk,
+            smtpLatencyMs: result.smtpLatencyMs,
+            smtpHost: result.smtpHost,
+            smtpPort: result.smtpPort,
+            smtpReason: result.smtpReason,
+          };
+        })
+      );
+
+      const working = (data.results || []).filter((item) => item.ok).length;
+      const failed = (data.results || []).length - working;
+
+      onLog('success', `SMTP proxy test complete: ${working} working, ${failed} failed`);
+      onToast(`Proxy test complete: ${working} working, ${failed} failed`, failed ? 'warning' : 'success');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSmtpProxies((current) =>
+        current.map((proxy) =>
+          proxy.enabled && proxy.testStatus === 'testing'
+            ? { ...proxy, testStatus: 'failed', testError: message }
+            : proxy
+        )
+      );
+      onLog('error', `SMTP proxy test failed: ${message}`);
+      onToast('SMTP proxy test failed', 'error');
+    } finally {
+      setTestingSmtpProxies(false);
+    }
+  }
+
   function normalizeMicrosoftProxyUrl(raw: string): string | null {
     const value = raw.trim();
     if (!value) return null;
@@ -4911,6 +5115,8 @@ function SmtpSenderPanel({
         body: JSON.stringify({
           action: 'testProxies',
           proxies: candidates.map((proxy) => ({ id: proxy.id, url: proxy.url })),
+          smtpHost: accounts.find((account) => account.enabled)?.host || '',
+          smtpPort: accounts.find((account) => account.enabled)?.port || 0,
         }),
       });
 
@@ -4930,6 +5136,12 @@ function SmtpSenderPanel({
           region?: string;
           city?: string;
           reason?: string;
+          webOk?: boolean;
+          smtpOk?: boolean;
+          smtpLatencyMs?: number;
+          smtpHost?: string;
+          smtpPort?: number;
+          smtpReason?: string;
         }>;
       };
 
@@ -4952,6 +5164,12 @@ function SmtpSenderPanel({
             region: result.region,
             city: result.city,
             testError: result.reason,
+            webOk: result.webOk,
+            smtpOk: result.smtpOk,
+            smtpLatencyMs: result.smtpLatencyMs,
+            smtpHost: result.smtpHost,
+            smtpPort: result.smtpPort,
+            smtpReason: result.smtpReason,
           };
         })
       );
@@ -5015,6 +5233,14 @@ function SmtpSenderPanel({
       }
     }
 
+    if (senderMode === 'smtp' && smtpProxyEnabled) {
+      const activeProxies = smtpProxies.filter((proxy) => proxy.enabled);
+      if (!activeProxies.length) {
+        onToast('Add at least one enabled SMTP proxy or disable proxy mode', 'warning');
+        return;
+      }
+    }
+
     if (senderMode === 'microsoft' && microsoftProxyEnabled) {
       const activeProxies = microsoftProxies.filter((proxy) => proxy.enabled);
       if (!activeProxies.length) {
@@ -5057,6 +5283,28 @@ function SmtpSenderPanel({
       formData.append('recipients', JSON.stringify(recipients));
       formData.append('fromName', fromName);
       formData.append('replyTo', replyTo.trim());
+
+      formData.append(
+        'smtpProxyEnabled',
+        senderMode === 'smtp' && smtpProxyEnabled ? 'true' : 'false'
+      );
+      formData.append(
+        'smtpProxyRotate',
+        senderMode === 'smtp' &&
+          smtpProxyEnabled &&
+          smtpProxies.filter((proxy) => proxy.enabled).length > 1 &&
+          smtpProxyRotate
+          ? 'true'
+          : 'false'
+      );
+      formData.append(
+        'smtpProxies',
+        JSON.stringify(
+          senderMode === 'smtp'
+            ? smtpProxies.filter((proxy) => proxy.enabled)
+            : []
+        )
+      );
 
       formData.append(
         'microsoftProxyEnabled',
@@ -5862,6 +6110,216 @@ function SmtpSenderPanel({
               </select>
             </Field>
           )}
+          {senderMode === 'smtp' && (
+            <div className="space-y-3 rounded border border-slate-200 p-3">
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={smtpProxyEnabled}
+                  onChange={(event) => setSmtpProxyEnabled(event.target.checked)}
+                />
+                <span>
+                  <span className="font-medium">Enable proxy</span>
+                  <span className="block text-xs text-slate-500">
+                    Route SMTP connections through the configured proxy pool.
+                  </span>
+                </span>
+              </label>
+
+              {smtpProxyEnabled && (
+                <div className="space-y-3">
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+                    <Field label="Protocol">
+                      <select
+                        className="input"
+                        value={smtpProxyProtocol}
+                        onChange={(event) =>
+                          setSmtpProxyProtocol(
+                            event.target.value === 'https' ? 'https' : 'http'
+                          )
+                        }
+                      >
+                        <option value="http">HTTP</option>
+                        <option value="https">HTTPS</option>
+                      </select>
+                    </Field>
+                    <Field label="Host">
+                      <input
+                        className="input"
+                        value={smtpProxyHost}
+                        onChange={(event) => setSmtpProxyHost(event.target.value)}
+                        placeholder="1.2.3.4"
+                      />
+                    </Field>
+                    <Field label="Port">
+                      <input
+                        className="input"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        value={smtpProxyPort}
+                        onChange={(event) => setSmtpProxyPort(event.target.value)}
+                        placeholder="8080"
+                      />
+                    </Field>
+                    <Field label="Username — optional">
+                      <input
+                        className="input"
+                        value={smtpProxyUsername}
+                        onChange={(event) => setSmtpProxyUsername(event.target.value)}
+                      />
+                    </Field>
+                    <Field label="Password — optional">
+                      <input
+                        className="input"
+                        type="password"
+                        value={smtpProxyPassword}
+                        onChange={(event) => setSmtpProxyPassword(event.target.value)}
+                      />
+                    </Field>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="px-3 py-2 rounded border border-slate-300"
+                    onClick={addManualSmtpProxy}
+                  >
+                    Add manual proxy
+                  </button>
+
+                  <Field label="Proxy URL(s)">
+                    <textarea
+                      className="input min-h-24"
+                      value={smtpProxyInput}
+                      onChange={(event) => setSmtpProxyInput(event.target.value)}
+                      placeholder={'http://user:pass@1.2.3.4:8080\nhttp://5.6.7.8:3128'}
+                    />
+                    <div className="mt-1 text-xs text-slate-500">
+                      Paste one or many HTTP/HTTPS proxy URLs. Supports URL, host:port, host:port:user:pass, and CSV rows: protocol,host,port,username,password.
+                    </div>
+                  </Field>
+
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      className="px-3 py-2 rounded border border-slate-300"
+                      onClick={() => addSmtpProxyLines(smtpProxyInput)}
+                    >
+                      Add proxy URL(s)
+                    </button>
+                    <label className="px-3 py-2 rounded border border-slate-300 cursor-pointer">
+                      Import proxy file
+                      <input
+                        type="file"
+                        accept=".txt,.csv,text/plain,text/csv"
+                        className="hidden"
+                        onChange={(event) => {
+                          void loadSmtpProxyFile(event.target.files?.[0] || null);
+                          event.currentTarget.value = '';
+                        }}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="px-3 py-2 rounded border border-slate-300 disabled:opacity-50"
+                      disabled={
+                        testingSmtpProxies ||
+                        smtpProxies.filter((proxy) => proxy.enabled).length === 0
+                      }
+                      onClick={() => void testSmtpProxies()}
+                    >
+                      {testingSmtpProxies ? 'Testing proxies…' : 'Test Proxies'}
+                    </button>
+                  </div>
+
+                  {smtpProxies.length > 0 && (
+                    <div className="space-y-2">
+                      <div className="text-sm font-medium">
+                        Loaded proxies ({smtpProxies.filter((proxy) => proxy.enabled).length} enabled)
+                      </div>
+                      <div className="space-y-2">
+                        {smtpProxies.map((proxy) => (
+                          <div key={proxy.id} className="flex items-center gap-2 rounded border border-slate-200 p-2">
+                            <input
+                              type="checkbox"
+                              checked={proxy.enabled}
+                              onChange={(event) =>
+                                setSmtpProxies((current) =>
+                                  current.map((item) =>
+                                    item.id === proxy.id
+                                      ? { ...item, enabled: event.target.checked }
+                                      : item
+                                  )
+                                )
+                              }
+                            />
+                            <div className="min-w-0 flex-1">
+                              <code className="block break-all text-xs">{proxy.url}</code>
+                              <div className="mt-1 text-xs text-slate-500">
+                                {proxy.testStatus === 'testing' && 'Testing…'}
+                                {proxy.testStatus === 'working' && (
+                                  <span>
+                                    ✅ {countryFlagEmoji(proxy.countryCode)} {proxy.country || 'Unknown country'}
+                                    {proxy.city ? ` · ${proxy.city}` : ''}
+                                    {proxy.region ? `, ${proxy.region}` : ''}
+                                    {proxy.ip ? ` · ${proxy.ip}` : ''}
+                                    {proxy.smtpHost && proxy.smtpPort ? ` · SMTP ${proxy.smtpHost}:${proxy.smtpPort} ✅` : ''}
+                                    {typeof proxy.smtpLatencyMs === 'number' ? ` · ${proxy.smtpLatencyMs} ms tunnel` : ''}
+                                  </span>
+                                )}
+                                {proxy.testStatus === 'failed' && (
+                                  <span className="text-red-600">
+                                    ❌ {proxy.webOk === false ? 'Web proxy failed' : proxy.smtpOk === false ? 'SMTP tunnel blocked' : 'Failed'}
+                                    {proxy.webOk !== false && proxy.country ? ` · ${countryFlagEmoji(proxy.countryCode)} ${proxy.country}` : ''}
+                                    {proxy.ip ? ` · ${proxy.ip}` : ''}
+                                    {proxy.smtpHost && proxy.smtpPort ? ` · ${proxy.smtpHost}:${proxy.smtpPort}` : ''}
+                                    {proxy.smtpReason ? ` · ${proxy.smtpReason}` : proxy.testError ? ` · ${proxy.testError}` : ''}
+                                  </span>
+                                )}
+                                {!proxy.testStatus || proxy.testStatus === 'untested' ? 'Not tested' : null}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              className="text-xs text-red-600"
+                              onClick={() =>
+                                setSmtpProxies((current) =>
+                                  current.filter((item) => item.id !== proxy.id)
+                                )
+                              }
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      disabled={smtpProxies.filter((proxy) => proxy.enabled).length <= 1}
+                      checked={
+                        smtpProxies.filter((proxy) => proxy.enabled).length > 1 &&
+                        smtpProxyRotate
+                      }
+                      onChange={(event) => setSmtpProxyRotate(event.target.checked)}
+                    />
+                    <span>
+                      <span className="font-medium">Rotate proxies</span>
+                      <span className="block text-xs text-slate-500">
+                        {smtpProxies.filter((proxy) => proxy.enabled).length <= 1
+                          ? 'Add at least two enabled proxies to rotate. A single proxy is used for every SMTP connection.'
+                          : 'Round-robin across enabled proxies for SMTP connections.'}
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              )}
+            </div>
+          )}
+
           {senderMode === 'microsoft' && (
             <div className="space-y-3 rounded border border-slate-200 p-3">
               <label className="flex items-center gap-2">
@@ -6019,12 +6477,17 @@ function SmtpSenderPanel({
                                     {proxy.city ? ` · ${proxy.city}` : ''}
                                     {proxy.region ? `, ${proxy.region}` : ''}
                                     {proxy.ip ? ` · ${proxy.ip}` : ''}
-                                    {typeof proxy.latencyMs === 'number' ? ` · ${proxy.latencyMs} ms` : ''}
+                                    {proxy.smtpHost && proxy.smtpPort ? ` · SMTP ${proxy.smtpHost}:${proxy.smtpPort} ✅` : ''}
+                                    {typeof proxy.smtpLatencyMs === 'number' ? ` · ${proxy.smtpLatencyMs} ms tunnel` : ''}
                                   </span>
                                 )}
                                 {proxy.testStatus === 'failed' && (
                                   <span className="text-red-600">
-                                    ❌ Failed{proxy.testError ? ` · ${proxy.testError}` : ''}
+                                    ❌ {proxy.webOk === false ? 'Web proxy failed' : proxy.smtpOk === false ? 'SMTP tunnel blocked' : 'Failed'}
+                                    {proxy.webOk !== false && proxy.country ? ` · ${countryFlagEmoji(proxy.countryCode)} ${proxy.country}` : ''}
+                                    {proxy.ip ? ` · ${proxy.ip}` : ''}
+                                    {proxy.smtpHost && proxy.smtpPort ? ` · ${proxy.smtpHost}:${proxy.smtpPort}` : ''}
+                                    {proxy.smtpReason ? ` · ${proxy.smtpReason}` : proxy.testError ? ` · ${proxy.testError}` : ''}
                                   </span>
                                 )}
                                 {!proxy.testStatus || proxy.testStatus === 'untested' ? 'Not tested' : null}
