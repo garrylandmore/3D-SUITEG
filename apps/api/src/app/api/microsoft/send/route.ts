@@ -35,6 +35,12 @@ type SmtpPlanAccount = SmtpAccountInput & {
   used: number;
 };
 
+type MicrosoftProxyInput = {
+  id: string;
+  url: string;
+  enabled: boolean;
+};
+
 function parseAccounts(raw: string): SmtpAccountInput[] {
   let parsed: unknown;
 
@@ -81,9 +87,10 @@ function parseAccounts(raw: string): SmtpAccountInput[] {
 
 function createSmtpTransport(
   account: SmtpAccountInput,
-  connectionTimeoutMs = 30000
+  connectionTimeoutMs = 30000,
+  proxyUrl?: string
 ) {
-  return nodemailer.createTransport({
+  const transporter = nodemailer.createTransport({
     host: account.host,
     port: account.port,
     secure: account.security === 'ssl',
@@ -100,6 +107,12 @@ function createSmtpTransport(
     greetingTimeout: connectionTimeoutMs,
     socketTimeout: Math.max(connectionTimeoutMs * 3, 60000),
   });
+
+  if (proxyUrl) {
+    transporter.setupProxy(proxyUrl);
+  }
+
+  return transporter;
 }
 
 function validateSmtpAccount(account: SmtpAccountInput): void {
@@ -1010,6 +1023,41 @@ export async function POST(request: NextRequest) {
     const rotateAccounts =
       String(formData.get('rotateAccounts') || 'false') === 'true';
 
+    const microsoftProxyEnabled =
+      String(formData.get('microsoftProxyEnabled') || 'false') === 'true';
+    const microsoftProxyRotate =
+      String(formData.get('microsoftProxyRotate') || 'false') === 'true';
+    const microsoftProxies = microsoftProxyEnabled
+      ? ((JSON.parse(
+          String(formData.get('microsoftProxies') || '[]')
+        ) as unknown[])
+          .map((item, index) => {
+            const value = (item || {}) as Record<string, unknown>;
+            return {
+              id: String(value.id || `proxy-${index + 1}`),
+              url: String(value.url || '').trim(),
+              enabled: value.enabled !== false,
+            } satisfies MicrosoftProxyInput;
+          })
+          .filter(
+            (proxy) =>
+              proxy.enabled && /^https?:\/\//i.test(proxy.url)
+          ))
+      : [];
+
+    if (microsoftProxyEnabled && !microsoftProxies.length) {
+      return new Response(
+        JSON.stringify({
+          error:
+            'Proxy mode is enabled but no valid HTTP/HTTPS proxy URL is configured.',
+        }),
+        {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+    }
+
     const connectionTimeoutMs = Math.min(
       120000,
       Math.max(
@@ -1434,8 +1482,48 @@ export async function POST(request: NextRequest) {
       async start(controller) {
         const transporters = new Map<
           string,
-          ReturnType<typeof nodemailer.createTransport>
+          ReturnType<typeof createSmtpTransport>
         >();
+        let proxyRotationCursor = 0;
+        const activeProxyUrls = microsoftProxies.map((proxy) => proxy.url);
+        const primaryProxyUrl = activeProxyUrls[0];
+
+        const getProxyUrl = () => {
+          if (!microsoftProxyEnabled || !activeProxyUrls.length) {
+            return undefined;
+          }
+          if (!microsoftProxyRotate || activeProxyUrls.length === 1) {
+            return primaryProxyUrl;
+          }
+
+          const url =
+            activeProxyUrls[proxyRotationCursor % activeProxyUrls.length];
+          proxyRotationCursor =
+            (proxyRotationCursor + 1) % activeProxyUrls.length;
+          return url;
+        };
+
+        const transporterKey = (accountId: string, proxyUrl?: string) =>
+          `${accountId}::${proxyUrl || 'direct'}`;
+
+        const getTransporter = (
+          account: SmtpPlanAccount,
+          proxyUrl?: string
+        ) => {
+          const key = transporterKey(account.id, proxyUrl);
+          let transporter = transporters.get(key);
+
+          if (!transporter) {
+            transporter = createSmtpTransport(
+              account,
+              connectionTimeoutMs,
+              proxyUrl
+            );
+            transporters.set(key, transporter);
+          }
+
+          return transporter;
+        };
 
         const emit = (payload: Record<string, unknown>) => {
           controller.enqueue(
@@ -1445,12 +1533,9 @@ export async function POST(request: NextRequest) {
 
         try {
           for (const account of plan) {
-            transporters.set(
-              account.id,
-              createSmtpTransport(
-                account,
-                connectionTimeoutMs
-              )
+            getTransporter(
+              account,
+              microsoftProxyEnabled ? primaryProxyUrl : undefined
             );
           }
 
@@ -1515,7 +1600,8 @@ export async function POST(request: NextRequest) {
 
               const testTransport = createSmtpTransport(
                 item.account,
-                connectionTimeoutMs
+                connectionTimeoutMs,
+                microsoftProxyEnabled ? primaryProxyUrl : undefined
               );
 
               try {
@@ -1524,12 +1610,9 @@ export async function POST(request: NextRequest) {
                 removedAccountIds.delete(id);
                 timedOutAccounts.delete(id);
 
-                transporters.set(
-                  id,
-                  createSmtpTransport(
-                    item.account,
-                    connectionTimeoutMs
-                  )
+                getTransporter(
+                  item.account,
+                  microsoftProxyEnabled ? primaryProxyUrl : undefined
                 );
 
                 emit({
@@ -1589,8 +1672,10 @@ export async function POST(request: NextRequest) {
 
             account.used += 1;
 
-            const transporter = transporters.get(
-              account.id
+            const selectedProxyUrl = getProxyUrl();
+            const transporter = getTransporter(
+              account,
+              selectedProxyUrl
             );
 
             if (!transporter) {
