@@ -341,57 +341,163 @@ export async function POST(request: NextRequest) {
         ? body.proxyUrl
         : undefined;
 
-    const valid: SmtpAccount[] = [];
-    const invalid: Array<SmtpAccount & { reason: string }> = [];
-    const temporaryTimeouts: Array<SmtpAccount & { reason: string }> = [];
-
-    for (const account of accounts) {
-      if (proxyUrl) {
-        const tunnel = await testSmtpTunnel(
-          proxyUrl,
-          account.host,
-          account.port,
-          10_000
-        );
-
-        if (!tunnel.ok) {
-          temporaryTimeouts.push({
-            ...account,
-            reason: `Proxy cannot open SMTP tunnel to ${account.host}:${account.port}: ${tunnel.reason || 'CONNECT failed'}`,
-          });
-          continue;
-        }
-      }
-
-      const transporter = createTransport(account, proxyUrl);
-
-      try {
-        await transporter.verify();
-        valid.push(account);
-      } catch (error) {
-        const classified = classifyError(error);
-
-        if (classified.kind === 'timeout') {
-          temporaryTimeouts.push({
-            ...account,
-            reason: classified.reason,
-          });
-        } else {
-          invalid.push({
-            ...account,
-            reason: classified.reason,
-          });
-        }
-      } finally {
-        transporter.close();
-      }
+    if (!accounts.length) {
+      return NextResponse.json(
+        { success: false, error: 'No SMTP accounts supplied' },
+        { status: 400 }
+      );
     }
 
-    return NextResponse.json({
-      success: true,
-      valid,
-      invalid,
-      temporaryTimeouts,
+    const encoder = new TextEncoder();
+
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const emit = (payload: Record<string, unknown>) => {
+          controller.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`));
+        };
+
+        const valid: SmtpAccount[] = [];
+        const invalid: Array<SmtpAccount & { reason: string }> = [];
+        const temporaryTimeouts: Array<SmtpAccount & { reason: string }> = [];
+
+        try {
+          for (let index = 0; index < accounts.length; index += 1) {
+            const account = accounts[index];
+            const current = index + 1;
+            const total = accounts.length;
+
+            console.log(
+              `[SMTP TEST ${current}/${total}] Testing ${account.username || account.fromEmail || account.label} -> ${account.host}:${account.port}`
+            );
+
+            emit({
+              type: 'testing',
+              index: current,
+              total,
+              account: {
+                id: account.id,
+                label: account.label,
+                host: account.host,
+                port: account.port,
+                security: account.security,
+                username: account.username,
+                fromEmail: account.fromEmail,
+                enabled: account.enabled,
+                maxSends: account.maxSends,
+              },
+            });
+
+            if (proxyUrl) {
+              const tunnel = await testSmtpTunnel(
+                proxyUrl,
+                account.host,
+                account.port,
+                10_000
+              );
+
+              if (!tunnel.ok) {
+                const reason = `Proxy cannot open SMTP tunnel to ${account.host}:${account.port}: ${tunnel.reason || 'CONNECT failed'}`;
+                const result = { ...account, reason };
+                temporaryTimeouts.push(result);
+
+                console.warn(
+                  `[SMTP TEST ${current}/${total}] TIMEOUT ${account.username || account.fromEmail || account.label} -> ${account.host}:${account.port} — ${reason}`
+                );
+
+                emit({
+                  type: 'result',
+                  status: 'timeout',
+                  index: current,
+                  total,
+                  account: result,
+                  reason,
+                });
+                continue;
+              }
+            }
+
+            const transporter = createTransport(account, proxyUrl);
+
+            try {
+              await transporter.verify();
+              valid.push(account);
+
+              console.log(
+                `[SMTP TEST ${current}/${total}] VALID ${account.username || account.fromEmail || account.label} -> ${account.host}:${account.port}`
+              );
+
+              emit({
+                type: 'result',
+                status: 'valid',
+                index: current,
+                total,
+                account,
+              });
+            } catch (error) {
+              const classified = classifyError(error);
+              const result = { ...account, reason: classified.reason };
+
+              if (classified.kind === 'timeout') {
+                temporaryTimeouts.push(result);
+                console.warn(
+                  `[SMTP TEST ${current}/${total}] TIMEOUT ${account.username || account.fromEmail || account.label} -> ${account.host}:${account.port} — ${classified.reason}`
+                );
+                emit({
+                  type: 'result',
+                  status: 'timeout',
+                  index: current,
+                  total,
+                  account: result,
+                  reason: classified.reason,
+                });
+              } else {
+                invalid.push(result);
+                console.error(
+                  `[SMTP TEST ${current}/${total}] INVALID ${account.username || account.fromEmail || account.label} -> ${account.host}:${account.port} — ${classified.reason}`
+                );
+                emit({
+                  type: 'result',
+                  status: 'invalid',
+                  index: current,
+                  total,
+                  account: result,
+                  reason: classified.reason,
+                });
+              }
+            } finally {
+              transporter.close();
+            }
+          }
+
+          emit({
+            type: 'complete',
+            total: accounts.length,
+            validCount: valid.length,
+            invalidCount: invalid.length,
+            timeoutCount: temporaryTimeouts.length,
+            valid,
+            invalid,
+            temporaryTimeouts,
+          });
+        } catch (error) {
+          emit({
+            type: 'fatal',
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      },
     });
   } catch (error) {
     return NextResponse.json(
