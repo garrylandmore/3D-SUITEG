@@ -103,9 +103,9 @@ function createSmtpTransport(
     pool: true,
     maxConnections: 2,
     maxMessages: Infinity,
-    connectionTimeout: connectionTimeoutMs,
-    greetingTimeout: connectionTimeoutMs,
-    socketTimeout: Math.max(connectionTimeoutMs * 3, 60000),
+    connectionTimeout: proxyUrl ? Math.min(connectionTimeoutMs, 12000) : connectionTimeoutMs,
+    greetingTimeout: proxyUrl ? Math.min(connectionTimeoutMs, 12000) : connectionTimeoutMs,
+    socketTimeout: proxyUrl ? Math.min(Math.max(connectionTimeoutMs, 20000), 30000) : Math.max(connectionTimeoutMs * 3, 60000),
   });
 
   if (proxyUrl) {
