@@ -4204,6 +4204,12 @@ type GmailConnectedAccount = {
 };
 
 
+type MicrosoftProxyEntry = {
+  id: string;
+  url: string;
+  enabled: boolean;
+};
+
 type SmtpAccount = {
   id: string;
   label: string;
@@ -4268,6 +4274,24 @@ function SmtpSenderPanel({
   const [selectedAccountId, setSelectedAccountId] = React.useState('');
   const [fromName, setFromName] = React.useState('{DomainName}');
   const [replyTo, setReplyTo] = React.useState('');
+
+  const [microsoftProxyEnabled, setMicrosoftProxyEnabled] =
+    React.useState(false);
+  const [microsoftProxyRotate, setMicrosoftProxyRotate] =
+    React.useState(false);
+  const [microsoftProxyInput, setMicrosoftProxyInput] =
+    React.useState('');
+  const [microsoftProxyProtocol, setMicrosoftProxyProtocol] =
+    React.useState<'http' | 'https'>('http');
+  const [microsoftProxyHost, setMicrosoftProxyHost] = React.useState('');
+  const [microsoftProxyPort, setMicrosoftProxyPort] = React.useState('');
+  const [microsoftProxyUsername, setMicrosoftProxyUsername] =
+    React.useState('');
+  const [microsoftProxyPassword, setMicrosoftProxyPassword] =
+    React.useState('');
+  const [microsoftProxies, setMicrosoftProxies] = React.useState<
+    MicrosoftProxyEntry[]
+  >([]);
 
   const [microsoftMeetingEnabled, setMicrosoftMeetingEnabled] =
     React.useState(true);
@@ -4481,6 +4505,10 @@ function SmtpSenderPanel({
         },
         body: JSON.stringify({
           accounts: candidates,
+          proxyUrl:
+            senderMode === 'microsoft' && microsoftProxyEnabled
+              ? microsoftProxies.find((proxy) => proxy.enabled)?.url || null
+              : null,
         }),
       });
 
@@ -4733,6 +4761,103 @@ function SmtpSenderPanel({
     return html;
   }
 
+  function normalizeMicrosoftProxyUrl(raw: string): string | null {
+    const value = raw.trim();
+    if (!value) return null;
+
+    const csv = value.split(',').map((part) => part.trim());
+    if (
+      csv.length >= 3 &&
+      ['http', 'https'].includes(csv[0].toLowerCase()) &&
+      /^\d+$/.test(csv[2])
+    ) {
+      const [protocol, host, port, username = '', password = ''] = csv;
+      const auth = username
+        ? `${encodeURIComponent(username)}:${encodeURIComponent(password)}@`
+        : '';
+      return `${protocol.toLowerCase()}://${auth}${host}:${port}`;
+    }
+
+    const hostPortUserPass = value.match(
+      /^([^:\s]+):(\d+):([^:\s]+):(.+)$/
+    );
+    if (hostPortUserPass) {
+      const [, host, port, username, password] = hostPortUserPass;
+      return `http://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}:${port}`;
+    }
+
+    const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(value)
+      ? value
+      : `http://${value}`;
+
+    try {
+      const parsed = new URL(candidate);
+      if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+      if (!parsed.hostname || !parsed.port) return null;
+      return parsed.toString().replace(/\/$/, '');
+    } catch {
+      return null;
+    }
+  }
+
+  function addMicrosoftProxyLines(raw: string) {
+    const values = raw
+      .split(/\r?\n|;/)
+      .map((value) => normalizeMicrosoftProxyUrl(value))
+      .filter((value): value is string => Boolean(value));
+
+    if (!values.length) {
+      onToast('No valid HTTP/HTTPS proxy URLs were found', 'warning');
+      return;
+    }
+
+    let addedCount = 0;
+    setMicrosoftProxies((current) => {
+      const existing = new Set(current.map((item) => item.url));
+      const added = values
+        .filter((url) => !existing.has(url))
+        .map((url) => {
+          addedCount += 1;
+          return { id: makeId('proxy'), url, enabled: true };
+        });
+      return [...current, ...added];
+    });
+    setMicrosoftProxyInput('');
+    onLog('success', `Loaded ${values.length} Microsoft proxy URL(s)`);
+  }
+
+  function addManualMicrosoftProxy() {
+    const host = microsoftProxyHost.trim();
+    const port = Number(microsoftProxyPort);
+
+    if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+      onToast('Enter a valid proxy host and port', 'warning');
+      return;
+    }
+
+    const auth = microsoftProxyUsername.trim()
+      ? `${encodeURIComponent(microsoftProxyUsername.trim())}:${encodeURIComponent(microsoftProxyPassword)}@`
+      : '';
+    const url = `${microsoftProxyProtocol}://${auth}${host}:${port}`;
+    addMicrosoftProxyLines(url);
+    setMicrosoftProxyHost('');
+    setMicrosoftProxyPort('');
+    setMicrosoftProxyUsername('');
+    setMicrosoftProxyPassword('');
+  }
+
+  async function loadMicrosoftProxyFile(file: File | null) {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      addMicrosoftProxyLines(text);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      onLog('error', `Could not read proxy file: ${message}`);
+      onToast('Could not read proxy file', 'error');
+    }
+  }
+
   async function sendSmtp() {
     const usableAccounts = accounts.filter((account) => {
       if (!account.enabled) return false;
@@ -4772,6 +4897,14 @@ function SmtpSenderPanel({
       }
     }
 
+    if (senderMode === 'microsoft' && microsoftProxyEnabled) {
+      const activeProxies = microsoftProxies.filter((proxy) => proxy.enabled);
+      if (!activeProxies.length) {
+        onToast('Add at least one enabled proxy or disable proxy mode', 'warning');
+        return;
+      }
+    }
+
     setSending(true);
 
     try {
@@ -4806,6 +4939,28 @@ function SmtpSenderPanel({
       formData.append('recipients', JSON.stringify(recipients));
       formData.append('fromName', fromName);
       formData.append('replyTo', replyTo.trim());
+
+      formData.append(
+        'microsoftProxyEnabled',
+        senderMode === 'microsoft' && microsoftProxyEnabled ? 'true' : 'false'
+      );
+      formData.append(
+        'microsoftProxyRotate',
+        senderMode === 'microsoft' &&
+          microsoftProxyEnabled &&
+          microsoftProxies.filter((proxy) => proxy.enabled).length > 1 &&
+          microsoftProxyRotate
+          ? 'true'
+          : 'false'
+      );
+      formData.append(
+        'microsoftProxies',
+        JSON.stringify(
+          senderMode === 'microsoft'
+            ? microsoftProxies.filter((proxy) => proxy.enabled)
+            : []
+        )
+      );
 
       formData.append(
         'microsoftMeetingEnabled',
@@ -5588,6 +5743,187 @@ function SmtpSenderPanel({
                 ))}
               </select>
             </Field>
+          )}
+          {senderMode === 'microsoft' && (
+            <div className="space-y-3 rounded border border-slate-200 p-3">
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={microsoftProxyEnabled}
+                  onChange={(event) =>
+                    setMicrosoftProxyEnabled(event.target.checked)
+                  }
+                />
+                <span>
+                  <span className="font-medium">Enable proxy</span>
+                  <span className="block text-xs text-slate-500">
+                    Route Microsoft SMTP connections through the configured proxy pool.
+                  </span>
+                </span>
+              </label>
+
+              {microsoftProxyEnabled && (
+                <div className="space-y-3">
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+                    <Field label="Protocol">
+                      <select
+                        className="input"
+                        value={microsoftProxyProtocol}
+                        onChange={(event) =>
+                          setMicrosoftProxyProtocol(
+                            event.target.value === 'https' ? 'https' : 'http'
+                          )
+                        }
+                      >
+                        <option value="http">HTTP</option>
+                        <option value="https">HTTPS</option>
+                      </select>
+                    </Field>
+                    <Field label="Host">
+                      <input
+                        className="input"
+                        value={microsoftProxyHost}
+                        onChange={(event) => setMicrosoftProxyHost(event.target.value)}
+                        placeholder="1.2.3.4"
+                      />
+                    </Field>
+                    <Field label="Port">
+                      <input
+                        className="input"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        value={microsoftProxyPort}
+                        onChange={(event) => setMicrosoftProxyPort(event.target.value)}
+                        placeholder="8080"
+                      />
+                    </Field>
+                    <Field label="Username — optional">
+                      <input
+                        className="input"
+                        value={microsoftProxyUsername}
+                        onChange={(event) => setMicrosoftProxyUsername(event.target.value)}
+                      />
+                    </Field>
+                    <Field label="Password — optional">
+                      <input
+                        className="input"
+                        type="password"
+                        value={microsoftProxyPassword}
+                        onChange={(event) => setMicrosoftProxyPassword(event.target.value)}
+                      />
+                    </Field>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="px-3 py-2 rounded border border-slate-300"
+                    onClick={addManualMicrosoftProxy}
+                  >
+                    Add manual proxy
+                  </button>
+
+                  <Field label="Proxy URL(s)">
+                    <textarea
+                      className="input min-h-24"
+                      value={microsoftProxyInput}
+                      onChange={(event) =>
+                        setMicrosoftProxyInput(event.target.value)
+                      }
+                      placeholder={'http://user:pass@1.2.3.4:8080\nhttp://5.6.7.8:3128'}
+                    />
+                    <div className="mt-1 text-xs text-slate-500">
+                      Paste one or many HTTP/HTTPS proxy URLs. Supports URL, host:port, host:port:user:pass, and CSV rows: protocol,host,port,username,password.
+                    </div>
+                  </Field>
+
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      className="px-3 py-2 rounded border border-slate-300"
+                      onClick={() => addMicrosoftProxyLines(microsoftProxyInput)}
+                    >
+                      Add proxy URL(s)
+                    </button>
+                    <label className="px-3 py-2 rounded border border-slate-300 cursor-pointer">
+                      Import proxy file
+                      <input
+                        type="file"
+                        accept=".txt,.csv,text/plain,text/csv"
+                        className="hidden"
+                        onChange={(event) => {
+                          void loadMicrosoftProxyFile(event.target.files?.[0] || null);
+                          event.currentTarget.value = '';
+                        }}
+                      />
+                    </label>
+                  </div>
+
+                  {microsoftProxies.length > 0 && (
+                    <div className="space-y-2">
+                      <div className="text-sm font-medium">
+                        Loaded proxies ({microsoftProxies.filter((proxy) => proxy.enabled).length} enabled)
+                      </div>
+                      <div className="space-y-2">
+                        {microsoftProxies.map((proxy) => (
+                          <div key={proxy.id} className="flex items-center gap-2 rounded border border-slate-200 p-2">
+                            <input
+                              type="checkbox"
+                              checked={proxy.enabled}
+                              onChange={(event) =>
+                                setMicrosoftProxies((current) =>
+                                  current.map((item) =>
+                                    item.id === proxy.id
+                                      ? { ...item, enabled: event.target.checked }
+                                      : item
+                                  )
+                                )
+                              }
+                            />
+                            <code className="min-w-0 flex-1 break-all text-xs">
+                              {proxy.url}
+                            </code>
+                            <button
+                              type="button"
+                              className="text-xs text-red-600"
+                              onClick={() =>
+                                setMicrosoftProxies((current) =>
+                                  current.filter((item) => item.id !== proxy.id)
+                                )
+                              }
+                            >
+                              Remove
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      disabled={microsoftProxies.filter((proxy) => proxy.enabled).length <= 1}
+                      checked={
+                        microsoftProxies.filter((proxy) => proxy.enabled).length > 1 &&
+                        microsoftProxyRotate
+                      }
+                      onChange={(event) =>
+                        setMicrosoftProxyRotate(event.target.checked)
+                      }
+                    />
+                    <span>
+                      <span className="font-medium">Rotate proxies</span>
+                      <span className="block text-xs text-slate-500">
+                        {microsoftProxies.filter((proxy) => proxy.enabled).length <= 1
+                          ? 'Add at least two enabled proxies to rotate. A single proxy is used for every Microsoft SMTP connection.'
+                          : 'Round-robin across enabled proxies for Microsoft SMTP connections.'}
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              )}
+            </div>
           )}
         </div>
       </Panel>
