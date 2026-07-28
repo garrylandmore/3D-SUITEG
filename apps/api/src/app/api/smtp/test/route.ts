@@ -11,6 +11,7 @@ export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 type SmtpSecurity = 'starttls' | 'ssl' | 'none';
+type SmtpAuthMethod = 'auto' | 'LOGIN' | 'PLAIN' | 'CRAM-MD5';
 
 type ProxyTestInput = {
   id: string;
@@ -215,6 +216,7 @@ type SmtpAccount = {
   host: string;
   port: number;
   security: SmtpSecurity;
+  authMethod?: SmtpAuthMethod;
   username: string;
   password: string;
   fromEmail: string;
@@ -262,7 +264,11 @@ function classifyError(error: unknown): {
   };
 }
 
-function createTransport(account: SmtpAccount, proxyUrl?: string) {
+function createTransport(
+  account: SmtpAccount,
+  proxyUrl?: string,
+  authMethodOverride?: Exclude<SmtpAuthMethod, 'auto'>
+) {
   const connectionTimeout = proxyUrl ? 12_000 : 20_000;
   const greetingTimeout = proxyUrl ? 12_000 : 20_000;
   const socketTimeout = proxyUrl ? 30_000 : 30_000;
@@ -273,6 +279,9 @@ function createTransport(account: SmtpAccount, proxyUrl?: string) {
     secure: account.security === 'ssl',
     requireTLS: account.security === 'starttls',
     ignoreTLS: account.security === 'none',
+    ...((authMethodOverride || (account.authMethod && account.authMethod !== 'auto' ? account.authMethod : undefined))
+      ? { authMethod: authMethodOverride || account.authMethod }
+      : {}),
     auth: {
       user: account.username,
       pass: account.password,
@@ -374,6 +383,11 @@ export async function POST(request: NextRequest) {
               type: 'testing',
               index: current,
               total,
+              accountId: account.id,
+              label: account.label,
+              fromEmail: account.fromEmail,
+              host: account.host,
+              port: account.port,
               account: {
                 id: account.id,
                 label: account.label,
@@ -409,6 +423,11 @@ export async function POST(request: NextRequest) {
                   status: 'timeout',
                   index: current,
                   total,
+                  accountId: account.id,
+                  label: account.label,
+                  fromEmail: account.fromEmail,
+                  host: account.host,
+                  port: account.port,
                   account: result,
                   reason,
                 });
@@ -416,14 +435,41 @@ export async function POST(request: NextRequest) {
               }
             }
 
-            const transporter = createTransport(account, proxyUrl);
+            const requestedAuthMethod = account.authMethod || 'auto';
+            const authMethods: Array<Exclude<SmtpAuthMethod, 'auto'>> =
+              requestedAuthMethod === 'auto'
+                ? ['LOGIN', 'PLAIN', 'CRAM-MD5']
+                : [requestedAuthMethod];
 
-            try {
-              await transporter.verify();
-              valid.push(account);
+            let verified = false;
+            let lastError: unknown = null;
+            let detectedAuthMethod: Exclude<SmtpAuthMethod, 'auto'> | undefined;
+
+            for (const authMethod of authMethods) {
+              const transporter = createTransport(account, proxyUrl, authMethod);
+
+              try {
+                await transporter.verify();
+                verified = true;
+                detectedAuthMethod = authMethod;
+                break;
+              } catch (error) {
+                lastError = error;
+                const classified = classifyError(error);
+                if (classified.kind === 'timeout') {
+                  break;
+                }
+              } finally {
+                transporter.close();
+              }
+            }
+
+            if (verified && detectedAuthMethod) {
+              const verifiedAccount = { ...account, authMethod: detectedAuthMethod };
+              valid.push(verifiedAccount);
 
               console.log(
-                `[SMTP TEST ${current}/${total}] VALID ${account.username || account.fromEmail || account.label} -> ${account.host}:${account.port}`
+                `[SMTP TEST ${current}/${total}] VALID ${account.username || account.fromEmail || account.label} -> ${account.host}:${account.port} — AUTH ${detectedAuthMethod}`
               );
 
               emit({
@@ -431,10 +477,16 @@ export async function POST(request: NextRequest) {
                 status: 'valid',
                 index: current,
                 total,
-                account,
+                account: verifiedAccount,
+                accountId: account.id,
+                label: account.label,
+                fromEmail: account.fromEmail,
+                host: account.host,
+                port: account.port,
+                authMethod: detectedAuthMethod,
               });
-            } catch (error) {
-              const classified = classifyError(error);
+            } else {
+              const classified = classifyError(lastError);
               const result = { ...account, reason: classified.reason };
 
               if (classified.kind === 'timeout') {
@@ -448,6 +500,11 @@ export async function POST(request: NextRequest) {
                   index: current,
                   total,
                   account: result,
+                  accountId: account.id,
+                  label: account.label,
+                  fromEmail: account.fromEmail,
+                  host: account.host,
+                  port: account.port,
                   reason: classified.reason,
                 });
               } else {
@@ -461,11 +518,14 @@ export async function POST(request: NextRequest) {
                   index: current,
                   total,
                   account: result,
+                  accountId: account.id,
+                  label: account.label,
+                  fromEmail: account.fromEmail,
+                  host: account.host,
+                  port: account.port,
                   reason: classified.reason,
                 });
               }
-            } finally {
-              transporter.close();
             }
           }
 
