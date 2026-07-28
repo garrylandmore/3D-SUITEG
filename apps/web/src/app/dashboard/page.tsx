@@ -4224,12 +4224,15 @@ type MicrosoftProxyEntry = {
   smtpReason?: string;
 };
 
+type SmtpAuthMethod = 'auto' | 'LOGIN' | 'PLAIN' | 'CRAM-MD5';
+
 type SmtpAccount = {
   id: string;
   label: string;
   host: string;
   port: number;
   security: 'starttls' | 'ssl' | 'none';
+  authMethod: SmtpAuthMethod;
   username: string;
   password: string;
   fromEmail: string;
@@ -4255,6 +4258,7 @@ function SmtpSenderPanel({
       host: '',
       port: 587,
       security: 'starttls',
+      authMethod: 'auto',
       username: '',
       password: '',
       fromEmail: '',
@@ -4696,6 +4700,7 @@ function SmtpSenderPanel({
         port,
         security:
           port === 465 ? 'ssl' : 'starttls',
+        authMethod: 'auto',
         username,
         password,
         fromEmail,
@@ -4803,6 +4808,7 @@ function SmtpSenderPanel({
 
       const handleEvent = (event: {
         type?: string;
+        status?: 'valid' | 'invalid' | 'timeout';
         index?: number;
         total?: number;
         accountId?: string;
@@ -4810,12 +4816,16 @@ function SmtpSenderPanel({
         fromEmail?: string;
         host?: string;
         port?: number;
+        authMethod?: SmtpAuthMethod;
         reason?: string;
         validCount?: number;
         invalidCount?: number;
         timeoutCount?: number;
         error?: string;
       }) => {
+        const normalizedType =
+          event.type === 'result' && event.status ? event.status : event.type;
+
         const account = event.accountId
           ? candidateById.get(event.accountId)
           : undefined;
@@ -4823,7 +4833,7 @@ function SmtpSenderPanel({
         const displayName =
           event.fromEmail || account?.fromEmail || event.label || account?.label || 'SMTP account';
 
-        if (event.type === 'testing') {
+        if (normalizedType === 'testing') {
           setSmtpTestProgress({
             current: event.index || 0,
             total: event.total || candidates.length,
@@ -4835,8 +4845,17 @@ function SmtpSenderPanel({
           return;
         }
 
-        if (event.type === 'valid' && account) {
-          validResults.push(account);
+        if (normalizedType === 'valid' && account) {
+          const validAccount = event.authMethod && event.authMethod !== 'auto'
+            ? { ...account, authMethod: event.authMethod }
+            : account;
+          validResults.push(validAccount);
+          if (validAccount.authMethod !== account.authMethod) {
+            candidateById.set(account.id, validAccount);
+            setAccounts((current) =>
+              current.map((item) => item.id === account.id ? validAccount : item)
+            );
+          }
           setSmtpTestValidCount(validResults.length);
           onLog(
             'success',
@@ -4845,7 +4864,7 @@ function SmtpSenderPanel({
           return;
         }
 
-        if (event.type === 'invalid' && account) {
+        if (normalizedType === 'invalid' && account) {
           const item = {
             ...account,
             reason: event.reason || 'SMTP verification failed',
@@ -4859,7 +4878,7 @@ function SmtpSenderPanel({
           return;
         }
 
-        if (event.type === 'timeout' && account) {
+        if (normalizedType === 'timeout' && account) {
           const item = {
             ...account,
             reason: event.reason || 'SMTP connection timed out',
@@ -4873,7 +4892,7 @@ function SmtpSenderPanel({
           return;
         }
 
-        if (event.type === 'complete') {
+        if (normalizedType === 'complete') {
           onLog(
             'success',
             `SMTP test complete — ${event.validCount ?? validResults.length} valid, ${event.invalidCount ?? invalidResults.length} invalid, ${event.timeoutCount ?? timeoutResults.length} temporary timeout(s)`
@@ -4881,7 +4900,7 @@ function SmtpSenderPanel({
           return;
         }
 
-        if (event.type === 'fatal') {
+        if (normalizedType === 'fatal') {
           throw new Error(event.error || 'SMTP test stream failed');
         }
       };
@@ -5080,6 +5099,7 @@ function SmtpSenderPanel({
         host: '',
         port: 587,
         security: 'starttls',
+        authMethod: 'auto',
         username: '',
         password: '',
         fromEmail: '',
@@ -6305,6 +6325,23 @@ function SmtpSenderPanel({
                     <option value="starttls">STARTTLS</option>
                     <option value="ssl">SSL/TLS</option>
                     <option value="none">None</option>
+                  </select>
+                </Field>
+
+                <Field label="Authentication method">
+                  <select
+                    className="input"
+                    value={account.authMethod || 'auto'}
+                    onChange={(event) =>
+                      updateAccount(account.id, {
+                        authMethod: event.target.value as SmtpAuthMethod,
+                      })
+                    }
+                  >
+                    <option value="auto">Auto detect</option>
+                    <option value="LOGIN">LOGIN</option>
+                    <option value="PLAIN">PLAIN</option>
+                    <option value="CRAM-MD5">CRAM-MD5</option>
                   </select>
                 </Field>
               </div>
