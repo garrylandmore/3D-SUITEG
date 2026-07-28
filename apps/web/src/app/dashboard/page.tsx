@@ -4594,6 +4594,13 @@ function SmtpSenderPanel({
     'attachment-link' | 'cta-link' | 'custom'
   >('attachment-link');
   const [qrCustomData, setQrCustomData] = React.useState('');
+  const [qrSize, setQrSize] = React.useState(512);
+  const [qrErrorCorrection, setQrErrorCorrection] = React.useState<
+    'L' | 'M' | 'Q' | 'H'
+  >('M');
+  const [qrPreviewDataUri, setQrPreviewDataUri] = React.useState('');
+  const [qrPreviewValue, setQrPreviewValue] = React.useState('');
+  const [qrPreviewing, setQrPreviewing] = React.useState(false);
 
   const [attachmentEnabled, setAttachmentEnabled] = React.useState(false);
   const [attachmentMode, setAttachmentMode] = React.useState<
@@ -5522,6 +5529,81 @@ function SmtpSenderPanel({
     }
   }
 
+  function resolveQrPreviewTemplate(template: string): string {
+    const email = recipients[0] || 'preview@example.com';
+    const at = email.lastIndexOf('@');
+    const localPart = at > 0 ? email.slice(0, at) : email;
+    const domain = at > 0 ? email.slice(at + 1) : 'example.com';
+    const domainName = domain.split('.')[0] || domain;
+    const emailBase64 = typeof window !== 'undefined' ? window.btoa(email) : email;
+    const emailHex = Array.from(new TextEncoder().encode(email))
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+
+    return String(template || '')
+      .replace(/\{Email\}/g, email)
+      .replace(/\{EmailBase64\}/g, emailBase64)
+      .replace(/\{EmailHex\}/g, emailHex)
+      .replace(/\{LocalPart\}/g, localPart)
+      .replace(/\{Domain\}/g, domain)
+      .replace(/\{DomainName\}/g, domainName)
+      .replace(/#emailinbase64\b/gi, `#${emailBase64}`)
+      .replace(/#emailinhex\b/gi, `#${emailHex}`)
+      .replace(/#email\b/gi, `#${email}`);
+  }
+
+  async function previewQrCode() {
+    const rawValue =
+      qrSource === 'cta-link'
+        ? ctaLink
+        : qrSource === 'custom'
+          ? qrCustomData
+          : attachmentLink;
+
+    const value = resolveQrPreviewTemplate(rawValue).trim();
+
+    if (!value) {
+      onToast('Enter a link or custom QR value first', 'warning');
+      return;
+    }
+
+    setQrPreviewing(true);
+
+    try {
+      const response = await fetch('/api/qr', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          value,
+          size: qrSize,
+          errorCorrectionLevel: qrErrorCorrection,
+        }),
+      });
+
+      const data = (await response.json()) as {
+        success?: boolean;
+        dataUri?: string;
+        error?: string;
+      };
+
+      if (!response.ok || !data.dataUri) {
+        throw new Error(data.error || 'QR generation failed');
+      }
+
+      setQrPreviewDataUri(data.dataUri);
+      setQrPreviewValue(value);
+      onLog('success', 'Native QR preview generated');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      onToast(`QR preview failed: ${message}`, 'error');
+      onLog('error', `QR preview failed: ${message}`);
+    } finally {
+      setQrPreviewing(false);
+    }
+  }
+
   async function sendSmtp() {
     const usableAccounts = accounts.filter((account) => {
       if (!account.enabled) return false;
@@ -5750,6 +5832,8 @@ function SmtpSenderPanel({
       formData.append('qrEnabled', qrEnabled ? 'true' : 'false');
       formData.append('qrSource', qrSource);
       formData.append('qrCustomData', qrCustomData.trim());
+      formData.append('qrSize', String(qrSize));
+      formData.append('qrErrorCorrection', qrErrorCorrection);
 
       formData.append(
         'attachmentEnabled',
@@ -7609,6 +7693,72 @@ function SmtpSenderPanel({
                       }
                     />
                   </Field>
+                )}
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field label="QR size">
+                    <select
+                      className="input"
+                      value={qrSize}
+                      onChange={(event) => setQrSize(Number(event.target.value))}
+                    >
+                      <option value={192}>192 px</option>
+                      <option value={256}>256 px</option>
+                      <option value={384}>384 px</option>
+                      <option value={512}>512 px</option>
+                      <option value={768}>768 px</option>
+                      <option value={1024}>1024 px</option>
+                    </select>
+                  </Field>
+
+                  <Field label="Error correction">
+                    <select
+                      className="input"
+                      value={qrErrorCorrection}
+                      onChange={(event) =>
+                        setQrErrorCorrection(
+                          event.target.value as 'L' | 'M' | 'Q' | 'H'
+                        )
+                      }
+                    >
+                      <option value="L">Low</option>
+                      <option value="M">Medium</option>
+                      <option value="Q">Quartile</option>
+                      <option value="H">High</option>
+                    </select>
+                  </Field>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    className="px-3 py-2 rounded border border-slate-300"
+                    disabled={qrPreviewing}
+                    onClick={() => void previewQrCode()}
+                  >
+                    {qrPreviewing ? 'Generating QR…' : 'Preview QR'}
+                  </button>
+                  <span className="text-xs text-slate-500">
+                    Generated natively by 3D Suite. No external QR service.
+                  </span>
+                </div>
+
+                {qrPreviewDataUri && (
+                  <div className="grid gap-3 rounded border border-slate-200 p-3 sm:grid-cols-[auto_1fr] sm:items-center">
+                    <img
+                      src={qrPreviewDataUri}
+                      alt="QR code preview"
+                      className="h-40 w-40 rounded border border-slate-200 bg-white p-2"
+                    />
+                    <div className="min-w-0 space-y-1">
+                      <div className="text-sm font-medium">Resolved preview value</div>
+                      <code className="block break-all text-xs text-slate-600">
+                        {qrPreviewValue}
+                      </code>
+                      <div className="text-xs text-slate-500">
+                        Preview uses the first recipient when placeholders are present.
+                      </div>
+                    </div>
+                  </div>
                 )}
               </>
             )}
