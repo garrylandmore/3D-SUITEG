@@ -4,6 +4,7 @@ import PptxGenJS from 'pptxgenjs';
 import QRCode from 'qrcode';
 import nodemailer from 'nodemailer';
 import { configureNodemailerProxy, isSupportedProxyUrl } from '../../../../lib/smtp-proxy';
+import { getSendJob, recordSendJobEvent, registerSendJob, waitForSendJob } from '../../../../lib/send-job-control';
 import {
   Document,
   ExternalHyperlink,
@@ -1013,6 +1014,9 @@ export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
 
+    const requestedJobId = String(formData.get('jobId') || '').trim();
+    const jobId = requestedJobId || `send-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
     const accounts = parseAccounts(
       String(formData.get('accounts') || '[]')
     );
@@ -1549,6 +1553,8 @@ export async function POST(request: NextRequest) {
       })
     );
 
+    registerSendJob(jobId, 'microsoft', recipients.length);
+
     const encoder = new TextEncoder();
 
     const stream = new ReadableStream<Uint8Array>({
@@ -1599,9 +1605,15 @@ export async function POST(request: NextRequest) {
         };
 
         const emit = (payload: Record<string, unknown>) => {
-          controller.enqueue(
-            encoder.encode(`${JSON.stringify(payload)}\n`)
-          );
+          recordSendJobEvent(jobId, payload);
+
+          try {
+            controller.enqueue(
+              encoder.encode(`${JSON.stringify({ ...payload, jobId })}\n`)
+            );
+          } catch {
+            // Browser disconnected or reloaded. Keep the server-side send job alive.
+          }
         };
 
         try {
@@ -1716,6 +1728,9 @@ export async function POST(request: NextRequest) {
 
           async function worker(workerId: number) {
             while (true) {
+              const jobDecision = await waitForSendJob(jobId);
+              if (jobDecision === 'stop') return;
+
               const index = queueCursor;
               queueCursor += 1;
 
@@ -2226,6 +2241,12 @@ export async function POST(request: NextRequest) {
                 Date.now() + perAccountDelayMs
               );
 
+              const beforeSendDecision = await waitForSendJob(jobId);
+              if (beforeSendDecision === 'stop') {
+                completed = true;
+                break;
+              }
+
               const info = await transporter.sendMail({
                 from: finalFromName
                   ? {
@@ -2383,10 +2404,13 @@ export async function POST(request: NextRequest) {
             )
           );
 
+          const stoppedByUser = getSendJob(jobId)?.status === 'stopping';
+
           emit({
-            type: 'complete',
+            type: stoppedByUser ? 'stopped' : 'complete',
             sentCount,
             failedCount,
+            current: sentCount + failedCount,
             total: recipients.length,
             accountUsage: plan.map(
               (account) => ({
@@ -2411,7 +2435,11 @@ export async function POST(request: NextRequest) {
             transporter.close();
           }
 
-          controller.close();
+          try {
+            controller.close();
+          } catch {
+            // Client disconnected; job state remains available through /api/send-jobs/:jobId.
+          }
         }
       },
     });
