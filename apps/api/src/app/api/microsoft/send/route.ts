@@ -18,6 +18,7 @@ export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
 type SmtpSecurity = 'starttls' | 'ssl' | 'none';
+type SmtpAuthMethod = 'auto' | 'LOGIN' | 'PLAIN' | 'CRAM-MD5';
 
 type SmtpAccountInput = {
   id: string;
@@ -25,6 +26,7 @@ type SmtpAccountInput = {
   host: string;
   port: number;
   security: SmtpSecurity;
+  authMethod: SmtpAuthMethod;
   username: string;
   password: string;
   fromEmail: string;
@@ -73,6 +75,9 @@ function parseAccounts(raw: string): SmtpAccountInput[] {
         host: String(value.host || '').trim(),
         port: Math.max(1, Math.floor(Number(value.port || 587))),
         security,
+        authMethod: ['LOGIN', 'PLAIN', 'CRAM-MD5'].includes(String(value.authMethod || '').toUpperCase())
+          ? String(value.authMethod).toUpperCase() as SmtpAuthMethod
+          : 'auto',
         username: String(value.username || '').trim(),
         password: String(value.password || ''),
         fromEmail: String(value.fromEmail || '').trim(),
@@ -97,6 +102,7 @@ function createSmtpTransport(
     secure: account.security === 'ssl',
     requireTLS: account.security === 'starttls',
     ignoreTLS: account.security === 'none',
+    ...(account.authMethod !== 'auto' ? { authMethod: account.authMethod } : {}),
     auth: {
       user: account.username,
       pass: account.password,
