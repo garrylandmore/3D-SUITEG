@@ -4618,12 +4618,88 @@ function SmtpSenderPanel({
   );
   const [attachment, setAttachment] = React.useState<File | null>(null);
   const [sending, setSending] = React.useState(false);
+  const [sendJobId, setSendJobId] = React.useState('');
+  const [sendJobStatus, setSendJobStatus] = React.useState<
+    'idle' | 'running' | 'paused' | 'stopping' | 'stopped' | 'completed' | 'failed'
+  >('idle');
   const [smtpSendProgress, setSmtpSendProgress] = React.useState({
     current: 0,
     total: 0,
     sent: 0,
     failed: 0,
   });
+
+  React.useEffect(() => {
+    const key = `3d-suite:${senderMode}:active-send-job`;
+    const savedJobId = window.sessionStorage.getItem(key) || '';
+    if (savedJobId) {
+      setSendJobId(savedJobId);
+    }
+  }, [senderMode]);
+
+  React.useEffect(() => {
+    if (!sendJobId) return;
+
+    const key = `3d-suite:${senderMode}:active-send-job`;
+    window.sessionStorage.setItem(key, sendJobId);
+
+    let cancelled = false;
+
+    const poll = async () => {
+      try {
+        const response = await fetch(`/api/send-jobs/${encodeURIComponent(sendJobId)}`, {
+          cache: 'no-store',
+        });
+
+        if (!response.ok) {
+          if (response.status === 404) {
+            window.sessionStorage.removeItem(key);
+            if (!cancelled) {
+              setSendJobId('');
+              setSendJobStatus('idle');
+            }
+          }
+          return;
+        }
+
+        const data = (await response.json()) as {
+          job?: {
+            status?: 'running' | 'paused' | 'stopping' | 'stopped' | 'completed' | 'failed';
+            total?: number;
+            current?: number;
+            sent?: number;
+            failed?: number;
+          };
+        };
+
+        if (cancelled || !data.job) return;
+
+        const status = data.job.status || 'running';
+        setSendJobStatus(status);
+        setSending(status === 'running' || status === 'paused' || status === 'stopping');
+        setSmtpSendProgress({
+          current: data.job.current || 0,
+          total: data.job.total || 0,
+          sent: data.job.sent || 0,
+          failed: data.job.failed || 0,
+        });
+
+        if (status === 'completed' || status === 'stopped' || status === 'failed') {
+          window.sessionStorage.removeItem(key);
+        }
+      } catch {
+        // A transient dashboard/API connection failure must not stop the server-side job.
+      }
+    };
+
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [sendJobId, senderMode]);
 
   React.useEffect(() => {
     if (!recipientsText.trim() && leadEmails.length) {
@@ -5624,6 +5700,43 @@ function SmtpSenderPanel({
     }
   }
 
+  async function controlSendJob(action: 'pause' | 'resume' | 'stop') {
+    if (!sendJobId) return;
+
+    try {
+      const response = await fetch(`/api/send-jobs/${encodeURIComponent(sendJobId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+
+      const data = (await response.json().catch(() => ({}))) as {
+        job?: { status?: typeof sendJobStatus };
+        error?: string;
+      };
+
+      if (!response.ok) {
+        throw new Error(data.error || `Could not ${action} send job`);
+      }
+
+      if (data.job?.status) {
+        setSendJobStatus(data.job.status);
+      }
+
+      if (action === 'pause') {
+        onLog('warning', `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} sending paused — in-flight SMTP delivery may finish first`);
+      } else if (action === 'resume') {
+        onLog('info', `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} sending resumed`);
+      } else {
+        onLog('warning', `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} stop requested — no new recipients will be started`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      onToast(message, 'error');
+      onLog('error', message);
+    }
+  }
+
   async function sendSmtp() {
     const usableAccounts = accounts.filter((account) => {
       if (!account.enabled) return false;
@@ -5679,6 +5792,14 @@ function SmtpSenderPanel({
       }
     }
 
+    const currentJobId = makeId(`${senderMode}-send`);
+    setSendJobId(currentJobId);
+    setSendJobStatus('running');
+    window.sessionStorage.setItem(
+      `3d-suite:${senderMode}:active-send-job`,
+      currentJobId
+    );
+
     setSending(true);
     setSmtpSendProgress({
       current: 0,
@@ -5695,6 +5816,7 @@ function SmtpSenderPanel({
           );
 
       const formData = new FormData();
+      formData.append('jobId', currentJobId);
       formData.append('accounts', JSON.stringify(plan));
       formData.append('rotateAccounts', rotateAccounts ? 'true' : 'false');
       formData.append(
@@ -6063,7 +6185,28 @@ function SmtpSenderPanel({
                       }`
                     );
                   }
+                } else if (event.type === 'stopped') {
+                  setSending(false);
+                  setSendJobStatus('stopped');
+                  window.sessionStorage.removeItem(
+                    `3d-suite:${senderMode}:active-send-job`
+                  );
+                  setSmtpSendProgress((current) => ({
+                    current: (event.sentCount || 0) + (event.failedCount || 0),
+                    total: event.total || current.total || recipients.length,
+                    sent: event.sentCount || 0,
+                    failed: event.failedCount || 0,
+                  }));
+                  onLog(
+                    'warning',
+                    `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} stopped — ${(event.sentCount || 0) + (event.failedCount || 0)}/${event.total || recipients.length} processed`
+                  );
                 } else if (event.type === 'complete') {
+                  setSending(false);
+                  setSendJobStatus('completed');
+                  window.sessionStorage.removeItem(
+                    `3d-suite:${senderMode}:active-send-job`
+                  );
                   setSmtpSendProgress({
                     current: recipients.length,
                     total: recipients.length,
@@ -7952,24 +8095,63 @@ function SmtpSenderPanel({
             </div>
           )}
 
-          <button
-            type="button"
-            className="rounded bg-[#6C63FF] px-4 py-2 text-white disabled:opacity-50"
-            disabled={sending || recipients.length === 0}
-            onClick={() => void sendSmtp()}
-          >
-            {sending
-              ? `Sending ${
-                  senderMode === 'microsoft'
-                    ? 'Microsoft SMTP'
-                    : 'SMTP'
-                } (${recipients.length})…`
-              : `Send ${recipients.length || ''} via ${
-                  senderMode === 'microsoft'
-                    ? 'Microsoft'
-                    : 'SMTP'
-                }`}
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className="rounded bg-[#6C63FF] px-4 py-2 text-white disabled:opacity-50"
+              disabled={sending || recipients.length === 0}
+              onClick={() => void sendSmtp()}
+            >
+              {sending
+                ? `Sending ${
+                    senderMode === 'microsoft'
+                      ? 'Microsoft SMTP'
+                      : 'SMTP'
+                  } (${recipients.length})…`
+                : `Send ${recipients.length || ''} via ${
+                    senderMode === 'microsoft'
+                      ? 'Microsoft'
+                      : 'SMTP'
+                  }`}
+            </button>
+
+            {sending && sendJobStatus === 'running' && (
+              <button
+                type="button"
+                className="rounded border border-amber-400 bg-amber-50 px-4 py-2 text-amber-800"
+                onClick={() => void controlSendJob('pause')}
+              >
+                Pause
+              </button>
+            )}
+
+            {sending && sendJobStatus === 'paused' && (
+              <button
+                type="button"
+                className="rounded border border-emerald-400 bg-emerald-50 px-4 py-2 text-emerald-800"
+                onClick={() => void controlSendJob('resume')}
+              >
+                Resume
+              </button>
+            )}
+
+            {sending && (
+              <button
+                type="button"
+                className="rounded border border-red-400 bg-red-50 px-4 py-2 text-red-700 disabled:opacity-50"
+                disabled={sendJobStatus === 'stopping'}
+                onClick={() => void controlSendJob('stop')}
+              >
+                {sendJobStatus === 'stopping' ? 'Stopping…' : 'Stop'}
+              </button>
+            )}
+
+            {sendJobStatus !== 'idle' && (
+              <span className="text-xs text-slate-500">
+                Job: {sendJobStatus}
+              </span>
+            )}
+          </div>
         </div>
       </Panel>
     </div>
