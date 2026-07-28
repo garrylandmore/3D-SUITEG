@@ -683,15 +683,19 @@ function randomDigits(length: number): string {
   return result;
 }
 
-async function buildQrCodeDataUri(value: string): Promise<string> {
+async function buildQrCodeDataUri(
+  value: string,
+  size = 512,
+  errorCorrectionLevel: 'L' | 'M' | 'Q' | 'H' = 'M'
+): Promise<string> {
   const data = String(value || '').trim();
   if (!data) return '';
 
   return await QRCode.toDataURL(data, {
     type: 'image/png',
-    errorCorrectionLevel: 'M',
+    errorCorrectionLevel,
     margin: 1,
-    width: 512,
+    width: Math.min(1024, Math.max(96, Math.floor(size || 512))),
   });
 }
 
@@ -1259,6 +1263,23 @@ export async function POST(request: NextRequest) {
       formData.get('qrCustomData') || ''
     ).trim();
 
+
+    const qrSize = Math.min(
+      1024,
+      Math.max(96, Math.floor(Number(formData.get('qrSize') || 512)))
+    );
+
+    const qrErrorCorrectionRaw = String(
+      formData.get('qrErrorCorrection') || 'M'
+    ).toUpperCase();
+
+    const qrErrorCorrection: 'L' | 'M' | 'Q' | 'H' =
+      qrErrorCorrectionRaw === 'L' ||
+      qrErrorCorrectionRaw === 'Q' ||
+      qrErrorCorrectionRaw === 'H'
+        ? qrErrorCorrectionRaw
+        : 'M';
+
     const attachmentEnabled =
       String(formData.get('attachmentEnabled') || 'false') === 'true';
 
@@ -1671,7 +1692,7 @@ export async function POST(request: NextRequest) {
               });
 
               const qrDataUri = qrEnabled
-                ? await buildQrCodeDataUri(qrRawValue)
+                ? await buildQrCodeDataUri(qrRawValue, qrSize, qrErrorCorrection)
                 : '';
 
               let bodySource = bodyTemplate;
