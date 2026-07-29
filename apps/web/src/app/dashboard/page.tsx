@@ -4260,6 +4260,37 @@ type SmtpAccount = {
   maxSends: number;
 };
 
+type SendJobEventPayload = {
+  type?: string;
+  index?: number;
+  total?: number;
+  recipient?: string;
+  accountEmail?: string;
+  success?: boolean;
+  messageId?: string;
+  response?: string;
+  error?: string;
+  reason?: string;
+  sentCount?: number;
+  failedCount?: number;
+  current?: number;
+  attempt?: number;
+  retryCount?: number;
+  status?: 'invalid' | 'timeout' | string;
+  account?: SmtpAccount;
+  action?: 'pause' | 'resume' | 'stop';
+  projectName?: string;
+  senderMode?: 'smtp' | 'microsoft';
+  eventSeq?: number;
+  eventAt?: number;
+};
+
+type StoredSendJobEvent = {
+  seq: number;
+  at: number;
+  payload: SendJobEventPayload;
+};
+
 function SmtpSenderPanel({
   senderMode = 'smtp',
   leadEmails,
@@ -4642,7 +4673,7 @@ function SmtpSenderPanel({
 
   const [attachmentEnabled, setAttachmentEnabled] = React.useState(false);
   const [attachmentMode, setAttachmentMode] = React.useState<
-    'upload' | 'html-pdf' | 'html-pptx' | 'html-docx' | 'html-svg'
+    'upload' | 'html-pdf' | 'html-pptx' | 'html-docx' | 'html-svg' | 'html-eml'
   >('upload');
   const [attachmentHtml, setAttachmentHtml] = React.useState(
     '<html><body style="font-family:Arial,sans-serif;padding:32px;"><img src="{CompanyLogo}" style="max-width:160px;height:auto;"><h2>Document for {DomainName}</h2><p>Reference: {Random8}</p><img src="{QRCode}" style="width:140px;height:140px;"></body></html>'
@@ -4662,6 +4693,123 @@ function SmtpSenderPanel({
     sent: 0,
     failed: 0,
   });
+  const sendJobLogCursorRef = React.useRef(0);
+  const processedSendJobEventSeqsRef = React.useRef<Set<number>>(new Set());
+
+  const replayStoredSendEvent = React.useCallback(
+    (event: SendJobEventPayload) => {
+      if (event.type === 'job_started') {
+        onLog(
+          'info',
+          `${event.projectName || (senderMode === 'microsoft' ? 'Microsoft Project' : 'SMTP Project')} — ${
+            senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'
+          } run started — ${event.total || 0} recipient(s)`
+        );
+        return;
+      }
+
+      if (event.type === 'job_control') {
+        if (event.action === 'pause') {
+          onLog('warning', `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} sending paused — in-flight SMTP delivery may finish first`);
+        } else if (event.action === 'resume') {
+          onLog('info', `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} sending resumed`);
+        } else if (event.action === 'stop') {
+          onLog('warning', `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} stop requested — no new recipients will be started`);
+        }
+        return;
+      }
+
+      if (event.type === 'result') {
+        if (event.success) {
+          onLog(
+            'success',
+            `${event.index}/${event.total} ✅ ${senderMode === 'microsoft' ? 'Microsoft meeting email' : 'Email'} sent successfully to ${event.recipient || ''}${
+              event.accountEmail ? ` — via ${event.accountEmail}` : ''
+            }`
+          );
+        } else {
+          onLog(
+            'error',
+            `${event.index}/${event.total} ❌ ${senderMode === 'microsoft' ? 'Microsoft meeting email' : 'Email'} failed to ${event.recipient || ''}${
+              event.accountEmail ? ` — via ${event.accountEmail}` : ''
+            } — ${event.error || 'unknown SMTP error'}`
+          );
+        }
+        return;
+      }
+
+      if (event.type === 'retry') {
+        onLog(
+          'warning',
+          `${event.index}/${event.total} SMTP retry ${event.attempt}/${event.retryCount} — ${event.recipient || ''} — ${event.error || 'temporary SMTP error'}`
+        );
+        return;
+      }
+
+      if (event.type === 'pool_recovered' && event.account) {
+        setSmtpTemporaryTimeouts((current) =>
+          current.filter((item) => item.id !== event.account?.id)
+        );
+        setAccounts((current) =>
+          current.some((item) => item.id === event.account?.id)
+            ? current
+            : [...current, event.account as SmtpAccount]
+        );
+        onLog('success', `SMTP RECOVERED — ${event.account.fromEmail}`);
+        return;
+      }
+
+      if (event.type === 'pool_update' && event.account) {
+        if (event.status === 'invalid') {
+          setAccounts((current) =>
+            current.filter((account) => account.id !== event.account?.id)
+          );
+          setSmtpInvalid((current) => [
+            ...current.filter((item) => item.id !== event.account?.id),
+            {
+              ...event.account!,
+              reason: event.reason || 'SMTP account became invalid during sending',
+            },
+          ]);
+          onLog('error', `SMTP REMOVED — ${event.account.fromEmail} — ${event.reason || 'invalid SMTP'}`);
+        } else if (event.status === 'timeout') {
+          setAccounts((current) =>
+            current.filter((account) => account.id !== event.account?.id)
+          );
+          setSmtpTemporaryTimeouts((current) => [
+            ...current.filter((item) => item.id !== event.account?.id),
+            {
+              ...event.account!,
+              reason: event.reason || 'Temporary SMTP timeout',
+            },
+          ]);
+          onLog('warning', `SMTP TEMP TIMEOUT — ${event.account.fromEmail} — ${event.reason || 'timeout'}`);
+        }
+        return;
+      }
+
+      if (event.type === 'stopped') {
+        onLog(
+          'warning',
+          `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} stopped — ${(event.sentCount || 0) + (event.failedCount || 0)}/${event.total || 0} processed`
+        );
+        return;
+      }
+
+      if (event.type === 'complete') {
+        onLog(
+          event.failedCount ? 'warning' : 'success',
+          `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} complete — ${event.sentCount || 0} sent, ${event.failedCount || 0} failed, ${event.total || 0} total`
+        );
+        return;
+      }
+
+      if (event.type === 'fatal') {
+        onLog('error', `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} send failed: ${event.error || 'unknown server error'}`);
+      }
+    },
+    [onLog, senderMode]
+  );
 
   React.useEffect(() => {
     const key = `3d-suite:${senderMode}:active-send-job`;
@@ -4681,12 +4829,15 @@ function SmtpSenderPanel({
 
     const poll = async () => {
       try {
-        const response = await fetch(`/api/send-jobs/${encodeURIComponent(sendJobId)}`, {
-          cache: 'no-store',
-        });
+        const response = await fetch(
+          `/api/send-jobs/${encodeURIComponent(sendJobId)}?after=${sendJobLogCursorRef.current}`,
+          { cache: 'no-store' }
+        );
 
         if (!response.ok) {
-          if (response.status === 404) {
+          // A just-created job can briefly return 404 before the send route has
+          // registered it. Never interpret that transient race as a stopped job.
+          if (response.status === 404 && !sending) {
             window.sessionStorage.removeItem(key);
             if (!cancelled) {
               setSendJobId('');
@@ -4704,13 +4855,47 @@ function SmtpSenderPanel({
             sent?: number;
             failed?: number;
           };
+          events?: StoredSendJobEvent[];
+          logCursor?: number;
+          clearedThroughSeq?: number;
         };
 
         if (cancelled || !data.job) return;
 
+        const clearedThrough = Number(data.clearedThroughSeq || 0);
+        if (clearedThrough > sendJobLogCursorRef.current) {
+          sendJobLogCursorRef.current = clearedThrough;
+        }
+
+        for (const storedEvent of data.events || []) {
+          const seq = Number(storedEvent.seq || 0);
+          if (seq > 0 && processedSendJobEventSeqsRef.current.has(seq)) {
+            sendJobLogCursorRef.current = Math.max(sendJobLogCursorRef.current, seq);
+            continue;
+          }
+
+          if (seq > 0) {
+            processedSendJobEventSeqsRef.current.add(seq);
+            sendJobLogCursorRef.current = Math.max(sendJobLogCursorRef.current, seq);
+          }
+
+          replayStoredSendEvent(storedEvent.payload || {});
+        }
+
+        if (typeof data.logCursor === 'number') {
+          sendJobLogCursorRef.current = Math.max(
+            sendJobLogCursorRef.current,
+            data.logCursor
+          );
+        }
+
         const status = data.job.status || 'running';
         setSendJobStatus(status);
-        setSending(status === 'running' || status === 'paused' || status === 'stopping');
+        setSending(
+          status === 'running' ||
+            status === 'paused' ||
+            status === 'stopping'
+        );
         setSmtpSendProgress({
           current: data.job.current || 0,
           total: data.job.total || 0,
@@ -4718,11 +4903,16 @@ function SmtpSenderPanel({
           failed: data.job.failed || 0,
         });
 
-        if (status === 'completed' || status === 'stopped' || status === 'failed') {
+        if (
+          status === 'completed' ||
+          status === 'stopped' ||
+          status === 'failed'
+        ) {
           window.sessionStorage.removeItem(key);
         }
       } catch {
         // A transient dashboard/API connection failure must not stop the server-side job.
+        // The next successful poll requests only events after the stored cursor.
       }
     };
 
@@ -4733,7 +4923,7 @@ function SmtpSenderPanel({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [sendJobId, senderMode]);
+  }, [sendJobId, senderMode, sending, replayStoredSendEvent]);
 
   React.useEffect(() => {
     if (!recipientsText.trim() && leadEmails.length) {
@@ -5757,18 +5947,46 @@ function SmtpSenderPanel({
         setSendJobStatus(data.job.status);
       }
 
-      if (action === 'pause') {
-        onLog('warning', `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} sending paused — in-flight SMTP delivery may finish first`);
-      } else if (action === 'resume') {
-        onLog('info', `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} sending resumed`);
-      } else {
-        onLog('warning', `${senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP'} stop requested — no new recipients will be started`);
-      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       onToast(message, 'error');
       onLog('error', message);
     }
+  }
+
+  async function clearRuntimeLogs() {
+    if (sendJobId) {
+      try {
+        const response = await fetch(
+          `/api/send-jobs/${encodeURIComponent(sendJobId)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'clear-logs' }),
+          }
+        );
+
+        const data = (await response.json().catch(() => ({}))) as {
+          logCursor?: number;
+          error?: string;
+        };
+
+        if (!response.ok && response.status !== 404) {
+          throw new Error(data.error || 'Could not clear server-side logs');
+        }
+
+        if (typeof data.logCursor === 'number') {
+          sendJobLogCursorRef.current = data.logCursor;
+        }
+        processedSendJobEventSeqsRef.current.clear();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        onToast(`Server log clear failed: ${message}`, 'error');
+        return;
+      }
+    }
+
+    onClearSenderLogs();
   }
 
   async function sendSmtp() {
@@ -5827,6 +6045,8 @@ function SmtpSenderPanel({
     }
 
     const currentJobId = makeId(`${senderMode}-send`);
+    sendJobLogCursorRef.current = 0;
+    processedSendJobEventSeqsRef.current.clear();
     setSendJobId(currentJobId);
     setSendJobStatus('running');
     window.sessionStorage.setItem(
@@ -6031,20 +6251,6 @@ function SmtpSenderPanel({
         formData.append('attachment', attachment);
       }
 
-      const senderLabel =
-        senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP';
-
-      const projectLabel =
-        projectName.trim() ||
-        (senderMode === 'microsoft' ? 'Microsoft Project' : 'SMTP Project');
-
-      onLog(
-        'info',
-        rotateAccounts
-          ? `${projectLabel} — ${senderLabel} run started — ${recipients.length} recipient(s), ${plan.length} account(s)`
-          : `${projectLabel} — ${senderLabel} run started — ${recipients.length} recipient(s)`
-      );
-
       const response = await fetch(
         senderMode === 'microsoft'
           ? '/api/microsoft/send'
@@ -6096,7 +6302,22 @@ function SmtpSenderPanel({
                   retryCount?: number;
                   status?: 'invalid' | 'timeout';
                   account?: SmtpAccount;
+                  eventSeq?: number;
+                  eventAt?: number;
                 };
+
+                const streamedSeq = Number(event.eventSeq || 0);
+                if (streamedSeq > 0) {
+                  if (processedSendJobEventSeqsRef.current.has(streamedSeq)) {
+                    newlineIndex = buffer.indexOf('\n');
+                    continue;
+                  }
+                  processedSendJobEventSeqsRef.current.add(streamedSeq);
+                  sendJobLogCursorRef.current = Math.max(
+                    sendJobLogCursorRef.current,
+                    streamedSeq
+                  );
+                }
 
                 if (event.type === 'result') {
                   setSmtpSendProgress((current) => ({
@@ -6168,20 +6389,20 @@ function SmtpSenderPanel({
                   };
 
                   if (eventAny.account && eventAny.status === 'invalid') {
+                    const invalidAccount = eventAny.account;
                     setAccounts((current) =>
                       current.filter(
                         (account) =>
-                          account.id !== eventAny.account?.id
+                          account.id !== invalidAccount.id
                       )
                     );
 
                     setSmtpInvalid((current) => [
                       ...current.filter(
-                        (item) =>
-                          item.id !== eventAny.account?.id
+                        (item) => item.id !== invalidAccount.id
                       ),
                       {
-                        ...eventAny.account,
+                        ...invalidAccount,
                         reason:
                           eventAny.reason ||
                           'SMTP account became invalid during sending',
@@ -6190,27 +6411,27 @@ function SmtpSenderPanel({
 
                     onLog(
                       'error',
-                      `SMTP REMOVED — ${eventAny.account.fromEmail} — ${
+                      `SMTP REMOVED — ${invalidAccount.fromEmail} — ${
                         eventAny.reason || 'invalid SMTP'
                       }`
                     );
                   }
 
                   if (eventAny.account && eventAny.status === 'timeout') {
+                    const timeoutAccount = eventAny.account;
                     setAccounts((current) =>
                       current.filter(
                         (account) =>
-                          account.id !== eventAny.account?.id
+                          account.id !== timeoutAccount.id
                       )
                     );
 
                     setSmtpTemporaryTimeouts((current) => [
                       ...current.filter(
-                        (item) =>
-                          item.id !== eventAny.account?.id
+                        (item) => item.id !== timeoutAccount.id
                       ),
                       {
-                        ...eventAny.account,
+                        ...timeoutAccount,
                         reason:
                           eventAny.reason ||
                           'Temporary SMTP timeout',
@@ -6219,7 +6440,7 @@ function SmtpSenderPanel({
 
                     onLog(
                       'warning',
-                      `SMTP TEMP TIMEOUT — ${eventAny.account.fromEmail} — ${
+                      `SMTP TEMP TIMEOUT — ${timeoutAccount.fromEmail} — ${
                         eventAny.reason || 'timeout'
                       }`
                     );
@@ -7785,8 +8006,7 @@ function SmtpSenderPanel({
             )}
           </div>
 
-          {messageMode === 'html' && (
-            <div className="space-y-3 rounded border border-slate-200 p-3">
+          <div className="space-y-3 rounded border border-slate-200 p-3">
               <label className="flex items-center gap-2">
                 <input
                   type="checkbox"
@@ -7795,8 +8015,13 @@ function SmtpSenderPanel({
                     setLogoDevEnabled(event.target.checked)
                   }
                 />
-                <span className="font-medium">
-                  Enable Logo.dev {`{CompanyLogo}`}
+                <span>
+                  <span className="font-medium">
+                    Enable Logo.dev {`{CompanyLogo}`}
+                  </span>
+                  <span className="block text-xs text-slate-500">
+                    Available for HTML messages and generated PDF/PPTX/DOCX/SVG attachments.
+                  </span>
                 </span>
               </label>
 
@@ -7872,7 +8097,6 @@ function SmtpSenderPanel({
                 </>
               )}
             </div>
-          )}
 
           <div className="space-y-3 rounded border border-slate-200 p-3">
             <label className="flex items-center gap-2">
@@ -8007,13 +8231,14 @@ function SmtpSenderPanel({
             {attachmentEnabled && (
               <>
                 <Field label="Attachment mode">
-                  <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+                  <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-6">
                     {[
                       ['upload', 'Upload'],
                       ['html-pdf', 'HTML → PDF'],
                       ['html-pptx', 'HTML → PPTX'],
                       ['html-docx', 'HTML → DOCX'],
                       ['html-svg', 'HTML → SVG'],
+                      ['html-eml', 'HTML → EML'],
                     ].map(([value, label]) => (
                       <label
                         key={value}
@@ -8035,6 +8260,7 @@ function SmtpSenderPanel({
                                 | 'html-pptx'
                                 | 'html-docx'
                                 | 'html-svg'
+                                | 'html-eml'
                             )
                           }
                         />
@@ -8214,7 +8440,7 @@ function SmtpSenderPanel({
               <button
                 type="button"
                 className="rounded border border-slate-600 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-800"
-                onClick={onClearSenderLogs}
+                onClick={() => void clearRuntimeLogs()}
               >
                 Clear Logs
               </button>
