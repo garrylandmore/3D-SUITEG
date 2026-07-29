@@ -42,7 +42,7 @@ type SmtpPlanAccount = SmtpAccountInput & {
   used: number;
 };
 
-type MicrosoftProxyInput = {
+type SmtpProxyInput = {
   id: string;
   url: string;
   enabled: boolean;
@@ -1110,113 +1110,6 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-function escapeIcsText(value: string): string {
-  return String(value || '')
-    .replace(/\\/g, '\\\\')
-    .replace(/\r?\n/g, '\\n')
-    .replace(/,/g, '\\,')
-    .replace(/;/g, '\\;');
-}
-
-function formatIcsDate(value: Date): string {
-  return value
-    .toISOString()
-    .replace(/[-:]/g, '')
-    .replace(/\.\d{3}Z$/, 'Z');
-}
-
-function buildMicrosoftRsvpCalendar(args: {
-  recipient: string;
-  organizerEmail: string;
-  organizerName: string;
-  title: string;
-  description: string;
-  location: string;
-  durationMinutes: number;
-  reminderMinutes: number;
-}): string {
-  const start = new Date();
-  const end = new Date(
-    start.getTime() + args.durationMinutes * 60 * 1000
-  );
-
-  const senderDomain =
-    args.organizerEmail.split('@')[1] || 'localhost';
-
-  const uid =
-    `${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2)}@${senderDomain}`;
-
-  const lines = [
-    'BEGIN:VCALENDAR',
-    'VERSION:2.0',
-    'PRODID:-//Microsoft Corporation//Outlook 16.0 MIMEDIR//EN',
-    'CALSCALE:GREGORIAN',
-    'METHOD:REQUEST',
-    'BEGIN:VEVENT',
-    `UID:${uid}`,
-    `DTSTAMP:${formatIcsDate(start)}`,
-    `DTSTART:${formatIcsDate(start)}`,
-    `DTEND:${formatIcsDate(end)}`,
-    `ORGANIZER;CN="${escapeIcsText(
-      args.organizerName
-    )}":MAILTO:${args.organizerEmail}`,
-    `ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN="${escapeIcsText(
-      args.recipient.split('@')[0]
-    )}":MAILTO:${args.recipient}`,
-    `SUMMARY:${escapeIcsText(args.title)}`,
-    `DESCRIPTION:${escapeIcsText(args.description)}`,
-    `LOCATION:${escapeIcsText(args.location)}`,
-    'SEQUENCE:0',
-    'PRIORITY:5',
-    'CLASS:PUBLIC',
-    'STATUS:CONFIRMED',
-    'TRANSP:OPAQUE',
-  ];
-
-  if (args.reminderMinutes > 0) {
-    lines.push(
-      'BEGIN:VALARM',
-      'ACTION:DISPLAY',
-      'DESCRIPTION:REMINDER',
-      `TRIGGER;RELATED=START:-PT${args.reminderMinutes}M`,
-      'END:VALARM'
-    );
-  }
-
-  lines.push('END:VEVENT', 'END:VCALENDAR');
-
-  return lines.join('\r\n');
-}
-
-function validateOnBehalfAlias(
-  authenticatedFrom: string,
-  alias: string
-): void {
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(alias)) {
-    throw new Error(
-      'On-behalf From alias is not a valid email address.'
-    );
-  }
-
-  const authenticatedDomain =
-    authenticatedFrom.split('@')[1]?.toLowerCase() || '';
-
-  const aliasDomain =
-    alias.split('@')[1]?.toLowerCase() || '';
-
-  if (
-    !authenticatedDomain ||
-    !aliasDomain ||
-    authenticatedDomain !== aliasDomain
-  ) {
-    throw new Error(
-      'On-behalf From alias must use the same domain as the authenticated SMTP account.'
-    );
-  }
-}
-
 function classifySmtpSendError(error: unknown): {
   kind: 'invalid' | 'timeout' | 'message';
   reason: string;
@@ -1283,7 +1176,7 @@ export async function POST(request: NextRequest) {
 
     const requestedJobId = String(formData.get('jobId') || '').trim();
     const jobId = requestedJobId || `send-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-    const projectName = String(formData.get('projectName') || '').trim() || 'Microsoft Project';
+    const projectName = String(formData.get('projectName') || '').trim() || 'SMTP Project';
 
     const accounts = parseAccounts(
       String(formData.get('accounts') || '[]')
@@ -1308,29 +1201,46 @@ export async function POST(request: NextRequest) {
     const rotateAccounts =
       String(formData.get('rotateAccounts') || 'false') === 'true';
 
-    const microsoftProxyEnabled =
-      String(formData.get('microsoftProxyEnabled') || 'false') === 'true';
-    const microsoftProxyRotate =
-      String(formData.get('microsoftProxyRotate') || 'false') === 'true';
-    const microsoftProxies = microsoftProxyEnabled
-      ? ((JSON.parse(
-          String(formData.get('microsoftProxies') || '[]')
+    const smtpProxyEnabled =
+      String(formData.get('smtpProxyEnabled') || 'false') === 'true';
+
+    const smtpProxyRotate =
+      String(formData.get('smtpProxyRotate') || 'false') === 'true';
+
+    let smtpProxies: SmtpProxyInput[] = [];
+
+    if (smtpProxyEnabled) {
+      try {
+        smtpProxies = (JSON.parse(
+          String(formData.get('smtpProxies') || '[]')
         ) as unknown[])
           .map((item, index) => {
             const value = (item || {}) as Record<string, unknown>;
+
             return {
               id: String(value.id || `proxy-${index + 1}`),
               url: String(value.url || '').trim(),
               enabled: value.enabled !== false,
-            } satisfies MicrosoftProxyInput;
+            };
           })
           .filter(
             (proxy) =>
               proxy.enabled && isSupportedProxyUrl(proxy.url)
-          ))
-      : [];
+          );
+      } catch {
+        return new Response(
+          JSON.stringify({
+            error: 'SMTP proxy configuration is not valid JSON.',
+          }),
+          {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          }
+        );
+      }
+    }
 
-    if (microsoftProxyEnabled && !microsoftProxies.length) {
+    if (smtpProxyEnabled && !smtpProxies.length) {
       return new Response(
         JSON.stringify({
           error:
@@ -1437,106 +1347,6 @@ export async function POST(request: NextRequest) {
     const replyTo = String(
       formData.get('replyTo') || ''
     ).trim();
-
-    const microsoftMeetingEnabled =
-      String(
-        formData.get('microsoftMeetingEnabled') || 'true'
-      ) === 'true';
-
-    const meetingTitleTemplate = String(
-      formData.get('meetingTitleTemplate') ||
-        '{DomainName} Meeting Invitation'
-    );
-
-    const meetingDescriptionTemplate = String(
-      formData.get('meetingDescriptionTemplate') ||
-        'You are invited to join our meeting. Please RSVP to confirm your attendance.'
-    );
-
-    const meetingLocationTemplate = String(
-      formData.get('meetingLocationTemplate') ||
-        '{DomainName} Conference Room'
-    );
-
-    const meetingOrganizerNameTemplate = String(
-      formData.get('meetingOrganizerNameTemplate') ||
-        '{DomainName} Meetings'
-    );
-
-    const meetingDurationMinutes = Math.min(
-      1440,
-      Math.max(
-        5,
-        Math.floor(
-          Number(
-            formData.get('meetingDurationMinutes') || 60
-          )
-        )
-      )
-    );
-
-    const meetingReminderMinutes = Math.min(
-      1440,
-      Math.max(
-        0,
-        Math.floor(
-          Number(
-            formData.get('meetingReminderMinutes') || 15
-          )
-        )
-      )
-    );
-
-    const onBehalfEnabled =
-      String(formData.get('onBehalfEnabled') || 'false') ===
-      'true';
-
-    const onBehalfRandomize =
-      String(formData.get('onBehalfRandomize') || 'false') ===
-      'true';
-
-    const parseStringList = (raw: FormDataEntryValue | null) => {
-      try {
-        const parsed = JSON.parse(String(raw || '[]')) as unknown[];
-        return Array.from(
-          new Set(
-            parsed
-              .map((item) => String(item || '').trim())
-              .filter(Boolean)
-          )
-        );
-      } catch {
-        return [];
-      }
-    };
-
-    const onBehalfDisplayNames = parseStringList(
-      formData.get('onBehalfDisplayNames')
-    );
-
-    const onBehalfPrefixes = parseStringList(
-      formData.get('onBehalfPrefixes')
-    )
-      .map((prefix) => prefix.replace(/^@+/, ''))
-      .filter((prefix) =>
-        /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(prefix)
-      );
-
-    if (
-      onBehalfEnabled &&
-      (!onBehalfDisplayNames.length || !onBehalfPrefixes.length)
-    ) {
-      return new Response(
-        JSON.stringify({
-          error:
-            'Send on behalf is enabled but no valid display name/prefix is configured.',
-        }),
-        {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' },
-        }
-      );
-    }
 
     const subjectTemplate = String(
       formData.get('subjectTemplate') || ''
@@ -1821,7 +1631,7 @@ export async function POST(request: NextRequest) {
       })
     );
 
-    registerSendJob(jobId, 'microsoft', recipients.length, projectName);
+    registerSendJob(jobId, 'smtp', recipients.length, projectName);
 
     const encoder = new TextEncoder();
 
@@ -1831,33 +1641,46 @@ export async function POST(request: NextRequest) {
           string,
           ReturnType<typeof createSmtpTransport>
         >();
+
         let proxyRotationCursor = 0;
-        const activeProxyUrls = microsoftProxies.map((proxy) => proxy.url);
+
+        const activeProxyUrls = smtpProxies.map(
+          (proxy) => proxy.url
+        );
+
         const primaryProxyUrl = activeProxyUrls[0];
 
         const getProxyUrl = () => {
-          if (!microsoftProxyEnabled || !activeProxyUrls.length) {
+          if (!smtpProxyEnabled || !activeProxyUrls.length) {
             return undefined;
           }
-          if (!microsoftProxyRotate || activeProxyUrls.length === 1) {
+
+          if (!smtpProxyRotate || activeProxyUrls.length === 1) {
             return primaryProxyUrl;
           }
 
           const url =
-            activeProxyUrls[proxyRotationCursor % activeProxyUrls.length];
+            activeProxyUrls[
+              proxyRotationCursor % activeProxyUrls.length
+            ];
+
           proxyRotationCursor =
             (proxyRotationCursor + 1) % activeProxyUrls.length;
+
           return url;
         };
 
-        const transporterKey = (accountId: string, proxyUrl?: string) =>
-          `${accountId}::${proxyUrl || 'direct'}`;
+        const transporterKey = (
+          accountId: string,
+          proxyUrl?: string
+        ) => `${accountId}::${proxyUrl || 'direct'}`;
 
         const getTransporter = (
           account: SmtpPlanAccount,
           proxyUrl?: string
         ) => {
           const key = transporterKey(account.id, proxyUrl);
+
           let transporter = transporters.get(key);
 
           if (!transporter) {
@@ -1866,10 +1689,22 @@ export async function POST(request: NextRequest) {
               connectionTimeoutMs,
               proxyUrl
             );
+
             transporters.set(key, transporter);
           }
 
           return transporter;
+        };
+
+        const closeTransportersForAccount = (accountId: string) => {
+          Array.from(transporters.entries()).forEach(
+            ([key, transporter]) => {
+              if (key.startsWith(`${accountId}::`)) {
+                transporter.close();
+                transporters.delete(key);
+              }
+            }
+          );
         };
 
         const emit = (payload: Record<string, unknown>) => {
@@ -1888,7 +1723,7 @@ export async function POST(request: NextRequest) {
           for (const account of plan) {
             getTransporter(
               account,
-              microsoftProxyEnabled ? primaryProxyUrl : undefined
+              smtpProxyEnabled ? primaryProxyUrl : undefined
             );
           }
 
@@ -1954,7 +1789,7 @@ export async function POST(request: NextRequest) {
               const testTransport = createSmtpTransport(
                 item.account,
                 connectionTimeoutMs,
-                microsoftProxyEnabled ? primaryProxyUrl : undefined
+                smtpProxyEnabled ? primaryProxyUrl : undefined
               );
 
               try {
@@ -1965,7 +1800,7 @@ export async function POST(request: NextRequest) {
 
                 getTransporter(
                   item.account,
-                  microsoftProxyEnabled ? primaryProxyUrl : undefined
+                  smtpProxyEnabled ? primaryProxyUrl : undefined
                 );
 
                 emit({
@@ -2029,6 +1864,7 @@ export async function POST(request: NextRequest) {
             account.used += 1;
 
             const selectedProxyUrl = getProxyUrl();
+
             const transporter = getTransporter(
               account,
               selectedProxyUrl
@@ -2115,155 +1951,10 @@ export async function POST(request: NextRequest) {
                 recipient,
                 originalFilename,
                 {
-                  attachmentLink:
-                    resolvedAttachmentLink,
-                  ctaLink: resolvedCtaLink,
+                  attachmentLink,
+                  ctaLink,
                 }
               );
-
-              let finalFromEmail = account.fromEmail;
-              let finalFromName = resolvedFromName;
-
-              if (onBehalfEnabled) {
-                const authenticatedDomain =
-                  account.fromEmail
-                    .split('@')[1]
-                    ?.trim()
-                    .toLowerCase() || '';
-
-                if (!authenticatedDomain) {
-                  throw new Error(
-                    `${account.label}: authenticated From address has no valid domain.`
-                  );
-                }
-
-                const displayNameTemplate = onBehalfRandomize
-                  ? onBehalfDisplayNames[
-                      Math.floor(
-                        Math.random() * onBehalfDisplayNames.length
-                      )
-                    ]
-                  : onBehalfDisplayNames[0];
-
-                const prefixTemplate = onBehalfRandomize
-                  ? onBehalfPrefixes[
-                      Math.floor(Math.random() * onBehalfPrefixes.length)
-                    ]
-                  : onBehalfPrefixes[0];
-
-                const resolvedOnBehalfDisplayName = placeholders(
-                  displayNameTemplate,
-                  recipient,
-                  originalFilename,
-                  {
-                    attachmentLink: resolvedAttachmentLink,
-                    ctaLink: resolvedCtaLink,
-                  }
-                ).trim();
-
-                const resolvedPrefix = placeholders(
-                  prefixTemplate,
-                  recipient,
-                  originalFilename,
-                  {
-                    attachmentLink: resolvedAttachmentLink,
-                    ctaLink: resolvedCtaLink,
-                  }
-                )
-                  .trim()
-                  .replace(/^@+/, '');
-
-                if (
-                  !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$/.test(
-                    resolvedPrefix
-                  )
-                ) {
-                  throw new Error(
-                    `Invalid on-behalf prefix "${resolvedPrefix}".`
-                  );
-                }
-
-                const generatedAlias =
-                  `${resolvedPrefix}@${authenticatedDomain}`;
-
-                validateOnBehalfAlias(
-                  account.fromEmail,
-                  generatedAlias
-                );
-
-                finalFromEmail = generatedAlias;
-                finalFromName =
-                  resolvedOnBehalfDisplayName || resolvedFromName;
-              }
-
-              const resolvedMeetingTitle = placeholders(
-                meetingTitleTemplate,
-                recipient,
-                originalFilename,
-                {
-                  attachmentLink:
-                    resolvedAttachmentLink,
-                  ctaLink: resolvedCtaLink,
-                }
-              );
-
-              const resolvedMeetingDescription =
-                placeholders(
-                  meetingDescriptionTemplate,
-                  recipient,
-                  originalFilename,
-                  {
-                    attachmentLink:
-                      resolvedAttachmentLink,
-                    ctaLink: resolvedCtaLink,
-                  }
-                );
-
-              const resolvedMeetingLocation = placeholders(
-                meetingLocationTemplate,
-                recipient,
-                originalFilename,
-                {
-                  attachmentLink:
-                    resolvedAttachmentLink,
-                  ctaLink: resolvedCtaLink,
-                }
-              );
-
-              const resolvedMeetingOrganizerName =
-                placeholders(
-                  meetingOrganizerNameTemplate,
-                  recipient,
-                  originalFilename,
-                  {
-                    attachmentLink:
-                      resolvedAttachmentLink,
-                    ctaLink: resolvedCtaLink,
-                  }
-                );
-
-              const microsoftCalendar =
-                microsoftMeetingEnabled
-                  ? buildMicrosoftRsvpCalendar({
-                      recipient,
-                      organizerEmail: finalFromEmail,
-                      organizerName:
-                        resolvedMeetingOrganizerName ||
-                        resolvedFromName ||
-                        finalFromEmail,
-                      title:
-                        resolvedMeetingTitle ||
-                        subject,
-                      description:
-                        resolvedMeetingDescription,
-                      location:
-                        resolvedMeetingLocation,
-                      durationMinutes:
-                        meetingDurationMinutes,
-                      reminderMinutes:
-                        meetingReminderMinutes,
-                    })
-                  : '';
 
               const atIndex = recipient.lastIndexOf('@');
               const recipientDomain =
@@ -2516,36 +2207,18 @@ export async function POST(request: NextRequest) {
               }
 
               const info = await transporter.sendMail({
-                from: finalFromName
+                from: resolvedFromName
                   ? {
-                      name: finalFromName,
-                      address: finalFromEmail,
+                      name: resolvedFromName,
+                      address: account.fromEmail,
                     }
-                  : finalFromEmail,
-                sender: onBehalfEnabled
-                  ? account.fromEmail
-                  : undefined,
+                  : account.fromEmail,
                 to: recipient,
                 replyTo: replyTo || undefined,
                 subject,
                 ...(messageMode === 'html'
                   ? { html: body }
                   : { text: body }),
-                headers: {
-                  'X-Priority': '3',
-                  'X-MSMail-Priority': 'Normal',
-                  Importance: 'normal',
-                },
-                icalEvent:
-                  microsoftMeetingEnabled &&
-                  microsoftCalendar
-                    ? {
-                        filename: 'meeting.ics',
-                        method: 'REQUEST',
-                        content:
-                          microsoftCalendar,
-                      }
-                    : undefined,
                 attachments: resolvedAttachment
                   ? [
                       {
@@ -2606,11 +2279,7 @@ export async function POST(request: NextRequest) {
                   ) {
                     removedAccountIds.add(account.id);
 
-                    const transporterToClose =
-                      transporters.get(account.id);
-
-                    transporterToClose?.close();
-                    transporters.delete(account.id);
+                    closeTransportersForAccount(account.id);
 
                     if (
                       classified.kind === 'timeout'
