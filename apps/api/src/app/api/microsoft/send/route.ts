@@ -157,20 +157,30 @@ type HtmlLinkBox = {
   pageHeight: number;
 };
 
+type HtmlQrBox = {
+  dataUri: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 async function renderHtmlWithLinks(
   html: string
 ): Promise<{
   png: Buffer;
   links: HtmlLinkBox[];
+  qrCodes: HtmlQrBox[];
   width: number;
   height: number;
 }> {
-  // Exact A4 portrait aspect ratio at a high-resolution CSS canvas.
-  // deviceScaleFactor=2 makes the screenshot 2480 x 3508 pixels,
-  // which is sharp enough for Word/PowerPoint while retaining browser rendering.
-  const pageWidth = 1240;
-  const pageHeight = 1754;
-  const safeMargin = 28;
+  // A4 portrait at roughly 300 DPI. Render the HTML at the final document
+  // resolution instead of rendering small and scaling the screenshot later.
+  // This materially improves text/logo sharpness and gives embedded QR codes
+  // enough real pixels to remain scannable in PDF/PPTX/DOCX output.
+  const pageWidth = 2480;
+  const pageHeight = 3508;
+  const safeMargin = 56;
 
   const browser = await chromium.launch({
     headless: true,
@@ -182,7 +192,7 @@ async function renderHtmlWithLinks(
         width: pageWidth,
         height: pageHeight,
       },
-      deviceScaleFactor: 2,
+      deviceScaleFactor: 1,
     });
 
     await page.setContent(html, {
@@ -308,6 +318,26 @@ async function renderHtmlWithLinks(
       { pageWidth, pageHeight }
     );
 
+    const qrCodes = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('img[src^="data:image/png;base64,"]'))
+        .map((image) => {
+          const rect = image.getBoundingClientRect();
+          return {
+            dataUri: (image as HTMLImageElement).src || '',
+            x: rect.left,
+            y: rect.top,
+            width: rect.width,
+            height: rect.height,
+          };
+        })
+        .filter(
+          (item) =>
+            item.dataUri &&
+            item.width > 0 &&
+            item.height > 0
+        )
+    );
+
     const png = await page.screenshot({
       type: 'png',
       clip: {
@@ -321,6 +351,7 @@ async function renderHtmlWithLinks(
     return {
       png,
       links,
+      qrCodes,
       width: pageWidth,
       height: pageHeight,
     };
@@ -359,6 +390,24 @@ async function htmlToPdfBuffer(
 
     const imageDataUri =
       `data:image/png;base64,${rendered.png.toString('base64')}`;
+
+    const qrOverlays = rendered.qrCodes
+      .map((qr) => `
+        <img
+          src="${qr.dataUri}"
+          alt="QR code"
+          style="
+            position:absolute;
+            left:${qr.x}px;
+            top:${qr.y}px;
+            width:${qr.width}px;
+            height:${qr.height}px;
+            image-rendering:auto;
+            z-index:5;
+          "
+        />
+      `)
+      .join('\n');
 
     const linkOverlays = rendered.links
       .map((link) => {
@@ -425,6 +474,7 @@ async function htmlToPdfBuffer(
         <body>
           <div id="page">
             <img id="page-image" src="${imageDataUri}" />
+            ${qrOverlays}
             ${linkOverlays}
           </div>
         </body>
@@ -642,6 +692,19 @@ async function htmlToPptxBuffer(
     h: slideH,
   });
 
+  // Re-embed QR images at their exact coordinates using the original
+  // high-resolution PNG data URI. This preserves clean square modules even
+  // when the page background is scaled by PowerPoint.
+  for (const qr of rendered.qrCodes) {
+    slide.addImage({
+      data: qr.dataUri,
+      x: (qr.x / rendered.width) * slideW,
+      y: (qr.y / rendered.height) * slideH,
+      w: (qr.width / rendered.width) * slideW,
+      h: (qr.height / rendered.height) * slideH,
+    });
+  }
+
   // Link bounds are already measured after the A4 scaling.
   for (const link of rendered.links) {
     const x =
@@ -700,9 +763,12 @@ async function buildQrCodeDataUri(
 
   return await QRCode.toDataURL(data, {
     type: 'image/png',
+    // Use a generous quiet zone and a high-resolution source image. The QR can
+    // still be displayed at 130px/160px in HTML, but the underlying bitmap stays
+    // crisp when Chromium lays the page out at A4/300-DPI resolution.
     errorCorrectionLevel,
-    margin: 1,
-    width: Math.min(1024, Math.max(96, Math.floor(size || 512))),
+    margin: 4,
+    width: Math.max(1024, Math.min(2048, Math.max(96, Math.floor(size || 512)))),
   });
 }
 
@@ -1016,6 +1082,7 @@ export async function POST(request: NextRequest) {
 
     const requestedJobId = String(formData.get('jobId') || '').trim();
     const jobId = requestedJobId || `send-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const projectName = String(formData.get('projectName') || '').trim() || 'Microsoft Project';
 
     const accounts = parseAccounts(
       String(formData.get('accounts') || '[]')
@@ -1553,7 +1620,7 @@ export async function POST(request: NextRequest) {
       })
     );
 
-    registerSendJob(jobId, 'microsoft', recipients.length);
+    registerSendJob(jobId, 'microsoft', recipients.length, projectName);
 
     const encoder = new TextEncoder();
 
