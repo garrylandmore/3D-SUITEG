@@ -895,6 +895,15 @@ export default function DashboardPage() {
     addToast('Logs cleared', 'success');
   }
 
+  function clearSenderLogs(sender: SenderKey) {
+    setLogs((current) => {
+      const next = current.filter((log) => log.sender !== sender);
+      syncStoredLogs(next);
+      return next;
+    });
+    addToast(`${sender === 'microsoft' ? 'Microsoft' : sender.toUpperCase()} logs cleared`, 'success');
+  }
+
   function globalBrowserProxyString(): string {
     if (!browserProxy.host.trim()) return '';
 
@@ -2854,26 +2863,37 @@ export default function DashboardPage() {
               onLog={(level, message) => appendLog(level, message, 'gmail')}
               onToast={addToast}
             />
-          ) : activeSender === 'smtp' ? (
-            <SmtpSenderPanel
-              senderMode="smtp"
-              leadEmails={leads
-                .map((lead) => lead.email || lead.normalized)
-                .filter((email): email is string => Boolean(email))}
-              onLog={(level, message) => appendLog(level, message, 'smtp')}
-              onToast={addToast}
-            />
-          ) : activeSender === 'microsoft' ? (
-            <SmtpSenderPanel
-              senderMode="microsoft"
-              leadEmails={leads
-                .map((lead) => lead.email || lead.normalized)
-                .filter((email): email is string => Boolean(email))}
-              onLog={(level, message) =>
-                appendLog(level, message, 'microsoft')
-              }
-              onToast={addToast}
-            />
+          ) : activeSender === 'smtp' || activeSender === 'microsoft' ? (
+            <div>
+              {/* Keep both SMTP workspaces mounted at the same time. This is intentional:
+                  switching between SMTP and Microsoft must never unmount, pause, or reset
+                  the other sender's active job, form state, proxy pool, or live log reader. */}
+              <div className={activeSender === 'smtp' ? 'block' : 'hidden'}>
+                <SmtpSenderPanel
+                  senderMode="smtp"
+                  leadEmails={leads
+                    .map((lead) => lead.email || lead.normalized)
+                    .filter((email): email is string => Boolean(email))}
+                  senderLogs={logs.filter((log) => log.sender === 'smtp')}
+                  onClearSenderLogs={() => clearSenderLogs('smtp')}
+                  onLog={(level, message) => appendLog(level, message, 'smtp')}
+                  onToast={addToast}
+                />
+              </div>
+
+              <div className={activeSender === 'microsoft' ? 'block' : 'hidden'}>
+                <SmtpSenderPanel
+                  senderMode="microsoft"
+                  leadEmails={leads
+                    .map((lead) => lead.email || lead.normalized)
+                    .filter((email): email is string => Boolean(email))}
+                  senderLogs={logs.filter((log) => log.sender === 'microsoft')}
+                  onClearSenderLogs={() => clearSenderLogs('microsoft')}
+                  onLog={(level, message) => appendLog(level, message, 'microsoft')}
+                  onToast={addToast}
+                />
+              </div>
+            </div>
           ) : (
             <MockSenderPanel
               sender={activeSender}
@@ -4243,14 +4263,22 @@ type SmtpAccount = {
 function SmtpSenderPanel({
   senderMode = 'smtp',
   leadEmails,
+  senderLogs,
+  onClearSenderLogs,
   onLog,
   onToast,
 }: {
   senderMode?: 'smtp' | 'microsoft';
   leadEmails: string[];
+  senderLogs: RuntimeLog[];
+  onClearSenderLogs: () => void;
   onLog: (level: LogLevel, message: string) => void;
   onToast: (message: string, level?: LogLevel) => void;
 }) {
+  const [projectName, setProjectName] = React.useState(
+    senderMode === 'microsoft' ? 'Microsoft Project' : 'SMTP Project'
+  );
+
   const [accounts, setAccounts] = React.useState<SmtpAccount[]>([
     {
       id: makeId('smtp'),
@@ -4345,6 +4373,7 @@ function SmtpSenderPanel({
       window.sessionStorage.setItem(
         smtpPanelSessionKey,
         JSON.stringify({
+          projectName,
           accounts,
           rotateAccounts,
           selectedAccountId,
@@ -4388,6 +4417,7 @@ function SmtpSenderPanel({
     microsoftProxyRotate,
     onLog,
     onToast,
+    projectName,
     rotateAccounts,
     selectedAccountId,
     senderMode,
@@ -4423,6 +4453,10 @@ function SmtpSenderPanel({
       if (!raw) return;
 
       const saved = JSON.parse(raw) as Record<string, unknown>;
+
+      if (typeof saved.projectName === 'string' && saved.projectName.trim()) {
+        setProjectName(saved.projectName);
+      }
 
       if (Array.isArray(saved.accounts) && saved.accounts.length > 0) {
         setAccounts(saved.accounts as SmtpAccount[]);
@@ -5817,6 +5851,7 @@ function SmtpSenderPanel({
 
       const formData = new FormData();
       formData.append('jobId', currentJobId);
+      formData.append('projectName', projectName.trim() || (senderMode === 'microsoft' ? 'Microsoft Project' : 'SMTP Project'));
       formData.append('accounts', JSON.stringify(plan));
       formData.append('rotateAccounts', rotateAccounts ? 'true' : 'false');
       formData.append(
@@ -5999,11 +6034,15 @@ function SmtpSenderPanel({
       const senderLabel =
         senderMode === 'microsoft' ? 'Microsoft SMTP' : 'SMTP';
 
+      const projectLabel =
+        projectName.trim() ||
+        (senderMode === 'microsoft' ? 'Microsoft Project' : 'SMTP Project');
+
       onLog(
         'info',
         rotateAccounts
-          ? `${senderLabel} run started — ${recipients.length} recipient(s), ${plan.length} account(s)`
-          : `${senderLabel} run started — ${recipients.length} recipient(s)`
+          ? `${projectLabel} — ${senderLabel} run started — ${recipients.length} recipient(s), ${plan.length} account(s)`
+          : `${projectLabel} — ${senderLabel} run started — ${recipients.length} recipient(s)`
       );
 
       const response = await fetch(
@@ -6249,6 +6288,15 @@ function SmtpSenderPanel({
     <div className="grid xl:grid-cols-2 gap-4">
       <Panel title={senderMode === 'microsoft' ? "Microsoft Sender — SMTP Accounts" : "Authenticated SMTP Accounts"}>
         <div className="space-y-3">
+          <Field label="Project name">
+            <input
+              className="input"
+              value={projectName}
+              onChange={(event) => setProjectName(event.target.value)}
+              placeholder={senderMode === 'microsoft' ? 'Microsoft Project' : 'SMTP Project'}
+            />
+          </Field>
+
           <div className="rounded border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
             Add the SMTP credentials supplied by your mail provider. Use "Save SMTPs + proxies to session" to keep SMTP credentials and proxy URLs for this browser session. They are restored when this sender panel reloads and are sent only to the local 3D Suite API for SMTP operations.
           </div>
@@ -8151,6 +8199,45 @@ function SmtpSenderPanel({
                 Job: {sendJobStatus}
               </span>
             )}
+          </div>
+
+          <div className="overflow-hidden rounded border border-slate-700 bg-[#111827]">
+            <div className="flex items-center justify-between border-b border-slate-700 px-3 py-2">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-200">
+                  {projectName.trim() || (senderMode === 'microsoft' ? 'Microsoft Project' : 'SMTP Project')} — {senderMode === 'microsoft' ? 'Microsoft Runtime Logs' : 'SMTP Runtime Logs'}
+                </div>
+                <div className="text-[11px] text-slate-400">
+                  Independent terminal for this sender. Switching sender tabs does not stop its job.
+                </div>
+              </div>
+              <button
+                type="button"
+                className="rounded border border-slate-600 px-2 py-1 text-[11px] text-slate-200 hover:bg-slate-800"
+                onClick={onClearSenderLogs}
+              >
+                Clear Logs
+              </button>
+            </div>
+
+            <div className="max-h-64 overflow-auto p-3 font-mono text-xs">
+              {senderLogs.length === 0 ? (
+                <div className="text-slate-500">No runtime actions yet.</div>
+              ) : (
+                <div className="space-y-1">
+                  {senderLogs.map((log) => (
+                    <div key={log.id} className="flex gap-2">
+                      <span className="shrink-0 text-[#A78BFA]">{formatTime(log.timestamp)}</span>
+                      <span className="shrink-0" style={{ color: levelColor(log.level) }}>
+                        {log.level}
+                      </span>
+                      <span className="break-words text-slate-200">{log.message}</span>
+                    </div>
+                  ))}
+                  <div className="text-slate-600">— end of {senderMode === 'microsoft' ? 'Microsoft' : 'SMTP'} log —</div>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </Panel>
