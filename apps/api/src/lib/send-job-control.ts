@@ -8,6 +8,7 @@ export type SendJobEvent = {
 export type SendJob = {
   id: string;
   senderMode: 'smtp' | 'microsoft';
+  projectName: string;
   status: SendJobStatus;
   total: number;
   current: number;
@@ -35,7 +36,8 @@ const MAX_EVENTS = 250;
 export function registerSendJob(
   id: string,
   senderMode: 'smtp' | 'microsoft',
-  total: number
+  total: number,
+  projectName = senderMode === 'microsoft' ? 'Microsoft Project' : 'SMTP Project'
 ): SendJob {
   const now = Date.now();
   const existing = jobs.get(id);
@@ -47,6 +49,7 @@ export function registerSendJob(
   const job: SendJob = {
     id,
     senderMode,
+    projectName,
     status: 'running',
     total,
     current: 0,
