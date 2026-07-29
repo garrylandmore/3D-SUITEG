@@ -370,9 +370,9 @@ async function renderHtmlToPng(
 async function htmlToPdfBuffer(
   html: string
 ): Promise<Buffer> {
-  // Reuse the exact same A4 high-resolution render used by PPTX/DOCX.
-  // This guarantees that the PDF shows the full document both vertically
-  // and horizontally instead of applying a second independent scale.
+  // Keep the source render at 300-DPI quality, but place it on a true A4
+  // CSS page before printing. Using the 2480x3508 source dimensions as CSS
+  // pixels causes Chromium to treat the page as physically huge and crop it.
   const rendered = await renderHtmlWithLinks(html);
 
   const browser = await chromium.launch({
@@ -382,8 +382,8 @@ async function htmlToPdfBuffer(
   try {
     const page = await browser.newPage({
       viewport: {
-        width: rendered.width,
-        height: rendered.height,
+        width: 794,
+        height: 1123,
       },
       deviceScaleFactor: 1,
     });
@@ -392,21 +392,28 @@ async function htmlToPdfBuffer(
       `data:image/png;base64,${rendered.png.toString('base64')}`;
 
     const qrOverlays = rendered.qrCodes
-      .map((qr) => `
-        <img
-          src="${qr.dataUri}"
-          alt="QR code"
-          style="
-            position:absolute;
-            left:${qr.x}px;
-            top:${qr.y}px;
-            width:${qr.width}px;
-            height:${qr.height}px;
-            image-rendering:auto;
-            z-index:5;
-          "
-        />
-      `)
+      .map((qr) => {
+        const left = (qr.x / rendered.width) * 100;
+        const top = (qr.y / rendered.height) * 100;
+        const width = (qr.width / rendered.width) * 100;
+        const height = (qr.height / rendered.height) * 100;
+
+        return `
+          <img
+            src="${qr.dataUri}"
+            alt="QR code"
+            style="
+              position:absolute;
+              left:${left}%;
+              top:${top}%;
+              width:${width}%;
+              height:${height}%;
+              image-rendering:auto;
+              z-index:5;
+            "
+          />
+        `;
+      })
       .join('\n');
 
     const linkOverlays = rendered.links
@@ -417,15 +424,20 @@ async function htmlToPdfBuffer(
           .replace(/</g, '&lt;')
           .replace(/>/g, '&gt;');
 
+        const left = (link.x / rendered.width) * 100;
+        const top = (link.y / rendered.height) * 100;
+        const width = (link.width / rendered.width) * 100;
+        const height = (link.height / rendered.height) * 100;
+
         return `
           <a
             href="${safeHref}"
             style="
               position:absolute;
-              left:${link.x}px;
-              top:${link.y}px;
-              width:${link.width}px;
-              height:${link.height}px;
+              left:${left}%;
+              top:${top}%;
+              width:${width}%;
+              height:${height}%;
               display:block;
               opacity:0.001;
               z-index:10;
@@ -450,23 +462,25 @@ async function htmlToPdfBuffer(
             body {
               margin: 0;
               padding: 0;
-              width: ${rendered.width}px;
-              height: ${rendered.height}px;
+              width: 210mm;
+              height: 297mm;
               overflow: hidden;
               background: white;
             }
 
             #page {
               position: relative;
-              width: ${rendered.width}px;
-              height: ${rendered.height}px;
+              width: 210mm;
+              height: 297mm;
+              overflow: hidden;
             }
 
             #page-image {
               position: absolute;
               inset: 0;
-              width: ${rendered.width}px;
-              height: ${rendered.height}px;
+              width: 100%;
+              height: 100%;
+              object-fit: fill;
               display: block;
             }
           </style>
@@ -489,8 +503,7 @@ async function htmlToPdfBuffer(
 
     return Buffer.from(
       await page.pdf({
-        width: '210mm',
-        height: '297mm',
+        format: 'A4',
         printBackground: true,
         preferCSSPageSize: true,
         pageRanges: '1',
@@ -607,13 +620,35 @@ async function htmlToDocxBuffer(
 ): Promise<Buffer> {
   const rendered = await renderHtmlWithLinks(html);
 
-  // A4 page with very small margins.
-  // The source PNG is already exactly A4-shaped and high resolution,
-  // so use nearly the entire Word page without another fit calculation.
+  // A4 page with very small margins. The source PNG is already exactly
+  // A4-shaped and high resolution.
   const imageWidth = 780;
   const imageHeight = Math.round(
     imageWidth * (rendered.height / rendered.width)
   );
+
+  const pageImage = new ImageRun({
+    data: rendered.png,
+    transformation: {
+      width: imageWidth,
+      height: imageHeight,
+    },
+    type: 'png',
+  });
+
+  // DOCX renders the HTML design as one high-resolution page image. Word
+  // cannot reliably place arbitrary HTML anchor rectangles over that image
+  // with docx.js, so make the page image itself clickable using the primary
+  // link from the template. For the common single-CTA document this means
+  // clicking the visible button (or elsewhere on the page) opens the same URL.
+  const primaryLink = rendered.links.find((link) => /^https?:\/\//i.test(link.href));
+
+  const imageChild = primaryLink
+    ? new ExternalHyperlink({
+        children: [pageImage],
+        link: primaryLink.href,
+      })
+    : pageImage;
 
   const children: Paragraph[] = [
     new Paragraph({
@@ -623,16 +658,7 @@ async function htmlToDocxBuffer(
         after: 0,
         line: 1,
       },
-      children: [
-        new ImageRun({
-          data: rendered.png,
-          transformation: {
-            width: imageWidth,
-            height: imageHeight,
-          },
-          type: 'png',
-        }),
-      ],
+      children: [imageChild],
     }),
   ];
 
