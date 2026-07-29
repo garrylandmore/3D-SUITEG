@@ -432,18 +432,30 @@ async function htmlToPdfBuffer(
         return `
           <a
             href="${safeHref}"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="Open link"
             style="
               position:absolute;
               left:${left}%;
               top:${top}%;
               width:${width}%;
               height:${height}%;
-              display:block;
-              opacity:0.001;
-              z-index:10;
+              display:flex;
+              align-items:center;
+              justify-content:center;
+              z-index:20;
+              overflow:hidden;
+              color:transparent;
+              font-size:1px;
+              line-height:1;
               text-decoration:none;
+              background:rgba(255,255,255,0.001);
+              pointer-events:auto;
+              -webkit-print-color-adjust:exact;
+              print-color-adjust:exact;
             "
-          >&nbsp;</a>
+          >OPEN</a>
         `;
       })
       .join('\n');
