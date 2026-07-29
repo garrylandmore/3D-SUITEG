@@ -8,11 +8,14 @@ import { getSendJob, recordSendJobEvent, registerSendJob, waitForSendJob } from 
 import {
   Document,
   ExternalHyperlink,
+  HorizontalPositionRelativeFrom,
   ImageRun,
   Packer,
   Paragraph,
   SectionType,
   TextRun,
+  TextWrappingType,
+  VerticalPositionRelativeFrom,
 } from 'docx';
 
 export const dynamic = 'force-dynamic';
@@ -532,19 +535,61 @@ async function htmlToPdfBuffer(
   }
 }
 
-function htmlToSvgBuffer(html: string): Buffer {
+async function htmlToSvgBuffer(html: string): Promise<Buffer> {
+  const rendered = await renderHtmlWithLinks(html);
+
+  const escapeXmlAttribute = (value: string) =>
+    String(value || '')
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+  const imageDataUri =
+    `data:image/png;base64,${rendered.png.toString('base64')}`;
+
+  const linkOverlays = rendered.links
+    .map((link) => {
+      const href = escapeXmlAttribute(link.href);
+      const x = Math.max(0, link.x);
+      const y = Math.max(0, link.y);
+      const width = Math.max(1, link.width);
+      const height = Math.max(1, link.height);
+
+      return `
+  <a href="${href}" target="_blank">
+    <rect
+      x="${x}"
+      y="${y}"
+      width="${width}"
+      height="${height}"
+      fill="#ffffff"
+      fill-opacity="0.001"
+      stroke="none"
+      pointer-events="all"
+    />
+  </a>`;
+    })
+    .join('');
+
   const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg"
-     width="794"
-     height="1123"
-     viewBox="0 0 794 1123"
-     preserveAspectRatio="xMidYMid meet">
-  <foreignObject x="0" y="0" width="794" height="1123">
-    <div xmlns="http://www.w3.org/1999/xhtml"
-         style="width:794px;height:1123px;box-sizing:border-box;overflow:hidden;">
-      ${html}
-    </div>
-  </foreignObject>
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  xmlns:xlink="http://www.w3.org/1999/xlink"
+  width="${rendered.width}"
+  height="${rendered.height}"
+  viewBox="0 0 ${rendered.width} ${rendered.height}"
+  preserveAspectRatio="xMidYMid meet"
+>
+  <image
+    x="0"
+    y="0"
+    width="${rendered.width}"
+    height="${rendered.height}"
+    href="${imageDataUri}"
+    xlink:href="${imageDataUri}"
+    preserveAspectRatio="xMidYMid meet"
+  />${linkOverlays}
 </svg>`;
 
   return Buffer.from(svg, 'utf8');
@@ -632,47 +677,162 @@ async function htmlToDocxBuffer(
 ): Promise<Buffer> {
   const rendered = await renderHtmlWithLinks(html);
 
-  // A4 page with very small margins. The source PNG is already exactly
-  // A4-shaped and high resolution.
-  const imageWidth = 780;
-  const imageHeight = Math.round(
-    imageWidth * (rendered.height / rendered.width)
-  );
+  // Word documents use a full-page, high-resolution background image so the
+  // visual result stays identical to the HTML/PDF/PPTX versions. Hyperlinks
+  // are then added back as transparent floating PNG overlays positioned over
+  // the exact bounds measured from the original HTML anchors.
+  const pageWidthPx = 794; // A4 at 96 CSS px/in
+  const pageHeightPx = 1123;
+  const emuPerInch = 914400;
+  const pageWidthInches = 8.27;
+  const pageHeightInches = 11.69;
+
+  const toXEmu = (sourceX: number) =>
+    Math.round(
+      (sourceX / rendered.width) *
+        pageWidthInches *
+        emuPerInch
+    );
+
+  const toYEmu = (sourceY: number) =>
+    Math.round(
+      (sourceY / rendered.height) *
+        pageHeightInches *
+        emuPerInch
+    );
+
+  const toWidthPx = (sourceWidth: number) =>
+    Math.max(
+      1,
+      Math.round(
+        (sourceWidth / rendered.width) *
+          pageWidthPx
+      )
+    );
+
+  const toHeightPx = (sourceHeight: number) =>
+    Math.max(
+      1,
+      Math.round(
+        (sourceHeight / rendered.height) *
+          pageHeightPx
+      )
+    );
 
   const pageImage = new ImageRun({
     data: rendered.png,
     transformation: {
-      width: imageWidth,
-      height: imageHeight,
+      width: pageWidthPx,
+      height: pageHeightPx,
     },
     type: 'png',
+    floating: {
+      horizontalPosition: {
+        relative: HorizontalPositionRelativeFrom.PAGE,
+        offset: 0,
+      },
+      verticalPosition: {
+        relative: VerticalPositionRelativeFrom.PAGE,
+        offset: 0,
+      },
+      wrap: {
+        type: TextWrappingType.NONE,
+      },
+      behindDocument: true,
+      allowOverlap: true,
+      lockAnchor: true,
+    },
   });
 
-  // DOCX renders the HTML design as one high-resolution page image. Word
-  // cannot reliably place arbitrary HTML anchor rectangles over that image
-  // with docx.js, so make the page image itself clickable using the primary
-  // link from the template. For the common single-CTA document this means
-  // clicking the visible button (or elsewhere on the page) opens the same URL.
-  const primaryLink = rendered.links.find((link) => /^https?:\/\//i.test(link.href));
+  // A fully transparent 1x1 PNG. Word still creates a real DrawingML object
+  // for it, which allows docx.js to attach an external hyperlink relationship.
+  // Scaling that image to each measured link rectangle gives us invisible but
+  // genuinely clickable hotspots over the rendered page.
+  const transparentPng = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64'
+  );
 
-  const imageChild = primaryLink
-    ? new ExternalHyperlink({
-        children: [pageImage],
-        link: primaryLink.href,
+  const overlayLinks = rendered.links
+    .filter((link) => /^https?:\/\//i.test(link.href))
+    .map((link) => {
+      const overlayImage = new ImageRun({
+        data: transparentPng,
+        transformation: {
+          width: toWidthPx(link.width),
+          height: toHeightPx(link.height),
+        },
+        type: 'png',
+        floating: {
+          horizontalPosition: {
+            relative: HorizontalPositionRelativeFrom.PAGE,
+            offset: toXEmu(link.x),
+          },
+          verticalPosition: {
+            relative: VerticalPositionRelativeFrom.PAGE,
+            offset: toYEmu(link.y),
+          },
+          wrap: {
+            type: TextWrappingType.NONE,
+          },
+          behindDocument: false,
+          allowOverlap: true,
+          lockAnchor: true,
+        },
+      });
+
+      return new ExternalHyperlink({
+        children: [overlayImage],
+        link: link.href,
+      });
+    });
+
+  // Keep a tiny fallback hyperlink in the document structure. It is visually
+  // unobtrusive, but gives viewers that do not activate hyperlinks on floating
+  // drawings (some browser previews) a standards-based link target as well.
+  const primaryLink = rendered.links.find(
+    (link) => /^https?:\/\//i.test(link.href)
+  );
+
+  const fallbackParagraph = primaryLink
+    ? new Paragraph({
+        spacing: {
+          before: 0,
+          after: 0,
+          line: 1,
+        },
+        children: [
+          new ExternalHyperlink({
+            link: primaryLink.href,
+            children: [
+              new TextRun({
+                text: 'Open link',
+                size: 2,
+                color: 'FFFFFF',
+              }),
+            ],
+          }),
+        ],
       })
-    : pageImage;
+    : null;
 
   const children: Paragraph[] = [
     new Paragraph({
-      alignment: 'center',
       spacing: {
         before: 0,
         after: 0,
         line: 1,
       },
-      children: [imageChild],
+      children: [
+        pageImage,
+        ...overlayLinks,
+      ],
     }),
   ];
+
+  if (fallbackParagraph) {
+    children.push(fallbackParagraph);
+  }
 
   const doc = new Document({
     sections: [
@@ -685,10 +845,13 @@ async function htmlToDocxBuffer(
               height: 16838,
             },
             margin: {
-              top: 80,
-              right: 80,
-              bottom: 80,
-              left: 80,
+              top: 0,
+              right: 0,
+              bottom: 0,
+              left: 0,
+              header: 0,
+              footer: 0,
+              gutter: 0,
             },
           },
         },
@@ -781,6 +944,56 @@ async function htmlToPptxBuffer(
   });
 
   return Buffer.from(output as Buffer);
+}
+
+async function htmlToEmlBuffer(args: {
+  html: string;
+  fromName?: string;
+  fromEmail: string;
+  senderEmail?: string;
+  to: string;
+  subject: string;
+  replyTo?: string;
+  icalEvent?: string;
+}): Promise<Buffer> {
+  const composer = nodemailer.createTransport({
+    streamTransport: true,
+    buffer: true,
+    newline: 'windows',
+  });
+
+  const info = await composer.sendMail({
+    from: args.fromName
+      ? { name: args.fromName, address: args.fromEmail }
+      : args.fromEmail,
+    sender: args.senderEmail || undefined,
+    to: args.to,
+    replyTo: args.replyTo || undefined,
+    subject: args.subject,
+    html: args.html,
+    icalEvent: args.icalEvent
+      ? {
+          filename: 'meeting.ics',
+          method: 'REQUEST',
+          content: args.icalEvent,
+        }
+      : undefined,
+    headers: {
+      'X-Generated-By': '3D Suite HTML to EML',
+    },
+  });
+
+  const message = (info as unknown as { message?: Buffer | string }).message;
+
+  if (Buffer.isBuffer(message)) {
+    return message;
+  }
+
+  if (typeof message === 'string') {
+    return Buffer.from(message, 'utf8');
+  }
+
+  throw new Error('Could not generate the EML attachment.');
 }
 
 function randomDigits(length: number): string {
@@ -1407,11 +1620,13 @@ export async function POST(request: NextRequest) {
       | 'html-pdf'
       | 'html-pptx'
       | 'html-docx'
-      | 'html-svg' =
+      | 'html-svg'
+      | 'html-eml' =
       attachmentModeRaw === 'html-pdf' ||
       attachmentModeRaw === 'html-pptx' ||
       attachmentModeRaw === 'html-docx' ||
-      attachmentModeRaw === 'html-svg'
+      attachmentModeRaw === 'html-svg' ||
+      attachmentModeRaw === 'html-eml'
         ? attachmentModeRaw
         : 'upload';
 
@@ -1545,11 +1760,18 @@ export async function POST(request: NextRequest) {
         };
 
         const emit = (payload: Record<string, unknown>) => {
-          recordSendJobEvent(jobId, payload);
+          const recordedEvent = recordSendJobEvent(jobId, payload);
 
           try {
             controller.enqueue(
-              encoder.encode(`${JSON.stringify({ ...payload, jobId })}\n`)
+              encoder.encode(
+                `${JSON.stringify({
+                  ...payload,
+                  jobId,
+                  eventSeq: recordedEvent?.seq,
+                  eventAt: recordedEvent?.at,
+                })}\n`
+              )
             );
           } catch {
             // Browser disconnected or reloaded. Keep the server-side send job alive.
@@ -1968,9 +2190,23 @@ export async function POST(request: NextRequest) {
                     generatedExt = 'docx';
                     generatedMimeType =
                       'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+                  } else if (
+                    attachmentMode === 'html-eml'
+                  ) {
+                    generatedBytes =
+                      await htmlToEmlBuffer({
+                        html: generatedHtml,
+                        fromName: resolvedFromName,
+                        fromEmail: account.fromEmail,
+                        to: recipient,
+                        subject,
+                        replyTo: replyTo || undefined,
+                      });
+                    generatedExt = 'eml';
+                    generatedMimeType = 'message/rfc822';
                   } else {
                     generatedBytes =
-                      htmlToSvgBuffer(
+                      await htmlToSvgBuffer(
                         generatedHtml
                       );
                     generatedExt = 'svg';
